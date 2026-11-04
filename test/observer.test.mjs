@@ -18,9 +18,13 @@ function boot() {
   const root = mkdtempSync(join(tmpdir(), 'dsh-observer-'))
   const tools = new Map()
   const listeners = new Map()
+  const commands = new Map()
   const prompts = []
   const ctx = {
     get(name) {
+      if (name === 'commands') {
+        return { register: (definition) => commands.set(definition.name, definition) }
+      }
       if (name === 'sessionController') {
         return {
           async create() {
@@ -42,7 +46,7 @@ function boot() {
   }
   const bindingsPath = join(root, 'observer-bindings.json')
   apply(ctx, { bindingsPath })
-  return { ctx, tools, listeners, prompts, bindingsPath }
+  return { ctx, tools, listeners, commands, prompts, bindingsPath }
 }
 
 test('observer: mounting writes nothing until a follower is created', () => {
@@ -115,4 +119,38 @@ test('observer: an unknown transfer changes nothing', () => {
   const { listeners } = boot()
   listeners.get('graft/session-transferred')({ sourceSessionId: 'nobody', newSessionId: 'x' })
   assert.deepEqual(debugObserverState().bindings, {})
+})
+
+/**
+ * v0.1.2 — THE COMMAND-LINE FALLBACK.
+ *
+ * The turn-tail chip depends on the Client bundle loading, which is a different failure
+ * mode from the Host logic. These commands must work even when no UI exists at all: typing
+ * `/observer-create` in the composer is the guaranteed path.
+ */
+test('observer: the three UI commands are registered and the create one works', async () => {
+  const { commands, prompts } = boot()
+  for (const name of ['observer-state', 'observer-create', 'observer-focus-ack']) {
+    assert.ok(commands.has(name), `${name} is registered`)
+  }
+
+  const created = await commands.get('observer-create').handler({ rawInput: 'main-cmd', agent: { id: 'main-cmd' } })
+  assert.equal(created.kind, 'success')
+  assert.match(created.text, /已召唤副脑 obs-1/u)
+  assert.equal(prompts.length, 1)
+
+  const state = JSON.parse((await commands.get('observer-state').handler({})).text)
+  assert.deepEqual(state.bindings, { 'main-cmd': 'obs-1' })
+
+  // A transfer moves the pointer; the command surface reports the new target.
+  const follow = debugFollowTransfer('main-cmd', 'main-cmd-2')
+  assert.equal(follow.followed, true)
+  const after = JSON.parse((await commands.get('observer-state').handler({})).text)
+  assert.deepEqual(after.bindings, { 'main-cmd-2': 'obs-1' })
+  assert.equal(after.focus.sessionId, 'main-cmd-2')
+
+  const acked = await commands.get('observer-focus-ack').handler({})
+  assert.equal(acked.kind, 'success')
+  const cleared = JSON.parse((await commands.get('observer-state').handler({})).text)
+  assert.equal(cleared.focus, null)
 })

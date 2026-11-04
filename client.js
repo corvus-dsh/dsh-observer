@@ -1,25 +1,46 @@
 /**
  * dsh-observer — the Client half: a turn-tail entry inside the CONVERSATION.
  *
- * Why the conversation and not a panel: a companion session belongs to the chat you are
- * having, not to a global console. `conversation.chat.turnTail` is the slot the UI already
- * renders after each completed turn, so the button sits exactly where the decision to
- * "call the second brain" is made.
+ * TWO HARD RULES, both learned the expensive way:
  *
- * The Client cannot talk to the Host except through commands, and it cannot name a session
- * except through `remote.session.list()` — both are the patterns proven on the graft console
- * after four rounds of gateway rejections.
+ *   1. THE SESSION ID COMES FROM THE SLOT, NEVER FROM A GUESS.
+ *      `conversation.chat.turnTail` is a `session`-scoped slot and `sessionId` is one of its
+ *      STANDARD props (verified through the live Slot catalog: standardProps includes
+ *      `sessionId: SessionId`). If it is missing, this component renders NOTHING — binding a
+ *      companion to "the first id in the list" would attach it to somebody else's session.
+ *
+ *   2. A RENDER FAILURE MUST BE VISIBLE.
+ *      An unloaded client module and a throwing component look identical from the outside:
+ *      nothing appears. The console line at module load and the error chip below exist so
+ *      those two causes can be told apart in ten seconds instead of four rounds.
  */
+
+console.log('[dsh-observer] client loaded')
 
 window.__ModuleLoader__.load({
   id: 'dsh-observer',
-  inject: ['slots', 'remote', 'remote.commands', 'remote.session'],
+  inject: ['slots', 'remote', 'remote.commands'],
   apply(ctx) {
     const React = require('react')
     const h = React.createElement
 
-    /** One command call, with the envelope peeled off and errors surfaced honestly. */
-    const callHost = async (line) => {
+    /** Peel the command envelope: `{ kind, text }`, optionally wrapped in `result`. */
+    const unwrapExecution = (value) => {
+      const node = value && value.result !== undefined ? value.result : value
+      if (node && typeof node.text === 'string') {
+        return { kind: typeof node.kind === 'string' ? node.kind : 'success', text: node.text }
+      }
+      return undefined
+    }
+
+    /**
+     * Call one Host command AS the session this turn belongs to.
+     *
+     * `agentId` must be a REAL session id: the gateway resolves it and answers
+     * `session/not-found` for anything else. That is why this function takes the id instead
+     * of looking one up.
+     */
+    const callHost = async (agentId, line) => {
       const remote = (() => {
         try {
           return ctx.get ? ctx.get('remote') : undefined
@@ -31,44 +52,19 @@ window.__ModuleLoader__.load({
       if (!commands || typeof commands.execute !== 'function') {
         return { ok: false, text: 'remote.commands 不可用（inject 未生效）' }
       }
-      const sessionId = await firstSessionId(remote)
       try {
-        // The gateway resolves the id (`session/not-found`), so this must be a REAL one.
-        const settled = await commands.execute(sessionId, line, [], undefined)
+        const settled = await commands.execute(agentId, line, [], undefined)
         const execution = unwrapExecution(settled)
-        if (execution === undefined) return { ok: false, text: `无法识别的返回形状：${JSON.stringify(settled).slice(0, 200)}` }
+        if (execution === undefined) {
+          return { ok: false, text: `无法识别的返回形状：${JSON.stringify(settled).slice(0, 200)}` }
+        }
         return { ok: execution.kind !== 'error', text: execution.text }
       } catch (error) {
         return { ok: false, text: String((error && error.message) || error) }
       }
     }
 
-    /** `commands.execute` answers `{ kind, text }`; tolerate one level of wrapper. */
-    const unwrapExecution = (value) => {
-      const node = value && value.result !== undefined ? value.result : value
-      if (node && typeof node.text === 'string') return { kind: typeof node.kind === 'string' ? node.kind : 'success', text: node.text }
-      return undefined
-    }
-
-    /** A live session id, agent-free, from `remote.session.list()`. */
-    const firstSessionId = async (remote) => {
-      const namespace = remote && (remote.session || remote.sessionController)
-      if (namespace && typeof namespace.list === 'function') {
-        try {
-          const reply = await namespace.list({}, undefined)
-          const items = reply && Array.isArray(reply.items) ? reply.items : []
-          for (const item of items) {
-            const id = item && typeof item.sessionId === 'string' ? item.sessionId : ''
-            if (id.length > 0) return id
-          }
-        } catch {
-          // Fall through to the placeholder: the command reports `session/not-found`.
-        }
-      }
-      return 'dsh-observer-ui'
-    }
-
-    const parseState = (text) => {
+    const parseJson = (text) => {
       try {
         const value = JSON.parse(text)
         return value !== null && typeof value === 'object' ? value : undefined
@@ -77,31 +73,42 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** The turn-tail row: one button, and it says what it will do. */
+    const CHIP = {
+      border: '1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.35))',
+      background: 'transparent',
+      borderRadius: '999px',
+      padding: '3px 10px',
+      cursor: 'pointer',
+      font: 'inherit',
+    }
+
+    /** One button, and it says exactly what it will do. */
     function TurnTail({ sessionId }) {
       const [bound, setBound] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState('')
-      const [focusHandled] = React.useState({ id: '' })
+      const handled = React.useState({ id: '' })[0]
 
       const refresh = async () => {
-        const reply = await callHost('/observer-state')
-        const state = reply.ok ? parseState(reply.text) : undefined
+        const reply = await callHost(sessionId, '/observer-state')
+        if (!reply.ok) {
+          setError(String(reply.text || '读取失败'))
+          return
+        }
+        const state = parseJson(reply.text)
         if (state === undefined) return
         const bindings = state.bindings && typeof state.bindings === 'object' ? state.bindings : {}
-        const main = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : ''
-        setBound(main.length > 0 && typeof bindings[main] === 'string' ? bindings[main] : '')
-        /**
-         * Focus pull: a transfer filed `focus.sessionId`, and this is where it is honoured.
-         * Exactly once per request — the ack clears it on the Host.
-         */
-        if (state.focus && typeof state.focus.sessionId === 'string' && state.focus.sessionId !== focusHandled.id) {
+        const observer = typeof bindings[sessionId] === 'string' ? bindings[sessionId] : ''
+        setBound(observer)
+        setError('')
+        // One-shot focus: a transfer filed the new main session; follow it exactly once.
+        if (state.focus && typeof state.focus.sessionId === 'string' && state.focus.sessionId !== handled.id) {
           const ui = ctx.get ? ctx.get('uiWorkspace') : undefined
           if (ui && typeof ui.openSession === 'function') {
             ui.openSession({ kind: 'session', sessionId: state.focus.sessionId })
-            focusHandled.id = state.focus.sessionId
+            handled.id = state.focus.sessionId
           }
-          void callHost('/observer-focus-ack')
+          void callHost(sessionId, '/observer-focus-ack')
         }
       }
 
@@ -112,30 +119,29 @@ window.__ModuleLoader__.load({
       const summon = async () => {
         setBusy(true)
         setError('')
-        const target = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : ''
-        const reply = await callHost(`/observer-create${target.length > 0 ? ` ${target}` : ''}`)
+        const reply = await callHost(sessionId, `/observer-create ${sessionId}`)
         setBusy(false)
         if (!reply.ok) {
           setError(String(reply.text || '召唤失败'))
           return
         }
         await refresh()
-        const state = await callHost('/observer-state')
-        const parsed = state.ok ? parseState(state.text) : undefined
-        const observerId = parsed && parsed.bindings && target.length > 0 ? parsed.bindings[target] : ''
+        const state = await callHost(sessionId, '/observer-state')
+        const parsed = state.ok ? parseJson(state.text) : undefined
+        const observerId = parsed && parsed.bindings && typeof parsed.bindings[sessionId] === 'string' ? parsed.bindings[sessionId] : ''
         const ui = ctx.get ? ctx.get('uiWorkspace') : undefined
-        if (typeof observerId === 'string' && observerId.length > 0 && ui && typeof ui.openSession === 'function') {
+        if (observerId.length > 0 && ui && typeof ui.openSession === 'function') {
           ui.openSession({ kind: 'session', sessionId: observerId })
         }
       }
 
       const jump = () => {
         const ui = ctx.get ? ctx.get('uiWorkspace') : undefined
-        if (ui && typeof ui.openSession === 'function' && bound.length > 0) {
+        if (bound.length > 0 && ui && typeof ui.openSession === 'function') {
           ui.openSession({ kind: 'session', sessionId: bound })
           return
         }
-        setError('uiWorkspace.openSession 不可用：请在左侧会话列表里打开副脑会话')
+        setError('uiWorkspace.openSession 不可用')
       }
 
       return h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 2px', fontSize: '12px', opacity: 0.85 } }, [
@@ -145,21 +151,43 @@ window.__ModuleLoader__.load({
             key: 'b',
             type: 'button',
             disabled: busy,
-            title: bound === '' ? '为主会话召唤一个跟随它的副脑' : `已绑定 ${bound}`,
-            style: {
-              border: '1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.35))',
-              background: 'transparent',
-              borderRadius: '999px',
-              padding: '3px 10px',
-              cursor: busy ? 'default' : 'pointer',
-              font: 'inherit',
-            },
+            style: { ...CHIP, cursor: busy ? 'default' : 'pointer' },
+            title: bound === '' ? `为主会话 ${sessionId} 召唤副脑` : `已绑定 ${bound}`,
             onClick: bound === '' ? summon : jump,
           },
           busy ? '🧠 召唤中…' : bound === '' ? '🧠 召唤副脑' : `🧠 切换至副脑 (${bound})`,
         ),
         error.length > 0 ? h('span', { key: 'e', style: { color: '#b91c1c' } }, error) : null,
       ])
+    }
+
+    /** A throwing child must leave a red chip, not a blank strip. */
+    class Boundary extends React.Component {
+      constructor(props) {
+        super(props)
+        this.state = { message: '' }
+      }
+
+      static getDerivedStateFromError(error) {
+        return { message: String((error && error.message) || error) }
+      }
+
+      render() {
+        if (this.state.message.length > 0) {
+          return h('span', { style: { color: '#b91c1c', fontSize: '12px' } }, `[Observer Error] ${this.state.message}`)
+        }
+        return this.props.children
+      }
+    }
+
+    const Entry = (props) => {
+      const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
+      if (sessionId.length === 0) {
+        // No id, no button. Guessing would bind the wrong session (see the header rule).
+        console.warn('[dsh-observer] turnTail received no sessionId; props keys =', props ? Object.keys(props) : props)
+        return null
+      }
+      return h(Boundary, null, h(TurnTail, { sessionId }))
     }
 
     ctx.slots.inject('conversation.chat.turnTail', () =>
@@ -170,13 +198,7 @@ window.__ModuleLoader__.load({
           order: 60,
           label: () => '副脑',
         },
-        (props) => {
-          const sessionId =
-            (props && typeof props.sessionId === 'string' && props.sessionId) ||
-            (props && props.session && typeof props.session.sessionId === 'string' && props.session.sessionId) ||
-            ''
-          return h(TurnTail, { sessionId })
-        },
+        Entry,
       ),
     )
   },
