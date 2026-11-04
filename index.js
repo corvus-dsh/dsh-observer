@@ -448,10 +448,11 @@ export function apply(ctx                   , config                          = 
           ok: { type: 'boolean' },
           bindings: { type: 'object' },
           reverse: { type: 'object' },
-          // Nullable on purpose: "no pending focus" is a real, normal state, and a schema
-          // that only accepts an object makes the Host reject the whole reply
-          // ("value.focus must be an object") the moment nothing is pending.
-          focus: { anyOf: [{ type: 'object' }, { type: 'null' }] },
+          // Nullable on purpose: "no pending focus" is a real, normal state. The Loader's
+          // schema subset has NO `anyOf` — using it fails activation with
+          // "unsupported JSON schema … anyOf is not a supported keyword" and the entry dies
+          // (the whole plugin half never mounts). `oneOf` IS supported.
+          focus: { oneOf: [{ type: 'object' }, { type: 'null' }] },
           focusConsumed: { type: 'boolean' },
         },
         required: ['ok'],

@@ -178,10 +178,30 @@ window.__ModuleLoader__.load({
           return
         }
         if (observerId.length === 0) {
+          /**
+           * PLAN B — the Host half can be INACTIVE (a failed entry registers no commands at
+           * all, and the gateway then answers a generic receipt). In that case still give the
+           * user a conversation to talk in: `startSession` is a CLIENT service and needs no
+           * Host command. No pointer is written and no mission is sent, so the message says so
+           * instead of pretending a companion was created.
+           */
+          const ui = bridge.ui()
+          if (ui && typeof ui.startSession === 'function') {
+            try {
+              ui.startSession()
+              setError(
+                `宿主侧副脑插件未激活（命令无回执 id：${String(reply.text).slice(0, 40)}）。已为你打开一个新会话；` +
+                  '插件恢复后即可正常召唤。',
+              )
+              return
+            } catch {
+              // Fall through to the plain report below.
+            }
+          }
           setError(
             String(
               (receipt && receipt.text) ||
-                `召唤回执 ${String(reply.text).slice(0, 80)}，但绑定表里没有该会话的副脑（宿主可能未加载 0.1.9）`,
+                `召唤回执 ${String(reply.text).slice(0, 80)}，但绑定表里没有该会话的副脑（宿主侧插件可能未激活）`,
             ),
           )
           return
