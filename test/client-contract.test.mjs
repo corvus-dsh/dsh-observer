@@ -63,3 +63,19 @@ test('client: the turn-tail entry takes sessionId from props and never guesses o
   // The dangerous fallback that could bind a companion to somebody else's session.
   assert.doesNotMatch(bundle, /session\.list\(/u, 'no "first id in the list" fallback is allowed here')
 })
+
+/**
+ * v0.1.7 — COMMAND REPLY SHAPES.
+ *
+ * On the live page `/observer-create` answered `{"ok":true}`: a plain object, not
+ * `{ kind, text }`. The strict unwrap reported "返回形状无法识别" and the summon looked broken
+ * even though the binding had been written. The bridge must accept all three observed shapes,
+ * and the summon must read the BINDING TABLE rather than the receipt.
+ */
+test('client: command replies are normalised, and the summon re-reads the binding table', () => {
+  assert.match(bundle, /normaliseReply/u, 'one place normalises the reply')
+  assert.match(bundle, /JSON\.stringify\(node\)/u, 'a plain object reply is treated as JSON text, not an error')
+  const summon = bundle.slice(bundle.indexOf('const summon ='), bundle.indexOf('const jump ='))
+  assert.match(summon, /observer-state/u, 'the summon asks the authority (the binding table) after creating')
+  assert.match(summon, /绑定表里没有该会话的副脑/u, 'a receipt without a binding is reported, never assumed')
+})

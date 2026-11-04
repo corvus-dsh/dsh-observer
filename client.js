@@ -26,10 +26,24 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
 
-    const unwrapExecution = (value) => {
+    /**
+     * Normalise whatever the gateway hands back into `{ ok, text }`.
+     *
+     * Three shapes have been observed on the live page, so all three are accepted:
+     *   1. `{ kind: 'success'|'error', text }`  — a command that returns a display line;
+     *   2. `{ result: <one of the above> }`     — the same, wrapped once by the gateway;
+     *   3. a PLAIN object, e.g. `{ ok: true }`  — what `/observer-create` actually produced
+     *      (`返回形状无法识别：{"ok":true}` was this case). Treating it as JSON text keeps the
+     *      caller's parse path identical instead of failing on a shape we did not predict.
+     */
+    const normaliseReply = (value) => {
       const node = value && value.result !== undefined ? value.result : value
-      if (node && typeof node.text === 'string') {
-        return { kind: typeof node.kind === 'string' ? node.kind : 'success', text: node.text }
+      if (node === null || node === undefined) return undefined
+      if (typeof node.text === 'string') {
+        return { ok: node.kind !== 'error', text: node.text }
+      }
+      if (typeof node === 'object') {
+        return { ok: node.ok !== false && node.kind !== 'error', text: JSON.stringify(node) }
       }
       return undefined
     }
@@ -50,11 +64,11 @@ window.__ModuleLoader__.load({
         }
         try {
           const settled = await commands.execute(agentId, line, [], undefined)
-          const execution = unwrapExecution(settled)
+          const execution = normaliseReply(settled)
           if (execution === undefined) {
             return { ok: false, text: `返回形状无法识别：${JSON.stringify(settled).slice(0, 160)}` }
           }
-          return { ok: execution.kind !== 'error', text: execution.text }
+          return execution
         } catch (error) {
           return { ok: false, text: String((error && error.message) || error) }
         }
@@ -116,18 +130,25 @@ window.__ModuleLoader__.load({
         setBusy(true)
         setError('')
         const reply = await bridge.callHost(sessionId, `/observer-create ${sessionId}`)
-        setBusy(false)
         if (!reply.ok) {
+          setBusy(false)
           setError(String(reply.text || '召唤失败'))
           return
         }
-        await refresh()
+        // The create reply is only a receipt: `{"ok":true}` on this build. The AUTHORITY is
+        // the binding table, so always re-read it instead of parsing the receipt.
         const state = await bridge.callHost(sessionId, '/observer-state')
         const parsed = state.ok ? parseJson(state.text) : undefined
         const observerId =
           parsed && parsed.bindings && typeof parsed.bindings[sessionId] === 'string' ? parsed.bindings[sessionId] : ''
+        setBusy(false)
+        if (observerId.length === 0) {
+          setError(`召唤回执 ${String(reply.text).slice(0, 80)}，但绑定表里没有该会话的副脑`)
+          return
+        }
+        setBound(observerId)
         const ui = bridge.ui()
-        if (observerId.length > 0 && ui && typeof ui.openSession === 'function') {
+        if (ui && typeof ui.openSession === 'function') {
           ui.openSession({ kind: 'session', sessionId: observerId })
         }
       }
