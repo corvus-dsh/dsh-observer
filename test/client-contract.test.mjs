@@ -79,3 +79,22 @@ test('client: command replies are normalised, and the summon re-reads the bindin
   assert.match(summon, /observer-state/u, 'the summon asks the authority (the binding table) after creating')
   assert.match(summon, /绑定表里没有该会话的副脑/u, 'a receipt without a binding is reported, never assumed')
 })
+
+/**
+ * v0.1.12 — THE QUEUED-COMMAND RECEIPT.
+ *
+ * The gateway answers `{ok:true, value:{commandId}}` and runs the command AFTERWARDS, so the
+ * per-command output never returns to the caller. The first implementation read the binding
+ * table once, immediately, lost the race, and told the user the plugin was not active — while
+ * the binding was being written a moment later. The client must recognise that receipt shape
+ * and POLL.
+ */
+test('client: an accepted-but-queued command is polled for, not treated as failure', () => {
+  assert.match(bundle, /commandId/u, 'the async receipt shape is recognised')
+  assert.match(bundle, /accepted/u, 'the reply carries an `accepted` flag')
+  assert.match(bundle, /const poll = async/u, 'a polling helper exists')
+  const summon = bundle.slice(bundle.indexOf('const summon ='), bundle.indexOf('const jump ='))
+  assert.match(summon, /await poll\(/u, 'the summon waits for the binding instead of reading once')
+  const consult = bundle.slice(bundle.indexOf('const consult ='), bundle.indexOf('const summon ='))
+  assert.match(consult, /await poll\(/u, 'the consult waits for the new session instead of reading once')
+})

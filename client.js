@@ -27,29 +27,50 @@ window.__ModuleLoader__.load({
     const h = React.createElement
 
     /**
-     * Normalise whatever the gateway hands back into `{ ok, text }`.
+     * Normalise whatever the gateway hands back into `{ ok, text, accepted }`.
      *
-     * Three shapes have been observed on the live page, so all three are accepted:
+     * FOUR shapes have been observed live, so all four are accepted:
      *   1. `{ kind: 'success'|'error', text }`  — a command that returns a display line;
      *   2. `{ result: <one of the above> }`     — the same, wrapped once by the gateway;
-     *   3. a PLAIN object, e.g. `{ ok: true }`  — what `/observer-create` actually produced
-     *      (`返回形状无法识别：{"ok":true}` was this case). Treating it as JSON text keeps the
-     *      caller's parse path identical instead of failing on a shape we did not predict.
+     *   3. a plain object `{ ok: true }`        — a receipt with nothing in it;
+     *   4. `{ ok: true, value: { commandId } }` — AN ASYNCHRONOUS ACCEPT: the command was
+     *      QUEUED, not run. Its output never comes back here, so the caller must poll the
+     *      state instead of treating the empty receipt as a failure. This shape is why the
+     *      button reported "未激活" while the binding was in fact being written.
      */
     const normaliseReply = (value) => {
       const node = value && value.result !== undefined ? value.result : value
       if (node === null || node === undefined) return undefined
       if (typeof node.text === 'string') {
-        return { ok: node.kind !== 'error', text: node.text }
+        return { ok: node.kind !== 'error', text: node.text, accepted: false }
       }
       if (typeof node === 'object') {
-        return { ok: node.ok !== false && node.kind !== 'error', text: JSON.stringify(node) }
+        const commandId = node.value && typeof node.value.commandId === 'string' ? node.value.commandId : ''
+        const accepted = commandId.length > 0 || (node.ok === true && node.value !== undefined)
+        return {
+          ok: node.ok !== false && node.kind !== 'error',
+          text: JSON.stringify(node),
+          accepted,
+        }
       }
       return undefined
     }
 
     /** Call one Host command AS the given session — the gateway resolves that id. */
     const makeBridge = (ctx) => {
+      /** Every visible session id, for "which one is NEW?" after an async create. */
+      const sessionIds = async () => {
+        try {
+          const remote = ctx.get ? ctx.get('remote') : undefined
+          const namespace = remote && (remote.session || remote.sessionController)
+          if (!namespace || typeof namespace.list !== 'function') return []
+          const reply = await namespace.list({}, undefined)
+          const items = reply && Array.isArray(reply.items) ? reply.items : []
+          return items.map((item) => (item && typeof item.sessionId === 'string' ? item.sessionId : '')).filter(Boolean)
+        } catch {
+          return []
+        }
+      }
       const callHost = async (agentId, line) => {
         const remote = (() => {
           try {
@@ -73,7 +94,23 @@ window.__ModuleLoader__.load({
           return { ok: false, text: String((error && error.message) || error) }
         }
       }
-      return { callHost }
+      return { callHost, sessionIds }
+    }
+
+    /**
+     * Poll `check` until it yields a non-empty value, or give up.
+     *
+     * Needed because the gateway QUEUES a command and returns `{ok:true, value:{commandId}}`:
+     * the write happens after the promise resolves, so a single read right after the call
+     * races the Host and loses.
+     */
+    const poll = async (check, { attempts = 20, delayMs = 400 } = {}) => {
+      for (let index = 0; index < attempts; index += 1) {
+        const value = await check()
+        if (typeof value === 'string' && value.length > 0) return value
+        await new Promise((resolve) => setTimeout(resolve, delayMs))
+      }
+      return ''
     }
 
     const parseJson = (text) => {
@@ -139,11 +176,20 @@ window.__ModuleLoader__.load({
       const consult = async () => {
         setBusy(true)
         setError('')
+        const before = await bridge.sessionIds()
         const reply = await bridge.callHost(sessionId, '/observer-consult')
-        setBusy(false)
         const parsed = reply.ok ? parseJson(reply.text) : undefined
-        const observerId = parsed && typeof parsed.observerSessionId === 'string' ? parsed.observerSessionId : ''
-        if (!reply.ok || observerId.length === 0) {
+        let observerId = parsed && typeof parsed.observerSessionId === 'string' ? parsed.observerSessionId : ''
+        if (observerId.length === 0) {
+          // Queued command: the session appears a moment later. A NEW id is the one we caused.
+          observerId = await poll(async () => {
+            const now = await bridge.sessionIds()
+            const fresh = now.filter((id) => before.indexOf(id) < 0)
+            return fresh.length > 0 ? fresh[0] : ''
+          })
+        }
+        setBusy(false)
+        if (observerId.length === 0) {
           setError(String((parsed && parsed.text) || reply.text || '开启磋商副脑失败'))
           return
         }
@@ -153,24 +199,27 @@ window.__ModuleLoader__.load({
       const summon = async () => {
         setBusy(true)
         setError('')
-        /**
-         * Two attempts, because the gateway has answered a bare `{ok:true}` for this line on
-         * one build: first with the id as an argument, then bare (the Host falls back to the
-         * calling agent). A generic receipt - success without any id - is not success.
-         */
+        const before = await bridge.sessionIds()
         let reply = await bridge.callHost(sessionId, `/observer-create ${sessionId}`)
         let receipt = reply.ok ? parseJson(reply.text) : undefined
         let observerId = receipt && typeof receipt.observerSessionId === 'string' ? receipt.observerSessionId : ''
+
+        /**
+         * QUEUED COMMAND: the gateway answers `{ok:true, value:{commandId}}` and runs the
+         * command afterwards, so the id has to be WAITED for — by watching the binding table
+         * (the authority) and, failing that, by spotting the new session in the list.
+         */
         if (observerId.length === 0) {
-          reply = await bridge.callHost(sessionId, '/observer-create')
-          receipt = reply.ok ? parseJson(reply.text) : undefined
-          observerId = receipt && typeof receipt.observerSessionId === 'string' ? receipt.observerSessionId : ''
-        }
-        if (observerId.length === 0) {
-          const state = await bridge.callHost(sessionId, '/observer-state')
-          const parsed = state.ok ? parseJson(state.text) : undefined
-          observerId =
-            parsed && parsed.bindings && typeof parsed.bindings[sessionId] === 'string' ? parsed.bindings[sessionId] : ''
+          observerId = await poll(async () => {
+            const state = await bridge.callHost(sessionId, '/observer-state')
+            const parsed = state.ok ? parseJson(state.text) : undefined
+            const fromState =
+              parsed && parsed.bindings && typeof parsed.bindings[sessionId] === 'string' ? parsed.bindings[sessionId] : ''
+            if (fromState.length > 0) return fromState
+            const now = await bridge.sessionIds()
+            const fresh = now.filter((id) => before.indexOf(id) < 0)
+            return fresh.length > 0 ? fresh[0] : ''
+          })
         }
         setBusy(false)
         if (!reply.ok && observerId.length === 0) {
