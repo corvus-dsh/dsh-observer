@@ -327,25 +327,36 @@ export function apply(ctx                   , config                          = 
        * successful summon with no follower. Fewer keys, verifiable behaviour.
        */
       handler: async (invocation     ) => {
-        const explicit = commandArg(invocation)
-        const mainSessionId = explicit.length > 0 ? explicit : commandAgent(invocation)
-        // Provenance for the user's Host log: "did my build run at all?" is the first
-        // question when the UI reports a generic receipt.
-        console.log(
-          `[dsh-observer] ${VERSION} command observer-create: raw=${JSON.stringify(
-            invocation?.rawInput ?? invocation?.line ?? null,
-          )} agent=${JSON.stringify(commandAgent(invocation))} -> ${JSON.stringify(mainSessionId)}`,
-        )
-        const result = await createObserver(mainSessionId, 'bind')
-        return {
-          kind: result.ok ? ('success'         ) : ('error'         ),
-          // JSON, so the client can read `observerSessionId` without a second round trip.
-          text: JSON.stringify({
-            ok: result.ok,
-            observerSessionId: result.observerSessionId,
-            mainSessionId,
-            text: result.text,
-          }),
+        try {
+          const explicit = commandArg(invocation)
+          const mainSessionId = explicit.length > 0 ? explicit : commandAgent(invocation)
+          // Provenance for the user's Host log: "did my build run at all?" is the first
+          // question when the UI reports a generic receipt.
+          console.log(
+            `[dsh-observer] ${VERSION} command observer-create: raw=${JSON.stringify(
+              invocation?.rawInput ?? invocation?.line ?? null,
+            )} agent=${JSON.stringify(commandAgent(invocation))} -> ${JSON.stringify(mainSessionId)}`,
+          )
+          const result = await createObserver(mainSessionId, 'bind')
+          return {
+            kind: result.ok ? ('success'         ) : ('error'         ),
+            // JSON, so the client can read `observerSessionId` without a second round trip.
+            text: JSON.stringify({
+              ok: result.ok,
+              observerSessionId: result.observerSessionId,
+              mainSessionId,
+              text: result.text,
+            }),
+          }
+        } catch (error) {
+          /**
+           * v0.1.14 P0: an uncaught throw inside a command handler surfaces to the UI as
+           * `{"ok":false,"error":{"code":"gateway/internal"}}` — a blob the chip used to render
+           * verbatim. Every failure now leaves as a sentence, and the detail goes to the log.
+           */
+          const detail = String((error       )?.message ?? error)
+          ctx.logger?.warn?.(`[dsh-observer] observer-create threw: ${detail}`)
+          return { kind: 'error'         , text: JSON.stringify({ ok: false, observerSessionId: '', text: `召唤失败：${detail}` }) }
         }
       },
     })
@@ -353,10 +364,18 @@ export function apply(ctx                   , config                          = 
       name: 'observer-consult',
       description: '开启前置需求磋商副脑（不绑定主会话）：/observer-consult',
       handler: async () => {
-        const result = await createObserver('', 'consult')
-        return {
-          kind: result.ok ? ('success'         ) : ('error'         ),
-          text: JSON.stringify({ ok: result.ok, observerSessionId: result.observerSessionId, text: result.text }),
+        // Same rule as observer-create: a throw here would reach the UI as
+        // `{"ok":false,"error":{"code":"gateway/internal"}}` instead of a sentence.
+        try {
+          const result = await createObserver('', 'consult')
+          return {
+            kind: result.ok ? ('success'         ) : ('error'         ),
+            text: JSON.stringify({ ok: result.ok, observerSessionId: result.observerSessionId, text: result.text }),
+          }
+        } catch (error) {
+          const detail = String((error       )?.message ?? error)
+          ctx.logger?.warn?.(`[dsh-observer] observer-consult threw: ${detail}`)
+          return { kind: 'error'         , text: JSON.stringify({ ok: false, observerSessionId: '', text: `磋商失败：${detail}` }) }
         }
       },
     })

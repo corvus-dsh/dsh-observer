@@ -21,7 +21,16 @@
 console.log('[dsh-observer] client version 0.1.9 · seats: turnTail+composer+sidebar · consult=yes')
 
 window.__ModuleLoader__.load({
-  id: 'dsh-observer',
+  /**
+   * v0.1.14 — THE MODULE ID CARRIES A VERSION SUFFIX ON PURPOSE.
+   *
+   * `__ModuleLoader__` caches a module per id, so a file change alone can keep serving the
+   * old half across restarts (observed: three rounds of "the new client is not active" while
+   * the file on disk clearly was). Bumping the id forces the loader to treat this as a NEW
+   * module; the file path is versioned too (client-v14.js), so a HTTP-level cache keyed on the
+   * specifier cannot serve the previous copy either.
+   */
+  id: 'dsh-observer-v14',
   factory(require, styles, host) {
     const React = require('react')
     const h = React.createElement
@@ -122,6 +131,28 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * Human-readable failure text.
+     *
+     * A Host error arrives as a JSON blob (`{"ok":false,"error":{"code":"gateway/internal"…}}`)
+     * and the chip used to render it verbatim — a wall of JSON where a sentence belongs. The
+     * full detail goes to the console; the UI says what the user can act on.
+     */
+    const friendly = (text, fallback) => {
+      const raw = String(text || '')
+      if (raw.trim().startsWith('{')) {
+        console.error('[dsh-observer] host failure:', raw)
+        try {
+          const parsed = JSON.parse(raw)
+          const code = parsed && parsed.error && parsed.error.code ? String(parsed.error.code) : ''
+          return `${fallback}（${code || '宿主异常'}）— 点击重试`
+        } catch {
+          return `${fallback} — 点击重试`
+        }
+      }
+      return raw.length > 0 ? raw : fallback
+    }
+
     const CHIP = {
       border: '1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.35))',
       background: 'transparent',
@@ -147,7 +178,7 @@ window.__ModuleLoader__.load({
         if (typeof document !== 'undefined' && document.hidden === true) return
         const reply = await bridge.callHost(sessionId, '/observer-state')
         if (!reply.ok) {
-          setError(String(reply.text || '读取失败'))
+          setError(friendly(reply.text, '读取副脑状态失败'))
           return
         }
         const state = parseJson(reply.text)
@@ -197,7 +228,7 @@ window.__ModuleLoader__.load({
         }
         setBusy(false)
         if (observerId.length === 0) {
-          setError(String((parsed && parsed.text) || reply.text || '开启磋商副脑失败'))
+          setError(friendly((parsed && parsed.text) || reply.text, '开启磋商副脑失败'))
           return
         }
         openNew(observerId)
@@ -227,7 +258,7 @@ window.__ModuleLoader__.load({
         }
         setBusy(false)
         if (!reply.ok && observerId.length === 0) {
-          setError(String((receipt && receipt.text) || reply.text || '召唤失败'))
+          setError(friendly((receipt && receipt.text) || reply.text, '召唤失败'))
           return
         }
         if (observerId.length === 0) {

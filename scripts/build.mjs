@@ -22,3 +22,13 @@ const banner = '// GENERATED from src/index.ts by scripts/build.mjs — do not e
 const output = banner + stripTypeScriptTypes(source, { mode: 'strip' })
 writeFileSync(join(root, 'index.js'), output, 'utf8')
 process.stdout.write(`built index.js (${Buffer.byteLength(output)} bytes)\n`)
+
+/**
+ * The Client half is plain ESM (no type strip), but `exports['./client']` points at a
+ * VERSIONED copy: `__ModuleLoader__` caches per id and the bundler/HTTP layer can cache the
+ * specifier, and a plain file edit was served stale across three restarts. Copying here keeps
+ * the two files byte-identical, and a test asserts they stay that way.
+ */
+const client = readFileSync(join(root, 'client.js'), 'utf8')
+writeFileSync(join(root, 'client-v14.js'), client, 'utf8')
+process.stdout.write(`copied client.js -> client-v14.js (${Buffer.byteLength(client)} bytes)\n`)

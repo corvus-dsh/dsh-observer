@@ -24,7 +24,12 @@ const bundle = readFileSync(join(here, '..', 'client.js'), 'utf8')
 
 test('client: the module is registered through __ModuleLoader__.load with a factory', () => {
   assert.match(bundle, /window\.__ModuleLoader__\.load\(/u, 'the module registers itself with the loader')
-  assert.match(bundle, /id:\s*'dsh-observer'/u, 'under its package name')
+  /**
+   * The id carries a VERSION SUFFIX on purpose: `__ModuleLoader__` caches per id, and a plain
+   * file edit was served stale across three restarts. Bumping the id is what makes the loader
+   * treat this as a new module — so the test requires the prefix, not an exact literal.
+   */
+  assert.match(bundle, /id:\s*'dsh-observer[^']*'/u, 'under its package name (a version suffix is allowed)')
   assert.match(
     bundle,
     /factory\s*\(\s*require\s*,\s*styles\s*,\s*host\s*\)/u,
@@ -125,4 +130,16 @@ test('client: the wait polls the silent channel, not the command channel', () =>
 
 test('client: a hidden tab performs no reads at all', () => {
   assert.match(bundle, /document\.hidden/u, 'reads are skipped while the window is in the background')
+})
+
+/**
+ * v0.1.14 — THE VERSIONED COPY MUST NOT DRIFT.
+ *
+ * `exports['./client']` points at `client-v14.js` so a specifier-level cache cannot serve the
+ * previous file; `scripts/build.mjs` copies the canonical `client.js` over it. Two files with
+ * one meaning is a drift hazard, so the copy is asserted byte-for-byte.
+ */
+test('client: client-v14.js is an exact copy of client.js', () => {
+  const copy = readFileSync(join(here, '..', 'client-v14.js'), 'utf8')
+  assert.equal(copy, bundle, 'run `node scripts/build.mjs` — the versioned client drifted from its source')
 })
