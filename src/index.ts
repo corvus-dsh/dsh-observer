@@ -26,7 +26,7 @@ export const name = 'dsh-observer'
  * Client half is cached separately, and "did my build reach the app?" must be answerable
  * without guessing.
  */
-export const VERSION = '0.1.9'
+export const VERSION = '0.1.15'
 console.log(`[dsh-observer] host version ${VERSION}`)
 
 /**
@@ -329,13 +329,9 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
         try {
           const explicit = commandArg(invocation)
           const mainSessionId = explicit.length > 0 ? explicit : commandAgent(invocation)
-          // Provenance for the user's Host log: "did my build run at all?" is the first
-          // question when the UI reports a generic receipt.
-          console.log(
-            `[dsh-observer] ${VERSION} command observer-create: raw=${JSON.stringify(
-              invocation?.rawInput ?? invocation?.line ?? null,
-            )} agent=${JSON.stringify(commandAgent(invocation))} -> ${JSON.stringify(mainSessionId)}`,
-          )
+          // One line per invocation, not a JSON dump: the log must not become the transcript
+          // problem this plugin was just accused of.
+          ctx.logger?.info?.(`[dsh-observer] create -> ${mainSessionId || '(none)'}`)
           const result = await createObserver(mainSessionId, 'bind')
           return {
             kind: result.ok ? ('success' as const) : ('error' as const),

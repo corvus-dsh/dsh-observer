@@ -24,11 +24,13 @@ writeFileSync(join(root, 'index.js'), output, 'utf8')
 process.stdout.write(`built index.js (${Buffer.byteLength(output)} bytes)\n`)
 
 /**
- * The Client half is plain ESM (no type strip), but `exports['./client']` points at a
- * VERSIONED copy: `__ModuleLoader__` caches per id and the bundler/HTTP layer can cache the
- * specifier, and a plain file edit was served stale across three restarts. Copying here keeps
- * the two files byte-identical, and a test asserts they stay that way.
+ * The Client half is plain ESM and is served as `client.js` — no copy, no versioned file.
+ * v0.1.14 shipped `client-v14.js` plus a versioned module id and the next start died with
+ * `Web authentication failed`; the client entry and its specifier stay exactly where the
+ * sibling plugins keep them.
  */
 const client = readFileSync(join(root, 'client.js'), 'utf8')
-writeFileSync(join(root, 'client-v14.js'), client, 'utf8')
-process.stdout.write(`copied client.js -> client-v14.js (${Buffer.byteLength(client)} bytes)\n`)
+if (/id:\s*'dsh-observer-v/u.test(client)) {
+  throw new Error('client.js must register with the plain id `dsh-observer` — a versioned id broke Web auth')
+}
+process.stdout.write(`client.js ${Buffer.byteLength(client)} bytes (plain id, no polling)\n`)

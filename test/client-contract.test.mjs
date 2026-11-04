@@ -1,16 +1,6 @@
 /**
- * v0.1.5 GUARD — THE CLIENT LOADER CONTRACT.
- *
- * The button was invisible for three rounds because the module called
- *
- *     window.__ModuleLoader__.load({ id, inject, apply })
- *
- * — no `factory`. The loader accepts it and registers NOTHING: the host never receives a
- * plugin object, the slot stays empty, and the console shows only the module-load line. Both
- * sibling plugins use the factory form, which is why their panels appear.
- *
- * This test pins the shape, because a static string check is the only thing that runs in
- * `node --test` (the Client half needs a browser).
+ * dsh-observer — the Client half is plain ESM, so these assertions are the only guard
+ * `node --test` can offer. Every rule below is written from a specific failure.
  */
 
 import test from 'node:test'
@@ -22,26 +12,29 @@ import { dirname, join } from 'node:path'
 const here = dirname(fileURLToPath(import.meta.url))
 const bundle = readFileSync(join(here, '..', 'client.js'), 'utf8')
 
-test('client: the module is registered through __ModuleLoader__.load with a factory', () => {
+/**
+ * Comments are stripped for the "must not appear" assertions: this file documents the bans
+ * (`no setInterval`, `never calls remote.session.list()`) and prose must not fail the guard.
+ */
+const code = bundle.replace(/\/\*[\s\S]*?\*\//gu, '').replace(/(^|[^:])\/\/[^\n]*/gu, '$1')
+
+test('client: registered through __ModuleLoader__.load with a factory and the PLAIN id', () => {
   assert.match(bundle, /window\.__ModuleLoader__\.load\(/u, 'the module registers itself with the loader')
   /**
-   * The id carries a VERSION SUFFIX on purpose: `__ModuleLoader__` caches per id, and a plain
-   * file edit was served stale across three restarts. Bumping the id is what makes the loader
-   * treat this as a new module — so the test requires the prefix, not an exact literal.
+   * The id must stay `dsh-observer`. v0.1.14 renamed it to `dsh-observer-v14` (and served a
+   * versioned file) to defeat a cache; the next start died with
+   * `desktop welcome: Web authentication failed`.
    */
-  assert.match(bundle, /id:\s*'dsh-observer[^']*'/u, 'under its package name (a version suffix is allowed)')
+  assert.match(bundle, /^\s*id:\s*'dsh-observer',$/mu, 'the module id is the plain package name')
+  assert.doesNotMatch(bundle, /id:\s*'dsh-observer-v\d+/u, 'a versioned id broke Web authentication')
   assert.match(
     bundle,
     /factory\s*\(\s*require\s*,\s*styles\s*,\s*host\s*\)/u,
     'the factory form is mandatory: load({ id, inject, apply }) registers nothing',
   )
-  // A factory returns the plugin object, so the loader needs `return {` inside it.
-  assert.match(bundle, /return\s*\{\s*\n\s*\/\*\*/u, 'the factory returns the plugin object')
 })
 
 test('client: the plugin object declares SERVICE keys, not package names', () => {
-  // The header comment shows the shape as `return { inject: [...], apply(ctx) {...} }`, so the
-  // FIRST match is prose. The plugin object is the LAST one in the file.
   const matches = [...bundle.matchAll(/inject:\s*\[([^\]]*)\]/gu)]
   assert.ok(matches.length > 0, 'the plugin object declares inject')
   const keys = matches[matches.length - 1][1]
@@ -54,92 +47,50 @@ test('client: the plugin object declares SERVICE keys, not package names', () =>
   assert.equal(
     keys.some((key) => key.startsWith('@')),
     false,
-    'package names do not grant service access — that is what the property guard rejected',
+    'package names do not grant service access',
   )
 })
 
 test('client: no class components (the sandbox React throws on React.Component)', () => {
-  assert.doesNotMatch(bundle, /extends\s+React\.Component/u, 'a class component breaks registration at load time')
+  assert.doesNotMatch(bundle, /extends\s+React\.Component/u)
 })
 
-test('client: the turn-tail entry takes sessionId from props and never guesses one', () => {
+test('client: the entry takes sessionId from props and never guesses one', () => {
   assert.match(bundle, /conversation\.chat\.turnTail/u, 'registers on the conversation slot')
   assert.match(bundle, /props\?\.sessionId|props\.sessionId/u, 'reads sessionId from the slot props')
-  // The dangerous fallback that could bind a companion to somebody else's session.
-  assert.doesNotMatch(bundle, /session\.list\(/u, 'no "first id in the list" fallback is allowed here')
+  assert.doesNotMatch(code, /session\.list\(/u, 'no "first id in the list" fallback is allowed here')
 })
 
 /**
- * v0.1.7 — COMMAND REPLY SHAPES.
+ * v0.1.15 — CLICK-ONLY BY ORDER OF THE USER.
  *
- * On the live page `/observer-create` answered `{"ok":true}`: a plain object, not
- * `{ kind, text }`. The strict unwrap reported "返回形状无法识别" and the summon looked broken
- * even though the binding had been written. The bridge must accept all three observed shapes,
- * and the summon must read the BINDING TABLE rather than the receipt.
+ * Every command call prints a `observer-state: …` row into the conversation. A poll loop
+ * therefore floods the transcript, and in this host the flood is the user's biggest complaint.
+ * The chip makes one call per click; nothing may run on a timer or enumerate sessions.
  */
-test('client: command replies are normalised, and the summon re-reads the binding table', () => {
-  assert.match(bundle, /normaliseReply/u, 'one place normalises the reply')
-  assert.match(bundle, /JSON\.stringify\(node\)/u, 'a plain object reply is treated as JSON text, not an error')
-  const summon = bundle.slice(bundle.indexOf('const summon ='), bundle.indexOf('const jump ='))
-  assert.match(summon, /observer-state/u, 'the summon asks the authority (the binding table) after creating')
-  assert.match(summon, /绑定表里没有该会话的副脑/u, 'a receipt without a binding is reported, never assumed')
+test('client: no polling of any kind', () => {
+  assert.doesNotMatch(code, /setInterval/u, 'no timer-driven reads')
+  assert.doesNotMatch(code, /const poll = async/u, 'the polling helper was removed on purpose')
+  assert.doesNotMatch(code, /sessionIds\(/u, 'the client must not enumerate sessions while waiting')
 })
 
-/**
- * v0.1.12 — THE QUEUED-COMMAND RECEIPT.
- *
- * The gateway answers `{ok:true, value:{commandId}}` and runs the command AFTERWARDS, so the
- * per-command output never returns to the caller. The first implementation read the binding
- * table once, immediately, lost the race, and told the user the plugin was not active — while
- * the binding was being written a moment later. The client must recognise that receipt shape
- * and POLL.
- */
-test('client: an accepted-but-queued command is polled for, not treated as failure', () => {
-  assert.match(bundle, /commandId/u, 'the async receipt shape is recognised')
-  assert.match(bundle, /accepted/u, 'the reply carries an `accepted` flag')
-  assert.match(bundle, /const poll = async/u, 'a polling helper exists')
-  const summon = bundle.slice(bundle.indexOf('const summon ='), bundle.indexOf('const jump ='))
-  assert.match(summon, /await poll\(/u, 'the summon waits for the binding instead of reading once')
-  const consult = bundle.slice(bundle.indexOf('const consult ='), bundle.indexOf('const summon ='))
-  assert.match(consult, /await poll\(/u, 'the consult waits for the new session instead of reading once')
+test('client: exactly one command call per click', () => {
+  const act = bundle.slice(bundle.indexOf('const act = async'), bundle.indexOf('const jump ='))
+  assert.equal(
+    (act.match(/callHost\(/gu) ?? []).length,
+    1,
+    'one callHost per click — a second call is a second transcript row',
+  )
+  assert.match(act, /observer-create|observer-consult/u, 'it calls the create/consult command')
 })
 
-/**
- * v0.1.13 — THREE UI-LEVEL RULES, all from one screenshot session:
- *
- *   1. a companion must not offer to summon a companion (infinite nesting);
- *   2. polling must use the SILENT channel — each command call prints a `observer-state: …`
- *      row into the transcript, and the user's chat filled with twenty of them;
- *   3. the blank-page consult path needs the same waiting behaviour as the summon.
- */
 test('client: a companion session hides the chip entirely (no nesting)', () => {
   assert.match(bundle, /reverse\[sessionId\]/u, 'the reverse index is consulted to detect "I am a companion"')
   assert.match(bundle, /if \(isObserver\) return null/u, 'the chip does not render in a companion session')
 })
 
-test('client: the wait polls the silent channel, not the command channel', () => {
-  const summon = bundle.slice(bundle.indexOf('const summon ='), bundle.indexOf('const jump ='))
-  const pollCall = summon.slice(summon.indexOf('await poll('), summon.indexOf('setBusy(false)'))
-  assert.match(pollCall, /bridge\.sessionIds\(\)/u, 'the wait uses remote.session.list (no transcript rows)')
-  assert.equal(
-    pollCall.includes('/observer-state'),
-    false,
-    'a command inside the poll would print one row per attempt into the conversation',
-  )
-})
-
-test('client: a hidden tab performs no reads at all', () => {
-  assert.match(bundle, /document\.hidden/u, 'reads are skipped while the window is in the background')
-})
-
-/**
- * v0.1.14 — THE VERSIONED COPY MUST NOT DRIFT.
- *
- * `exports['./client']` points at `client-v14.js` so a specifier-level cache cannot serve the
- * previous file; `scripts/build.mjs` copies the canonical `client.js` over it. Two files with
- * one meaning is a drift hazard, so the copy is asserted byte-for-byte.
- */
-test('client: client-v14.js is an exact copy of client.js', () => {
-  const copy = readFileSync(join(here, '..', 'client-v14.js'), 'utf8')
-  assert.equal(copy, bundle, 'run `node scripts/build.mjs` — the versioned client drifted from its source')
+test('client: a JSON error blob is never rendered verbatim', () => {
+  assert.match(bundle, /const friendly = /u, 'one place turns host failures into a sentence')
+  assert.match(bundle, /console\.error\('\[dsh-observer\] host failure:'/u, 'the detail goes to the console')
+  assert.match(bundle, /点击重试/u, 'the chip offers an action instead of dumping JSON')
 })

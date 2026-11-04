@@ -1,85 +1,50 @@
 /**
- * dsh-observer — the Client half: a turn-tail entry inside the CONVERSATION.
+ * dsh-observer — the Client half: turn-tail / composer / sidebar entry.
  *
- * THE LOADER CONTRACT (this was the bug that made the button invisible three times over):
+ * LOADER CONTRACT (the shape that actually works on this host):
  *
  *     window.__ModuleLoader__.load({
- *       id: '<package name>',
+ *       id: 'dsh-observer',
  *       factory(require, styles, host) { ...; return { inject: [...], apply(ctx) {...} } },
  *     })
  *
- * A module that instead calls `load({ id, inject, apply })` — no factory — is accepted and
- * then registers NOTHING: the host never receives a plugin object. Both sibling plugins
- * (dsh-graft-slice, dsh-memory) use the factory form, which is why their panels appear.
+ * The id is the PLAIN package name. v0.1.14 renamed it to `dsh-observer-v14` and pointed
+ * `exports['./client']` at a versioned copy; the next start died with
+ * `desktop welcome: Web authentication failed`, so the id and the specifier are stable again.
+ * Cache invalidation belongs to the package version, never to renaming this module.
  *
- * Two more rules carried over from those plugins:
- *   - `inject` lists SERVICE keys ('slots', 'remote', 'remote.commands'), not package names;
- *     the Cordis property guard reads exactly that array;
- *   - the sandbox React is minimal, so no class components and no exotic hooks.
+ * NO POLLING. Every command call prints a row into the conversation, so a poll loop floods the
+ * transcript in this host. The chip makes exactly ONE command call per click and reads the
+ * binding table once on mount. It never uses setInterval and never calls remote.session.list().
  */
 
-console.log('[dsh-observer] client version 0.1.9 · seats: turnTail+composer+sidebar · consult=yes')
+console.log('[dsh-observer] client 0.1.15 loaded (click-only, no polling)')
 
 window.__ModuleLoader__.load({
-  /**
-   * v0.1.14 — THE MODULE ID CARRIES A VERSION SUFFIX ON PURPOSE.
-   *
-   * `__ModuleLoader__` caches a module per id, so a file change alone can keep serving the
-   * old half across restarts (observed: three rounds of "the new client is not active" while
-   * the file on disk clearly was). Bumping the id forces the loader to treat this as a NEW
-   * module; the file path is versioned too (client-v14.js), so a HTTP-level cache keyed on the
-   * specifier cannot serve the previous copy either.
-   */
-  id: 'dsh-observer-v14',
+  id: 'dsh-observer',
   factory(require, styles, host) {
     const React = require('react')
     const h = React.createElement
 
     /**
-     * Normalise whatever the gateway hands back into `{ ok, text, accepted }`.
+     * Normalise a gateway command reply into `{ ok, text }`.
      *
-     * FOUR shapes have been observed live, so all four are accepted:
-     *   1. `{ kind: 'success'|'error', text }`  — a command that returns a display line;
-     *   2. `{ result: <one of the above> }`     — the same, wrapped once by the gateway;
-     *   3. a plain object `{ ok: true }`        — a receipt with nothing in it;
-     *   4. `{ ok: true, value: { commandId } }` — AN ASYNCHRONOUS ACCEPT: the command was
-     *      QUEUED, not run. Its output never comes back here, so the caller must poll the
-     *      state instead of treating the empty receipt as a failure. This shape is why the
-     *      button reported "未激活" while the binding was in fact being written.
+     * Observed shapes:
+     *   1. `{ kind: 'success'|'error', text }`   — a command that produces a display line;
+     *   2. `{ result: … }`                       — the same, wrapped once;
+     *   3. `{ ok: true, value: { commandId } }`  — an ASYNC accept: the command was queued and
+     *      its output will not come back here. Treated as accepted, never as a failure.
      */
     const normaliseReply = (value) => {
       const node = value && value.result !== undefined ? value.result : value
       if (node === null || node === undefined) return undefined
-      if (typeof node.text === 'string') {
-        return { ok: node.kind !== 'error', text: node.text, accepted: false }
-      }
-      if (typeof node === 'object') {
-        const commandId = node.value && typeof node.value.commandId === 'string' ? node.value.commandId : ''
-        const accepted = commandId.length > 0 || (node.ok === true && node.value !== undefined)
-        return {
-          ok: node.ok !== false && node.kind !== 'error',
-          text: JSON.stringify(node),
-          accepted,
-        }
-      }
+      if (typeof node.text === 'string') return { ok: node.kind !== 'error', text: node.text }
+      if (typeof node === 'object') return { ok: node.ok !== false && node.kind !== 'error', text: JSON.stringify(node) }
       return undefined
     }
 
     /** Call one Host command AS the given session — the gateway resolves that id. */
     const makeBridge = (ctx) => {
-      /** Every visible session id, for "which one is NEW?" after an async create. */
-      const sessionIds = async () => {
-        try {
-          const remote = ctx.get ? ctx.get('remote') : undefined
-          const namespace = remote && (remote.session || remote.sessionController)
-          if (!namespace || typeof namespace.list !== 'function') return []
-          const reply = await namespace.list({}, undefined)
-          const items = reply && Array.isArray(reply.items) ? reply.items : []
-          return items.map((item) => (item && typeof item.sessionId === 'string' ? item.sessionId : '')).filter(Boolean)
-        } catch {
-          return []
-        }
-      }
       const callHost = async (agentId, line) => {
         const remote = (() => {
           try {
@@ -95,31 +60,20 @@ window.__ModuleLoader__.load({
         try {
           const settled = await commands.execute(agentId, line, [], undefined)
           const execution = normaliseReply(settled)
-          if (execution === undefined) {
-            return { ok: false, text: `返回形状无法识别：${JSON.stringify(settled).slice(0, 160)}` }
-          }
+          if (execution === undefined) return { ok: false, text: `返回形状无法识别：${JSON.stringify(settled).slice(0, 120)}` }
           return execution
         } catch (error) {
           return { ok: false, text: String((error && error.message) || error) }
         }
       }
-      return { callHost, sessionIds }
-    }
-
-    /**
-     * Poll `check` until it yields a non-empty value, or give up.
-     *
-     * Needed because the gateway QUEUES a command and returns `{ok:true, value:{commandId}}`:
-     * the write happens after the promise resolves, so a single read right after the call
-     * races the Host and loses.
-     */
-    const poll = async (check, { attempts = 20, delayMs = 400 } = {}) => {
-      for (let index = 0; index < attempts; index += 1) {
-        const value = await check()
-        if (typeof value === 'string' && value.length > 0) return value
-        await new Promise((resolve) => setTimeout(resolve, delayMs))
+      const ui = () => {
+        try {
+          return ctx.get ? ctx.get('uiWorkspace') : undefined
+        } catch {
+          return undefined
+        }
       }
-      return ''
+      return { callHost, ui }
     }
 
     const parseJson = (text) => {
@@ -131,13 +85,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /**
-     * Human-readable failure text.
-     *
-     * A Host error arrives as a JSON blob (`{"ok":false,"error":{"code":"gateway/internal"…}}`)
-     * and the chip used to render it verbatim — a wall of JSON where a sentence belongs. The
-     * full detail goes to the console; the UI says what the user can act on.
-     */
+    /** A JSON error blob becomes one sentence; the detail goes to the console. */
     const friendly = (text, fallback) => {
       const raw = String(text || '')
       if (raw.trim().startsWith('{')) {
@@ -162,20 +110,16 @@ window.__ModuleLoader__.load({
     }
 
     /** One button, and it says exactly what it will do. */
-    function TurnTail({ sessionId, bridge }) {
+    function ObserverChip({ sessionId, bridge }) {
       const [bound, setBound] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState('')
-      /** True when THIS session is somebody's companion: it must not summon one of its own. */
       const [isObserver, setIsObserver] = React.useState(false)
       const handled = React.useState({ id: '' })[0]
 
-      const refresh = async () => {
-        // A consultation companion has no main session to ask about.
+      /** ONE read on mount: the label and the nesting rule need it. Never on a timer. */
+      const readOnce = async () => {
         if (sessionId.length === 0) return
-        // Every command call lands in the transcript as a row, so a poll that runs often is
-        // visible pollution. One read per mount/action, and never while the tab is hidden.
-        if (typeof document !== 'undefined' && document.hidden === true) return
         const reply = await bridge.callHost(sessionId, '/observer-state')
         if (!reply.ok) {
           setError(friendly(reply.text, '读取副脑状态失败'))
@@ -188,7 +132,7 @@ window.__ModuleLoader__.load({
         setBound(typeof bindings[sessionId] === 'string' ? bindings[sessionId] : '')
         setIsObserver(typeof reverse[sessionId] === 'string')
         setError('')
-        // One-shot focus: a transfer filed the new main session; follow it exactly once.
+        // One-shot focus filed by a transfer: honour it once, then never again.
         if (state.focus && typeof state.focus.sessionId === 'string' && state.focus.sessionId !== handled.id) {
           const ui = bridge.ui()
           if (ui && typeof ui.openSession === 'function') {
@@ -200,115 +144,48 @@ window.__ModuleLoader__.load({
       }
 
       React.useEffect(() => {
-        void refresh()
+        void readOnce()
       }, [sessionId])
 
-      /** Open the session the Host just created, whichever mode produced it. */
-      const openNew = (observerId) => {
+      const open = (id) => {
         const ui = bridge.ui()
-        if (observerId.length > 0 && ui && typeof ui.openSession === 'function') {
-          ui.openSession({ kind: 'session', sessionId: observerId })
+        if (id.length > 0 && ui && typeof ui.openSession === 'function') {
+          ui.openSession({ kind: 'session', sessionId: id })
+          return true
         }
-      }
-
-      const consult = async () => {
-        setBusy(true)
-        setError('')
-        const before = await bridge.sessionIds()
-        const reply = await bridge.callHost(sessionId, '/observer-consult')
-        const parsed = reply.ok ? parseJson(reply.text) : undefined
-        let observerId = parsed && typeof parsed.observerSessionId === 'string' ? parsed.observerSessionId : ''
-        if (observerId.length === 0) {
-          // Queued command: the session appears a moment later. A NEW id is the one we caused.
-          observerId = await poll(async () => {
-            const now = await bridge.sessionIds()
-            const fresh = now.filter((id) => before.indexOf(id) < 0)
-            return fresh.length > 0 ? fresh[0] : ''
-          })
-        }
-        setBusy(false)
-        if (observerId.length === 0) {
-          setError(friendly((parsed && parsed.text) || reply.text, '开启磋商副脑失败'))
-          return
-        }
-        openNew(observerId)
-      }
-
-      const summon = async () => {
-        setBusy(true)
-        setError('')
-        const before = await bridge.sessionIds()
-        let reply = await bridge.callHost(sessionId, `/observer-create ${sessionId}`)
-        let receipt = reply.ok ? parseJson(reply.text) : undefined
-        let observerId = receipt && typeof receipt.observerSessionId === 'string' ? receipt.observerSessionId : ''
-
-        /**
-         * QUEUED COMMAND: the gateway answers `{ok:true, value:{commandId}}` and runs the
-         * command afterwards, so the id has to be WAITED for. The wait uses the SILENT channel
-         * only (`remote.session.list`) — every command call would print a `observer-state: …`
-         * row into the transcript, and twenty of those is what the user saw as chat pollution.
-         * One authoritative state read happens after the wait, not twenty times during it.
-         */
-        if (observerId.length === 0) {
-          observerId = await poll(async () => {
-            const now = await bridge.sessionIds()
-            const fresh = now.filter((id) => before.indexOf(id) < 0)
-            return fresh.length > 0 ? fresh[0] : ''
-          })
-        }
-        setBusy(false)
-        if (!reply.ok && observerId.length === 0) {
-          setError(friendly((receipt && receipt.text) || reply.text, '召唤失败'))
-          return
-        }
-        if (observerId.length === 0) {
-          /**
-           * PLAN B — the Host half can be INACTIVE (a failed entry registers no commands at
-           * all, and the gateway then answers a generic receipt). In that case still give the
-           * user a conversation to talk in: `startSession` is a CLIENT service and needs no
-           * Host command. No pointer is written and no mission is sent, so the message says so
-           * instead of pretending a companion was created.
-           */
-          const ui = bridge.ui()
-          if (ui && typeof ui.startSession === 'function') {
-            try {
-              ui.startSession()
-              setError(
-                `宿主侧副脑插件未激活（命令无回执 id：${String(reply.text).slice(0, 40)}）。已为你打开一个新会话；` +
-                  '插件恢复后即可正常召唤。',
-              )
-              return
-            } catch {
-              // Fall through to the plain report below.
-            }
-          }
-          setError(
-            String(
-              (receipt && receipt.text) ||
-                `召唤回执 ${String(reply.text).slice(0, 80)}，但绑定表里没有该会话的副脑（宿主侧插件可能未激活）`,
-            ),
-          )
-          return
-        }
-        setBound(observerId)
-        openNew(observerId)
-      }
-
-      const jump = () => {
-        const ui = bridge.ui()
-        if (bound.length > 0 && ui && typeof ui.openSession === 'function') {
-          ui.openSession({ kind: 'session', sessionId: bound })
-          return
-        }
-        setError('uiWorkspace.openSession 不可用')
+        return false
       }
 
       /**
-       * NO NESTING. A session that is somebody's companion gets NO chip at all: a companion
-       * that summons a companion can be chained forever, and the whole design says the pair is
-       * exactly two. The Host refuses it too (`副脑会话…不能再给它召唤副脑`); this is the UI half
-       * of the same rule, so the button never even appears there.
+       * ONE call, then report. The Host may answer with the id, or with an async accept whose
+       * output never returns; either way the UI stops here. No polling, no session listing, no
+       * watching the binding table — the worst case is a message that says where to look.
        */
+      const act = async () => {
+        setBusy(true)
+        setError('')
+        const line = sessionId.length === 0 ? '/observer-consult' : `/observer-create ${sessionId}`
+        const reply = await bridge.callHost(sessionId, line)
+        setBusy(false)
+        const parsed = reply.ok ? parseJson(reply.text) : undefined
+        const observerId = parsed && typeof parsed.observerSessionId === 'string' ? parsed.observerSessionId : ''
+        if (observerId.length > 0) {
+          setBound(observerId)
+          if (open(observerId)) return
+        }
+        if (!reply.ok) {
+          setError(friendly((parsed && parsed.text) || reply.text, '副脑召唤失败'))
+          return
+        }
+        setError('已提交，正在创建副脑；若界面未自动切换，请稍后在左侧会话列表中选择新会话。')
+      }
+
+      const jump = () => {
+        if (bound.length > 0 && open(bound)) return
+        setError('uiWorkspace.openSession 不可用')
+      }
+
+      /** A companion must not summon a companion: no chip at all in that session. */
       if (isObserver) return null
 
       return h(
@@ -323,12 +200,12 @@ window.__ModuleLoader__.load({
               disabled: busy,
               style: { ...CHIP, cursor: busy ? 'default' : 'pointer' },
               title:
-                bound === ''
-                  ? sessionId.length === 0
+                bound !== ''
+                  ? `已绑定 ${bound}`
+                  : sessionId.length === 0
                     ? '在空白会话里先与副脑磋商需求'
-                    : `为主会话 ${sessionId} 召唤副脑`
-                  : `已绑定 ${bound}`,
-              onClick: bound !== '' ? jump : sessionId.length === 0 ? consult : summon,
+                    : `为主会话 ${sessionId} 召唤副脑`,
+              onClick: bound !== '' ? jump : act,
             },
             busy
               ? '🧠 处理中…'
@@ -343,26 +220,14 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /**
-     * Function-component error trap: a throwing render leaves a red chip, not a blank strip.
-     * (No class component — the sandbox React throws on `React.Component` at module scope,
-     * which kills registration before it happens.)
-     *
-     * `allowConsult` is for the ROOT-scoped seats (composer / sidebar): they can render with no
-     * Session at all (the blank page), and there the chip is a pre-discussion companion rather
-     * than a follower. The turn-tail seat keeps the strict rule and renders nothing without an
-     * id, because binding a companion to a guessed session is what we must never do.
-     */
+    /** Function-component error trap: a throwing render leaves a red chip, not a blank strip. */
     const makeEntry =
       (bridge, { allowConsult = false } = {}) =>
       (props) => {
         try {
           const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
-          if (sessionId.length === 0 && !allowConsult) {
-            console.warn('[dsh-observer] turnTail: no sessionId; prop keys =', props ? Object.keys(props) : props)
-            return null
-          }
-          return h(TurnTail, { sessionId, bridge })
+          if (sessionId.length === 0 && !allowConsult) return null
+          return h(ObserverChip, { sessionId, bridge })
         } catch (error) {
           const message = String((error && error.message) || error)
           console.error('[dsh-observer] entry crashed:', message)
@@ -375,22 +240,6 @@ window.__ModuleLoader__.load({
       inject: ['slots', 'remote', 'remote.commands'],
       apply(ctx) {
         const bridge = makeBridge(ctx)
-        bridge.ui = () => {
-          try {
-            return ctx.get ? ctx.get('uiWorkspace') : undefined
-          } catch {
-            return undefined
-          }
-        }
-        /**
-         * THREE SEATS, one component.
-         *
-         * `conversation.chat.turnTail`   — after a completed turn (session scope, needs an id).
-         * `conversation.input.left`      — compact control in the composer tool row.
-         * `sidebar.footer.action`        — ROOT scope, so it exists on the blank page too, where
-         *                                  there is no Session to bind and the chip becomes
-         *                                  「🧠 副脑磋商」 (pre-discussion, no pointer).
-         */
         const seats = [
           { name: 'conversation.chat.turnTail', id: 'observer-turntail', order: 60, allowConsult: false },
           { name: 'conversation.input.left', id: 'observer-composer', order: 60, allowConsult: true },
@@ -405,12 +254,11 @@ window.__ModuleLoader__.load({
               )
               return () => {}
             })
-            console.log(`[dsh-observer] registered ${seat.name}`)
           } catch (error) {
-            // One missing seat must not cost the others: report and continue.
             console.error(`[dsh-observer] ${seat.name} registration failed:`, String((error && error.message) || error))
           }
         }
+        console.log('[dsh-observer] client seats registered (turntail, composer, sidebar)')
       },
       __makeEntryForTest: makeEntry,
       __makeBridgeForTest: makeBridge,
