@@ -299,7 +299,10 @@ export function apply(ctx                   , config                          = 
           ok: { type: 'boolean' },
           bindings: { type: 'object' },
           reverse: { type: 'object' },
-          focus: { type: 'object' },
+          // Nullable on purpose: "no pending focus" is a real, normal state, and a schema
+          // that only accepts an object makes the Host reject the whole reply
+          // ("value.focus must be an object") the moment nothing is pending.
+          focus: { anyOf: [{ type: 'object' }, { type: 'null' }] },
           focusConsumed: { type: 'boolean' },
         },
         required: ['ok'],
