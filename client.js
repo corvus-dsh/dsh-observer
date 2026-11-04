@@ -18,7 +18,7 @@
  *   - the sandbox React is minimal, so no class components and no exotic hooks.
  */
 
-console.log('[dsh-observer] client loaded')
+console.log('[dsh-observer] client version 0.1.9 · seats: turnTail+composer+sidebar · consult=yes')
 
 window.__ModuleLoader__.load({
   id: 'dsh-observer',
@@ -153,21 +153,19 @@ window.__ModuleLoader__.load({
       const summon = async () => {
         setBusy(true)
         setError('')
-        const reply = await bridge.callHost(sessionId, `/observer-create ${sessionId}`)
-        if (!reply.ok) {
-          setBusy(false)
-          setError(String(reply.text || '召唤失败'))
-          return
-        }
         /**
-         * The Host answers JSON now (`{ok, observerSessionId, text}`). The binding table is
-         * still consulted when that id is missing, but the receipt is no longer ignored: the
-         * old code re-read state even when create had already failed, which is how a false
-         * success looked like a successful summon.
+         * Two attempts, because the gateway has answered a bare `{ok:true}` for this line on
+         * one build: first with the id as an argument, then bare (the Host falls back to the
+         * calling agent). A generic receipt - success without any id - is not success.
          */
-        const receipt = parseJson(reply.text)
-        const fromReceipt = receipt && typeof receipt.observerSessionId === 'string' ? receipt.observerSessionId : ''
-        let observerId = fromReceipt
+        let reply = await bridge.callHost(sessionId, `/observer-create ${sessionId}`)
+        let receipt = reply.ok ? parseJson(reply.text) : undefined
+        let observerId = receipt && typeof receipt.observerSessionId === 'string' ? receipt.observerSessionId : ''
+        if (observerId.length === 0) {
+          reply = await bridge.callHost(sessionId, '/observer-create')
+          receipt = reply.ok ? parseJson(reply.text) : undefined
+          observerId = receipt && typeof receipt.observerSessionId === 'string' ? receipt.observerSessionId : ''
+        }
         if (observerId.length === 0) {
           const state = await bridge.callHost(sessionId, '/observer-state')
           const parsed = state.ok ? parseJson(state.text) : undefined
@@ -175,8 +173,17 @@ window.__ModuleLoader__.load({
             parsed && parsed.bindings && typeof parsed.bindings[sessionId] === 'string' ? parsed.bindings[sessionId] : ''
         }
         setBusy(false)
+        if (!reply.ok && observerId.length === 0) {
+          setError(String((receipt && receipt.text) || reply.text || '召唤失败'))
+          return
+        }
         if (observerId.length === 0) {
-          setError(String((receipt && receipt.text) || `召唤回执 ${String(reply.text).slice(0, 80)}，但绑定表里没有该会话的副脑`))
+          setError(
+            String(
+              (receipt && receipt.text) ||
+                `召唤回执 ${String(reply.text).slice(0, 80)}，但绑定表里没有该会话的副脑（宿主可能未加载 0.1.9）`,
+            ),
+          )
           return
         }
         setBound(observerId)

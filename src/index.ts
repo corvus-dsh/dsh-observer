@@ -22,6 +22,14 @@ import { dirname, join } from 'node:path'
 export const name = 'dsh-observer'
 
 /**
+ * Version probe. Printed at IMPORT time so the Host log proves which copy is live — the
+ * Client half is cached separately, and "did my build reach the app?" must be answerable
+ * without guessing.
+ */
+export const VERSION = '0.1.9'
+console.log(`[dsh-observer] host version ${VERSION}`)
+
+/**
  * Hard dependencies: tools (the model-facing surface) and sessionController (creating and
  * prompting the follower session). Everything else is optional and probed with `ctx.get`.
  */
@@ -320,6 +328,13 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       handler: async (invocation: any) => {
         const explicit = commandArg(invocation)
         const mainSessionId = explicit.length > 0 ? explicit : commandAgent(invocation)
+        // Provenance for the user's Host log: "did my build run at all?" is the first
+        // question when the UI reports a generic receipt.
+        console.log(
+          `[dsh-observer] ${VERSION} command observer-create: raw=${JSON.stringify(
+            invocation?.rawInput ?? invocation?.line ?? null,
+          )} agent=${JSON.stringify(commandAgent(invocation))} -> ${JSON.stringify(mainSessionId)}`,
+        )
         const result = await createObserver(mainSessionId, 'bind')
         return {
           kind: result.ok ? ('success' as const) : ('error' as const),
