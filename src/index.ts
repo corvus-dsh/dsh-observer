@@ -257,6 +257,23 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       properties: { mainSessionId: { type: 'string', description: 'Session to observe. Default: the calling session.' } },
       additionalProperties: false,
     },
+    /**
+     * v0.1.3 P0 — an explicit OUTPUT contract is mandatory on 0.2.2; without it the whole
+     * entry fails to activate (and takes the Web boot with it).
+     */
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          observerSessionId: { type: 'string' },
+          text: { type: 'string' },
+        },
+        required: ['ok'],
+        additionalProperties: true,
+      },
+      render: (_args: unknown, value: any) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
     execute: async (args: { mainSessionId?: unknown }, exec: any) => {
       const explicit = typeof args?.mainSessionId === 'string' ? args.mainSessionId.trim() : ''
       const mainSessionId = explicit.length > 0 ? explicit : typeof exec?.agent?.id === 'string' ? exec.agent.id : ''
@@ -273,6 +290,21 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       type: 'object',
       properties: { ackFocus: { type: 'boolean', description: 'Consume the pending focus request.' } },
       additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          bindings: { type: 'object' },
+          reverse: { type: 'object' },
+          focus: { type: 'object' },
+          focusConsumed: { type: 'boolean' },
+        },
+        required: ['ok'],
+        additionalProperties: true,
+      },
+      render: (_args: unknown, value: any) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     execute: async (args: { ackFocus?: unknown }) => {
       const pending = state.focus
@@ -299,3 +331,10 @@ export function debugFollowTransfer(sourceSessionId: string, newSessionId: strin
 }
 
 export { EMPTY }
+
+/**
+ * v0.1.3: `manifest.json` names `activate`, and the Loader looks for it. Exporting the alias
+ * is what turns "导入失败" into a successful import — the entry loader checks this name
+ * before it ever calls the function.
+ */
+export const activate = apply
