@@ -1,6 +1,6 @@
 {
   "name": "dsh-observer",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Companion (follower) session for DSH. Listens to graft/session-transferred and rewrites its own pointer; never retired, never sliced.",
   "entry": "index.js",
   "activate": "activate(ctx, config)",

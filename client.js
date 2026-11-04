@@ -135,11 +135,16 @@ window.__ModuleLoader__.load({
       const [bound, setBound] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState('')
+      /** True when THIS session is somebody's companion: it must not summon one of its own. */
+      const [isObserver, setIsObserver] = React.useState(false)
       const handled = React.useState({ id: '' })[0]
 
       const refresh = async () => {
         // A consultation companion has no main session to ask about.
         if (sessionId.length === 0) return
+        // Every command call lands in the transcript as a row, so a poll that runs often is
+        // visible pollution. One read per mount/action, and never while the tab is hidden.
+        if (typeof document !== 'undefined' && document.hidden === true) return
         const reply = await bridge.callHost(sessionId, '/observer-state')
         if (!reply.ok) {
           setError(String(reply.text || '读取失败'))
@@ -148,7 +153,9 @@ window.__ModuleLoader__.load({
         const state = parseJson(reply.text)
         if (state === undefined) return
         const bindings = state.bindings && typeof state.bindings === 'object' ? state.bindings : {}
+        const reverse = state.reverse && typeof state.reverse === 'object' ? state.reverse : {}
         setBound(typeof bindings[sessionId] === 'string' ? bindings[sessionId] : '')
+        setIsObserver(typeof reverse[sessionId] === 'string')
         setError('')
         // One-shot focus: a transfer filed the new main session; follow it exactly once.
         if (state.focus && typeof state.focus.sessionId === 'string' && state.focus.sessionId !== handled.id) {
@@ -206,16 +213,13 @@ window.__ModuleLoader__.load({
 
         /**
          * QUEUED COMMAND: the gateway answers `{ok:true, value:{commandId}}` and runs the
-         * command afterwards, so the id has to be WAITED for — by watching the binding table
-         * (the authority) and, failing that, by spotting the new session in the list.
+         * command afterwards, so the id has to be WAITED for. The wait uses the SILENT channel
+         * only (`remote.session.list`) — every command call would print a `observer-state: …`
+         * row into the transcript, and twenty of those is what the user saw as chat pollution.
+         * One authoritative state read happens after the wait, not twenty times during it.
          */
         if (observerId.length === 0) {
           observerId = await poll(async () => {
-            const state = await bridge.callHost(sessionId, '/observer-state')
-            const parsed = state.ok ? parseJson(state.text) : undefined
-            const fromState =
-              parsed && parsed.bindings && typeof parsed.bindings[sessionId] === 'string' ? parsed.bindings[sessionId] : ''
-            if (fromState.length > 0) return fromState
             const now = await bridge.sessionIds()
             const fresh = now.filter((id) => before.indexOf(id) < 0)
             return fresh.length > 0 ? fresh[0] : ''
@@ -267,6 +271,14 @@ window.__ModuleLoader__.load({
         }
         setError('uiWorkspace.openSession 不可用')
       }
+
+      /**
+       * NO NESTING. A session that is somebody's companion gets NO chip at all: a companion
+       * that summons a companion can be chained forever, and the whole design says the pair is
+       * exactly two. The Host refuses it too (`副脑会话…不能再给它召唤副脑`); this is the UI half
+       * of the same rule, so the button never even appears there.
+       */
+      if (isObserver) return null
 
       return h(
         'div',

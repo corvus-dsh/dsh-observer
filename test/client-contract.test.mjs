@@ -98,3 +98,31 @@ test('client: an accepted-but-queued command is polled for, not treated as failu
   const consult = bundle.slice(bundle.indexOf('const consult ='), bundle.indexOf('const summon ='))
   assert.match(consult, /await poll\(/u, 'the consult waits for the new session instead of reading once')
 })
+
+/**
+ * v0.1.13 — THREE UI-LEVEL RULES, all from one screenshot session:
+ *
+ *   1. a companion must not offer to summon a companion (infinite nesting);
+ *   2. polling must use the SILENT channel — each command call prints a `observer-state: …`
+ *      row into the transcript, and the user's chat filled with twenty of them;
+ *   3. the blank-page consult path needs the same waiting behaviour as the summon.
+ */
+test('client: a companion session hides the chip entirely (no nesting)', () => {
+  assert.match(bundle, /reverse\[sessionId\]/u, 'the reverse index is consulted to detect "I am a companion"')
+  assert.match(bundle, /if \(isObserver\) return null/u, 'the chip does not render in a companion session')
+})
+
+test('client: the wait polls the silent channel, not the command channel', () => {
+  const summon = bundle.slice(bundle.indexOf('const summon ='), bundle.indexOf('const jump ='))
+  const pollCall = summon.slice(summon.indexOf('await poll('), summon.indexOf('setBusy(false)'))
+  assert.match(pollCall, /bridge\.sessionIds\(\)/u, 'the wait uses remote.session.list (no transcript rows)')
+  assert.equal(
+    pollCall.includes('/observer-state'),
+    false,
+    'a command inside the poll would print one row per attempt into the conversation',
+  )
+})
+
+test('client: a hidden tab performs no reads at all', () => {
+  assert.match(bundle, /document\.hidden/u, 'reads are skipped while the window is in the background')
+})
