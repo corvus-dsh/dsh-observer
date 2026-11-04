@@ -1,18 +1,21 @@
 /**
  * dsh-observer — the Client half: a turn-tail entry inside the CONVERSATION.
  *
- * TWO HARD RULES, both learned the expensive way:
+ * THREE RULES, each from a real failure:
  *
- *   1. THE SESSION ID COMES FROM THE SLOT, NEVER FROM A GUESS.
- *      `conversation.chat.turnTail` is a `session`-scoped slot and `sessionId` is one of its
- *      STANDARD props (verified through the live Slot catalog: standardProps includes
- *      `sessionId: SessionId`). If it is missing, this component renders NOTHING — binding a
- *      companion to "the first id in the list" would attach it to somebody else's session.
+ *   1. NO CLASS COMPONENTS. The client sandbox hands back a MINIMAL React (createElement plus
+ *      a couple of hooks — the sibling panel plugins say so in their own comments). Touching
+ *      `React.Component` at module scope throws while the module is being evaluated, and an
+ *      evaluated-and-crashed module registers nothing: the slot stays empty and the console
+ *      shows only a load error. Everything here is a plain function component.
  *
- *   2. A RENDER FAILURE MUST BE VISIBLE.
- *      An unloaded client module and a throwing component look identical from the outside:
- *      nothing appears. The console line at module load and the error chip below exist so
- *      those two causes can be told apart in ten seconds instead of four rounds.
+ *   2. THE SESSION ID COMES FROM THE SLOT. `conversation.chat.turnTail` is session-scoped and
+ *      `sessionId` is a STANDARD prop (verified against the live Slot catalog). If it is
+ *      missing this renders NOTHING — binding a companion to "the first id in the list" would
+ *      attach it to somebody else's session.
+ *
+ *   3. EVERY STAGE ANNOUNCES ITSELF. "Nothing appeared" is the worst symptom to debug, so the
+ *      module logs on load, on registration, and (loudly) when it refuses to render.
  */
 
 console.log('[dsh-observer] client loaded')
@@ -24,7 +27,6 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
 
-    /** Peel the command envelope: `{ kind, text }`, optionally wrapped in `result`. */
     const unwrapExecution = (value) => {
       const node = value && value.result !== undefined ? value.result : value
       if (node && typeof node.text === 'string') {
@@ -33,13 +35,7 @@ window.__ModuleLoader__.load({
       return undefined
     }
 
-    /**
-     * Call one Host command AS the session this turn belongs to.
-     *
-     * `agentId` must be a REAL session id: the gateway resolves it and answers
-     * `session/not-found` for anything else. That is why this function takes the id instead
-     * of looking one up.
-     */
+    /** Call one Host command AS the given session — the gateway resolves that id. */
     const callHost = async (agentId, line) => {
       const remote = (() => {
         try {
@@ -55,9 +51,7 @@ window.__ModuleLoader__.load({
       try {
         const settled = await commands.execute(agentId, line, [], undefined)
         const execution = unwrapExecution(settled)
-        if (execution === undefined) {
-          return { ok: false, text: `无法识别的返回形状：${JSON.stringify(settled).slice(0, 200)}` }
-        }
+        if (execution === undefined) return { ok: false, text: `返回形状无法识别：${JSON.stringify(settled).slice(0, 160)}` }
         return { ok: execution.kind !== 'error', text: execution.text }
       } catch (error) {
         return { ok: false, text: String((error && error.message) || error) }
@@ -78,11 +72,9 @@ window.__ModuleLoader__.load({
       background: 'transparent',
       borderRadius: '999px',
       padding: '3px 10px',
-      cursor: 'pointer',
       font: 'inherit',
     }
 
-    /** One button, and it says exactly what it will do. */
     function TurnTail({ sessionId }) {
       const [bound, setBound] = React.useState('')
       const [busy, setBusy] = React.useState(false)
@@ -98,10 +90,8 @@ window.__ModuleLoader__.load({
         const state = parseJson(reply.text)
         if (state === undefined) return
         const bindings = state.bindings && typeof state.bindings === 'object' ? state.bindings : {}
-        const observer = typeof bindings[sessionId] === 'string' ? bindings[sessionId] : ''
-        setBound(observer)
+        setBound(typeof bindings[sessionId] === 'string' ? bindings[sessionId] : '')
         setError('')
-        // One-shot focus: a transfer filed the new main session; follow it exactly once.
         if (state.focus && typeof state.focus.sessionId === 'string' && state.focus.sessionId !== handled.id) {
           const ui = ctx.get ? ctx.get('uiWorkspace') : undefined
           if (ui && typeof ui.openSession === 'function') {
@@ -161,45 +151,41 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    /** A throwing child must leave a red chip, not a blank strip. */
-    class Boundary extends React.Component {
-      constructor(props) {
-        super(props)
-        this.state = { message: '' }
-      }
-
-      static getDerivedStateFromError(error) {
-        return { message: String((error && error.message) || error) }
-      }
-
-      render() {
-        if (this.state.message.length > 0) {
-          return h('span', { style: { color: '#b91c1c', fontSize: '12px' } }, `[Observer Error] ${this.state.message}`)
-        }
-        return this.props.children
-      }
-    }
-
+    /**
+     * Function-component error trap: a throwing render must leave a red chip, not a blank
+     * strip. (No class component: see rule 1 at the top of this file.)
+     */
     const Entry = (props) => {
-      const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
-      if (sessionId.length === 0) {
-        // No id, no button. Guessing would bind the wrong session (see the header rule).
-        console.warn('[dsh-observer] turnTail received no sessionId; props keys =', props ? Object.keys(props) : props)
-        return null
+      try {
+        const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
+        if (sessionId.length === 0) {
+          console.warn('[dsh-observer] turnTail: no sessionId; prop keys =', props ? Object.keys(props) : props)
+          return null
+        }
+        return h(TurnTail, { sessionId })
+      } catch (error) {
+        const message = String((error && error.message) || error)
+        console.error('[dsh-observer] turnTail crashed:', message)
+        return h('span', { style: { color: '#b91c1c', fontSize: '12px' } }, `[Observer Error] ${message}`)
       }
-      return h(Boundary, null, h(TurnTail, { sessionId }))
     }
 
-    ctx.slots.inject('conversation.chat.turnTail', () =>
-      ctx.slots.register(
-        {
-          name: 'conversation.chat.turnTail',
-          id: 'observer-turntail',
-          order: 60,
-          label: () => '副脑',
-        },
-        Entry,
-      ),
-    )
+    try {
+      ctx.slots.inject('conversation.chat.turnTail', () => {
+        ctx.slots.register(
+          {
+            name: 'conversation.chat.turnTail',
+            id: 'observer-turntail',
+            order: 60,
+            label: () => '副脑',
+          },
+          Entry,
+        )
+        console.log('[dsh-observer] turnTail registered')
+        return () => {}
+      })
+    } catch (error) {
+      console.error('[dsh-observer] slot registration failed:', String((error && error.message) || error))
+    }
   },
 })
