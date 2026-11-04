@@ -69,7 +69,17 @@ window.__ModuleLoader__.load({
       const ui = () => {
         try {
           return ctx.get ? ctx.get('uiWorkspace') : undefined
-        } catch {
+        } catch (error) {
+          /**
+           * v0.1.16 — THE REASON A RETURNED ID DID NOT OPEN A WINDOW.
+           *
+           * `uiWorkspace` was NOT in this plugin's `inject` array, so the Cordis property guard
+           * threw `cannot get property "uiWorkspace" without inject`; the old catch swallowed it,
+           * `ui()` answered undefined, and the chip fell through to "请稍后在列表中选择" while
+           * holding a perfectly good session id. It is in `inject` now (see the plugin object),
+           * and this logs instead of hiding the cause.
+           */
+          console.error('[dsh-observer] uiWorkspace unavailable:', String((error && error.message) || error))
           return undefined
         }
       }
@@ -84,6 +94,9 @@ window.__ModuleLoader__.load({
         return undefined
       }
     }
+
+    /** Sessions whose state has already been read in this page load (see readOnce). */
+    const readSessions = new Set()
 
     /** A JSON error blob becomes one sentence; the detail goes to the console. */
     const friendly = (text, fallback) => {
@@ -117,7 +130,14 @@ window.__ModuleLoader__.load({
       const [isObserver, setIsObserver] = React.useState(false)
       const handled = React.useState({ id: '' })[0]
 
-      /** ONE read on mount: the label and the nesting rule need it. Never on a timer. */
+      /**
+       * ONE read per session per page load — not per mount.
+       *
+       * Three seats render this chip (turn-tail, composer, sidebar), and every re-render used to
+       * fire its own `/observer-state`: that is the "ghost polling" the transcript showed, dozens
+       * of rows with no timer in the code. A shared Set makes it exactly one row per session,
+       * for the label and the nesting rule, and never again.
+       */
       const readOnce = async () => {
         if (sessionId.length === 0) return
         const reply = await bridge.callHost(sessionId, '/observer-state')
@@ -134,26 +154,44 @@ window.__ModuleLoader__.load({
         setError('')
         // One-shot focus filed by a transfer: honour it once, then never again.
         if (state.focus && typeof state.focus.sessionId === 'string' && state.focus.sessionId !== handled.id) {
-          const ui = bridge.ui()
-          if (ui && typeof ui.openSession === 'function') {
-            ui.openSession({ kind: 'session', sessionId: state.focus.sessionId })
-            handled.id = state.focus.sessionId
-          }
+          open(state.focus.sessionId)
+          handled.id = state.focus.sessionId
           void bridge.callHost(sessionId, '/observer-focus-ack')
         }
       }
 
       React.useEffect(() => {
+        if (sessionId.length === 0) return
+        if (readSessions.has(sessionId)) return
+        readSessions.add(sessionId)
         void readOnce()
       }, [sessionId])
 
+      /**
+       * Open a session in the window. `uiWorkspace.openSession` takes the SessionTarget object
+       * `{ kind: 'session', sessionId }`; the string form is kept as a fallback for a host that
+       * resolves a bare id, so a single signature change cannot silently eat the jump.
+       */
       const open = (id) => {
-        const ui = bridge.ui()
-        if (id.length > 0 && ui && typeof ui.openSession === 'function') {
-          ui.openSession({ kind: 'session', sessionId: id })
-          return true
+        if (id.length === 0) return false
+        const workspaceUi = bridge.ui()
+        if (!workspaceUi || typeof workspaceUi.openSession !== 'function') {
+          setError('uiWorkspace.openSession 不可用（inject 未生效）')
+          return false
         }
-        return false
+        try {
+          workspaceUi.openSession({ kind: 'session', sessionId: id })
+          return true
+        } catch (error) {
+          try {
+            workspaceUi.openSession(id)
+            return true
+          } catch (fallbackError) {
+            console.error('[dsh-observer] openSession failed:', String((fallbackError && fallbackError.message) || fallbackError))
+            setError(`无法打开会话 ${id}`)
+            return false
+          }
+        }
       }
 
       /**
@@ -220,37 +258,49 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** Function-component error trap: a throwing render leaves a red chip, not a blank strip. */
-    const makeEntry =
-      (bridge, { allowConsult = false } = {}) =>
-      (props) => {
-        try {
-          const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
-          if (sessionId.length === 0 && !allowConsult) return null
-          return h(ObserverChip, { sessionId, bridge })
-        } catch (error) {
-          const message = String((error && error.message) || error)
-          console.error('[dsh-observer] entry crashed:', message)
-          return h('span', { style: { color: '#b91c1c', fontSize: '12px' } }, `[Observer Error] ${message}`)
-        }
+    /**
+     * Function-component error trap: a throwing render leaves a red chip, not a blank strip.
+     *
+     * v0.1.16: NO SEAT RENDERS WITHOUT A SESSION ID. A root-scoped seat (sidebar) has no
+     * `sessionId` prop, so the chip used to send `/observer-consult` with an EMPTY agent id —
+     * and the gateway answered `{"ok":false,"error":{"code":"gateway/internal"}}` before the
+     * handler ever ran. Rendering nothing there is honest; the composer and turn-tail seats do
+     * carry an id, so the feature stays reachable in every real conversation.
+     */
+    const makeEntry = (bridge) => (props) => {
+      try {
+        const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
+        if (sessionId.length === 0) return null
+        return h(ObserverChip, { sessionId, bridge })
+      } catch (error) {
+        const message = String((error && error.message) || error)
+        console.error('[dsh-observer] entry crashed:', message)
+        return h('span', { style: { color: '#b91c1c', fontSize: '12px' } }, `[Observer Error] ${message}`)
       }
+    }
 
     return {
-      /** Service keys, not package names — the Cordis guard reads this array. */
-      inject: ['slots', 'remote', 'remote.commands'],
+      /**
+       * Service keys, not package names — the Cordis guard reads this array.
+       *
+       * `uiWorkspace` belongs here: without it `ctx.get('uiWorkspace')` throws, the catch
+       * swallowed the message, and a freshly created companion id was never opened (the chip
+       * said "请稍后在列表中选择" while the id was already in hand).
+       */
+      inject: ['slots', 'remote', 'remote.commands', 'uiWorkspace'],
       apply(ctx) {
         const bridge = makeBridge(ctx)
         const seats = [
-          { name: 'conversation.chat.turnTail', id: 'observer-turntail', order: 60, allowConsult: false },
-          { name: 'conversation.input.left', id: 'observer-composer', order: 60, allowConsult: true },
-          { name: 'sidebar.footer.action', id: 'observer-sidebar', order: 60, allowConsult: true },
+          { name: 'conversation.chat.turnTail', id: 'observer-turntail', order: 60 },
+          { name: 'conversation.input.left', id: 'observer-composer', order: 60 },
+          { name: 'sidebar.footer.action', id: 'observer-sidebar', order: 60 },
         ]
         for (const seat of seats) {
           try {
             ctx.slots.inject(seat.name, () => {
               ctx.slots.register(
                 { name: seat.name, id: seat.id, order: seat.order, label: () => '副脑' },
-                makeEntry(bridge, { allowConsult: seat.allowConsult }),
+                makeEntry(bridge),
               )
               return () => {}
             })

@@ -26,7 +26,7 @@ export const name = 'dsh-observer'
  * Client half is cached separately, and "did my build reach the app?" must be answerable
  * without guessing.
  */
-export const VERSION = '0.1.15'
+export const VERSION = '0.1.16'
 console.log(`[dsh-observer] host version ${VERSION}`)
 
 /**

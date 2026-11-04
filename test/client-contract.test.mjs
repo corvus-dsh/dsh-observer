@@ -41,7 +41,7 @@ test('client: the plugin object declares SERVICE keys, not package names', () =>
     .split(',')
     .map((part) => part.trim().replace(/^['"]|['"]$/gu, ''))
     .filter(Boolean)
-  for (const required of ['slots', 'remote', 'remote.commands']) {
+  for (const required of ['slots', 'remote', 'remote.commands', 'uiWorkspace']) {
     assert.ok(keys.includes(required), `inject must include the SERVICE key '${required}'`)
   }
   assert.equal(
@@ -49,6 +49,32 @@ test('client: the plugin object declares SERVICE keys, not package names', () =>
     false,
     'package names do not grant service access',
   )
+})
+
+/**
+ * v0.1.16 — WHY A RETURNED ID DID NOT OPEN A WINDOW.
+ *
+ * `uiWorkspace` was missing from `inject`, so `ctx.get('uiWorkspace')` threw, the catch hid it,
+ * and the chip told the user to find the session by hand while holding its id.
+ */
+test('client: openSession uses the SessionTarget object through the injected service', () => {
+  assert.match(code, /workspaceUi\.openSession/u, 'it opens through the uiWorkspace service')
+  assert.match(code, /kind:\s*'session',\s*sessionId:\s*id/u, 'the documented target shape is used')
+})
+
+/**
+ * v0.1.16 — ONE STATE READ PER SESSION, NOT PER MOUNT.
+ *
+ * Three seats render the chip and each re-render mounts it again; every mount used to fire
+ * `/observer-state`, which is the "ghost polling" in the transcript (dozens of rows, no timer).
+ */
+test('client: state is read at most once per session per page load', () => {
+  assert.match(code, /const readSessions = new Set\(\)/u, 'a shared set remembers what was read')
+  assert.match(code, /readSessions\.has\(sessionId\)/u, 'the effect consults it before reading')
+})
+
+test('client: a seat without a session id renders nothing (no empty-id command)', () => {
+  assert.match(code, /if \(sessionId\.length === 0\) return null/u, 'no chip without a session to act on')
 })
 
 test('client: no class components (the sandbox React throws on React.Component)', () => {
