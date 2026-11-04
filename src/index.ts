@@ -206,6 +206,47 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
     }
   }
 
+  /**
+   * v0.1 CLIENT CHANNEL: the UI reaches the Host only through commands (tools need an
+   * agent). Three of them, all session-independent, so a turn-tail button in ANY session
+   * can call them — including one that is not the session being observed.
+   */
+  const commands = ctx.get?.('commands')
+  if (isRecord(commands) && typeof commands.register === 'function') {
+    commands.register({
+      name: 'observer-state',
+      description: '读取副脑绑定状态与一次性焦点请求。Read the observer bindings.',
+      handler: async () => ({
+        kind: 'success' as const,
+        text: JSON.stringify({
+          bindings: { ...state.bindings },
+          reverse: { ...state.reverse },
+          focus: state.focus === null ? null : { ...state.focus },
+        }),
+      }),
+    })
+    commands.register({
+      name: 'observer-create',
+      description: '为主会话召唤副脑：/observer-create [mainSessionId]',
+      input: { hint: '[mainSessionId]' },
+      handler: async (invocation: any) => {
+        const requested = String(invocation?.rawInput ?? '').trim()
+        const mainSessionId =
+          requested.length > 0 ? requested : typeof invocation?.agent?.id === 'string' ? invocation.agent.id : ''
+        const result = await createFor(mainSessionId)
+        return { kind: result.ok ? ('success' as const) : ('error' as const), text: result.text }
+      },
+    })
+    commands.register({
+      name: 'observer-focus-ack',
+      description: '控制台已消费一次焦点牵引请求。Acknowledge the one-shot focus request.',
+      handler: async () => {
+        takeFocus()
+        return { kind: 'success' as const, text: 'focus-acked' }
+      },
+    })
+  }
+
   ctx.tools?.register({
     name: 'observer_create',
     description:
