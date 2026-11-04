@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "dsh-observer",
   "version": "0.1.9",
   "description": "Companion (follower) session for DSH. Listens to graft/session-transferred and rewrites its own pointer; never retired, never sliced.",

@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "dsh-observer",
   "version": "0.1.9",
   "description": "Companion session (鍓剳) for DSH: a follower session bound to a main session, co-transferring by pointer, never sliced.",
