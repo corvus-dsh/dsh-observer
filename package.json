@@ -1,0 +1,29 @@
+{
+  "name": "dsh-observer",
+  "version": "0.1.0",
+  "description": "Companion session (副脑) for DSH: a follower session bound to a main session, co-transferring by pointer, never sliced.",
+  "type": "module",
+  "main": "index.js",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.5",
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "node scripts/build.mjs && node --test test/*.test.mjs"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "manifest.json",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "MIT"
+}

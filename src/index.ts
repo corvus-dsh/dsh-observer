@@ -1,0 +1,260 @@
+/**
+ * dsh-observer — the companion session (副脑), as its own plugin.
+ *
+ * WHY IT IS A SEPARATE PLUGIN
+ *
+ * The follower used to live inside dsh-graft-slice, which meant the graft plugin knew about
+ * observers, their storage and their UI. That is the coupling this package exists to remove:
+ * graft now only announces `graft/session-transferred`, and this plugin decides what (if
+ * anything) follows.
+ *
+ * THE ONE DESIGN RULE (from 副会话Observer-架构方案-v0.1.md §2)
+ *
+ * The observer is a FOLLOWER, not a second tape. It is never retired and never sliced; a
+ * transfer only rewrites one pointer inside `observer-bindings.json`. That is what keeps the
+ * pair free of the four deadlock cycles a "mutual graft" would introduce.
+ */
+
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+
+/** Cordis plugin name. */
+export const name = 'dsh-observer'
+
+/**
+ * Hard dependencies: tools (the model-facing surface) and sessionController (creating and
+ * prompting the follower session). Everything else is optional and probed with `ctx.get`.
+ */
+export const inject = ['tools', 'sessionController']
+
+interface ObserverBindings {
+  /** mainSessionId -> observerSessionId */
+  bindings: Record<string, string>
+  /** observerSessionId -> mainSessionId */
+  reverse: Record<string, string>
+  /**
+   * A one-shot focus request, consumed by the Client (which owns `uiWorkspace`). The Host
+   * cannot move a window, so it leaves a note and the UI acts on it exactly once.
+   */
+  focus: { sessionId: string; at: number } | null
+}
+
+interface PluginContextLike {
+  get?: (name: string) => any
+  logger?: { info?: (message: string) => void; warn?: (message: string) => void }
+  on?: (event: string, listener: (...args: any[]) => any) => unknown
+  tools?: { register: (definition: any) => unknown }
+}
+
+const EMPTY: ObserverBindings = { bindings: {}, reverse: {}, focus: null }
+
+let bindingsPath = ''
+let state: ObserverBindings = { bindings: {}, reverse: {}, focus: null }
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Atomic write: temp file + rename, so a reader never sees half a document. */
+function writeAtomic(path: string, value: unknown): void {
+  const temp = `${path}.tmp-${process.pid}-${Date.now().toString(36)}`
+  writeFileSync(temp, JSON.stringify(value, null, 2), 'utf8')
+  renameSync(temp, path)
+}
+
+function load(): void {
+  // Start from empty on EVERY load: the module-level state must describe THIS file, and a
+  // mount that reuses a previous process-level copy would leak bindings across profiles
+  // (and across tests).
+  state = { bindings: {}, reverse: {}, focus: null }
+  try {
+    const parsed = JSON.parse(readFileSync(bindingsPath, 'utf8'))
+    if (!isRecord(parsed)) return
+    const next: ObserverBindings = { bindings: {}, reverse: {}, focus: null }
+    if (isRecord(parsed.bindings)) {
+      for (const [main, observer] of Object.entries(parsed.bindings)) {
+        if (typeof observer === 'string' && observer.length > 0) next.bindings[main] = observer
+      }
+    }
+    if (isRecord(parsed.reverse)) {
+      for (const [observer, main] of Object.entries(parsed.reverse)) {
+        if (typeof main === 'string' && main.length > 0) next.reverse[observer] = main
+      }
+    }
+    if (isRecord(parsed.focus) && typeof parsed.focus.sessionId === 'string') {
+      next.focus = { sessionId: parsed.focus.sessionId, at: Number(parsed.focus.at) || 0 }
+    }
+    state = next
+  } catch {
+    // Absent (first run) or torn: start empty. A stale pointer is repairable; a crash is not.
+  }
+}
+
+function save(): void {
+  try {
+    mkdirSync(dirname(bindingsPath), { recursive: true })
+    writeAtomic(bindingsPath, state)
+  } catch {
+    // Persistence is best-effort here: the in-memory map still serves this process.
+  }
+}
+
+function observerOf(mainSessionId: string): string {
+  const observer = state.bindings[mainSessionId]
+  return typeof observer === 'string' ? observer : ''
+}
+
+function mainOfObserver(observerSessionId: string): string {
+  const main = state.reverse[observerSessionId]
+  return typeof main === 'string' ? main : ''
+}
+
+/**
+ * Follow a transfer: rewrite the pointer inside this plugin, and leave a focus note.
+ *
+ * This is the WHOLE cross-plugin coupling: a listener on an event name. It never calls into
+ * graft, never blocks it, and a profile without graft simply never receives the event.
+ */
+function followTransfer(sourceSessionId: string, newSessionId: string): { followed: boolean; observerSessionId: string } {
+  const observer = observerOf(sourceSessionId)
+  if (observer.length === 0) return { followed: false, observerSessionId: '' }
+  delete state.bindings[sourceSessionId]
+  state.bindings[newSessionId] = observer
+  state.reverse[observer] = newSessionId
+  state.focus = { sessionId: newSessionId, at: Date.now() }
+  save()
+  return { followed: true, observerSessionId: observer }
+}
+
+function takeFocus(): { sessionId: string; at: number } | null {
+  const focus = state.focus
+  if (focus === null) return null
+  state.focus = null
+  save()
+  return focus
+}
+
+export function apply(ctx: PluginContextLike, config: Record<string, unknown> = {}): void {
+  const configured = typeof config.bindingsPath === 'string' ? config.bindingsPath : ''
+  bindingsPath = configured.length > 0 ? configured : join(process.env.DSH_PROFILE_DIR ?? process.cwd(), 'data', 'dsh-observer', 'observer-bindings.json')
+  load()
+
+  /**
+   * THE event. Grafted plugins announce, this one listens; nothing is imported in either
+   * direction. Registered defensively: a host without the event bus must not fail to mount.
+   */
+  ctx.on?.('graft/session-transferred', (payload: any) => {
+    try {
+      const source = typeof payload?.sourceSessionId === 'string' ? payload.sourceSessionId : ''
+      const target = typeof payload?.newSessionId === 'string' ? payload.newSessionId : ''
+      if (source.length === 0 || target.length === 0) return
+      const result = followTransfer(source, target)
+      if (result.followed) {
+        ctx.logger?.info?.(`[dsh-observer] ${result.observerSessionId} now follows ${target}`)
+      }
+    } catch (error) {
+      // A listener must never break the transfer that triggered it.
+      ctx.logger?.warn?.(`[dsh-observer] follow failed: ${String((error as any)?.message ?? error)}`)
+    }
+  })
+
+  const createFor = async (mainSessionId: string): Promise<{ ok: boolean; observerSessionId: string; text: string }> => {
+    if (mainSessionId.length === 0) {
+      return { ok: false, observerSessionId: '', text: '没有可绑定的主会话 id：请在会话里执行，或传入 mainSessionId。' }
+    }
+    if (mainOfObserver(mainSessionId).length > 0) {
+      return { ok: false, observerSessionId: '', text: '这是一个副脑会话：它跟随主会话，不能再给它召唤副脑。' }
+    }
+    const existing = observerOf(mainSessionId)
+    if (existing.length > 0) return { ok: true, observerSessionId: existing, text: `该会话已有副脑：${existing}（未重复创建）。` }
+
+    const controller = ctx.get?.('sessionController')
+    if (!isRecord(controller) || typeof controller.create !== 'function') {
+      return { ok: false, observerSessionId: '', text: 'sessionController.create 不可用：当前宿主不支持创建会话。' }
+    }
+    try {
+      const created = await controller.create({})
+      const observerSessionId = typeof created?.sessionId === 'string' ? created.sessionId : ''
+      if (observerSessionId.length === 0) return { ok: false, observerSessionId: '', text: `会话创建返回了空 id：${JSON.stringify(created)}` }
+      state.bindings[mainSessionId] = observerSessionId
+      state.reverse[observerSessionId] = mainSessionId
+      save()
+      try {
+        await controller.prompt(
+          {
+            requestId: `observer-mission-${Date.now()}`,
+            sessionId: observerSessionId,
+            mode: 'queue',
+            content: [
+              {
+                type: 'text',
+                text:
+                  `[副脑启动] 你被绑定为会话 ${mainSessionId} 的观察者（跟随者）。` +
+                  '职责：读主会话日志、澄清需求、以确认卡形式提出方案；不直接改代码。' +
+                  '主会话转生后你会收到新的绑定目标，身份不变。',
+              },
+            ],
+          },
+          new AbortController().signal,
+        )
+      } catch (error) {
+        ctx.logger?.warn?.(`[dsh-observer] mission prompt failed: ${String((error as any)?.message ?? error)}`)
+      }
+      return { ok: true, observerSessionId, text: `已召唤副脑 ${observerSessionId}，绑定到 ${mainSessionId}。` }
+    } catch (error) {
+      return { ok: false, observerSessionId: '', text: `创建副脑失败：${String((error as any)?.message ?? error)}` }
+    }
+  }
+
+  ctx.tools?.register({
+    name: 'observer_create',
+    description:
+      'Summon a companion observer for a session: creates an ordinary session and records the follower pointer. ' +
+      'The observer is never retired and never sliced — a transfer only rewrites its pointer.',
+    parameters: {
+      type: 'object',
+      properties: { mainSessionId: { type: 'string', description: 'Session to observe. Default: the calling session.' } },
+      additionalProperties: false,
+    },
+    execute: async (args: { mainSessionId?: unknown }, exec: any) => {
+      const explicit = typeof args?.mainSessionId === 'string' ? args.mainSessionId.trim() : ''
+      const mainSessionId = explicit.length > 0 ? explicit : typeof exec?.agent?.id === 'string' ? exec.agent.id : ''
+      return createFor(mainSessionId)
+    },
+  })
+
+  ctx.tools?.register({
+    name: 'observer_status',
+    description:
+      'Read the follower pointer (who observes whom) plus any pending focus request. Read-only. ' +
+      'ackFocus consumes that one-shot request so the UI can say "I have moved the window".',
+    parameters: {
+      type: 'object',
+      properties: { ackFocus: { type: 'boolean', description: 'Consume the pending focus request.' } },
+      additionalProperties: false,
+    },
+    execute: async (args: { ackFocus?: unknown }) => {
+      const pending = state.focus
+      if (args?.ackFocus === true) takeFocus()
+      return {
+        ok: true,
+        bindings: { ...state.bindings },
+        reverse: { ...state.reverse },
+        focus: pending === null ? null : { ...pending },
+        ...(args?.ackFocus === true ? { focusConsumed: true } : {}),
+      }
+    },
+  })
+}
+
+/** Test seam: the in-process state, so a test can assert without touching disk. */
+export function debugObserverState(): ObserverBindings {
+  return JSON.parse(JSON.stringify(state))
+}
+
+/** Test seam: follow a transfer without an event bus. */
+export function debugFollowTransfer(sourceSessionId: string, newSessionId: string): { followed: boolean; observerSessionId: string } {
+  return followTransfer(sourceSessionId, newSessionId)
+}
+
+export { EMPTY }

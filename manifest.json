@@ -1,0 +1,34 @@
+{
+  "name": "dsh-observer",
+  "version": "0.1.0",
+  "description": "Companion (follower) session for DSH. Listens to graft/session-transferred and rewrites its own pointer; never retired, never sliced.",
+  "entry": "index.js",
+  "activate": "activate(ctx, config)",
+  "permissions": [
+    "session:read",
+    "session:write"
+  ],
+  "services": [
+    "tools",
+    "sessionController"
+  ],
+  "hooks": [
+    "graft/session-transferred"
+  ],
+  "tools": [
+    "observer_create",
+    "observer_status"
+  ],
+  "engines": {
+    "dsh": ">=0.2.1-rc.5",
+    "node": ">=20"
+  },
+  "redLines": {
+    "observerIsNeverGraftSource": true,
+    "pointerOnlyOnTransfer": true
+  },
+  "notes": [
+    "This package OWNS observer-bindings.json. dsh-graft-slice only announces transfers; it has no observer code.",
+    "The follower is never sliced: a transfer rewrites one pointer instead of creating a second tape, which is what keeps the pair deadlock-free."
+  ]
+}

@@ -1,0 +1,10 @@
+# dsh-observer — insert the plugin row.
+#
+# The patch follows the same shape as the other local plugins: one insert with the id, the
+# package name, and the config. `bindingsPath` is optional — when omitted the plugin uses
+# <profile>/data/dsh-observer/observer-bindings.json.
+- insert:
+    - id: dsh-observer
+      name: dsh-observer
+      config:
+        bindingsPath: ''
