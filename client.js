@@ -101,6 +101,8 @@ window.__ModuleLoader__.load({
       const handled = React.useState({ id: '' })[0]
 
       const refresh = async () => {
+        // A consultation companion has no main session to ask about.
+        if (sessionId.length === 0) return
         const reply = await bridge.callHost(sessionId, '/observer-state')
         if (!reply.ok) {
           setError(String(reply.text || '读取失败'))
@@ -126,6 +128,28 @@ window.__ModuleLoader__.load({
         void refresh()
       }, [sessionId])
 
+      /** Open the session the Host just created, whichever mode produced it. */
+      const openNew = (observerId) => {
+        const ui = bridge.ui()
+        if (observerId.length > 0 && ui && typeof ui.openSession === 'function') {
+          ui.openSession({ kind: 'session', sessionId: observerId })
+        }
+      }
+
+      const consult = async () => {
+        setBusy(true)
+        setError('')
+        const reply = await bridge.callHost(sessionId, '/observer-consult')
+        setBusy(false)
+        const parsed = reply.ok ? parseJson(reply.text) : undefined
+        const observerId = parsed && typeof parsed.observerSessionId === 'string' ? parsed.observerSessionId : ''
+        if (!reply.ok || observerId.length === 0) {
+          setError(String((parsed && parsed.text) || reply.text || '开启磋商副脑失败'))
+          return
+        }
+        openNew(observerId)
+      }
+
       const summon = async () => {
         setBusy(true)
         setError('')
@@ -135,22 +159,28 @@ window.__ModuleLoader__.load({
           setError(String(reply.text || '召唤失败'))
           return
         }
-        // The create reply is only a receipt: `{"ok":true}` on this build. The AUTHORITY is
-        // the binding table, so always re-read it instead of parsing the receipt.
-        const state = await bridge.callHost(sessionId, '/observer-state')
-        const parsed = state.ok ? parseJson(state.text) : undefined
-        const observerId =
-          parsed && parsed.bindings && typeof parsed.bindings[sessionId] === 'string' ? parsed.bindings[sessionId] : ''
+        /**
+         * The Host answers JSON now (`{ok, observerSessionId, text}`). The binding table is
+         * still consulted when that id is missing, but the receipt is no longer ignored: the
+         * old code re-read state even when create had already failed, which is how a false
+         * success looked like a successful summon.
+         */
+        const receipt = parseJson(reply.text)
+        const fromReceipt = receipt && typeof receipt.observerSessionId === 'string' ? receipt.observerSessionId : ''
+        let observerId = fromReceipt
+        if (observerId.length === 0) {
+          const state = await bridge.callHost(sessionId, '/observer-state')
+          const parsed = state.ok ? parseJson(state.text) : undefined
+          observerId =
+            parsed && parsed.bindings && typeof parsed.bindings[sessionId] === 'string' ? parsed.bindings[sessionId] : ''
+        }
         setBusy(false)
         if (observerId.length === 0) {
-          setError(`召唤回执 ${String(reply.text).slice(0, 80)}，但绑定表里没有该会话的副脑`)
+          setError(String((receipt && receipt.text) || `召唤回执 ${String(reply.text).slice(0, 80)}，但绑定表里没有该会话的副脑`))
           return
         }
         setBound(observerId)
-        const ui = bridge.ui()
-        if (ui && typeof ui.openSession === 'function') {
-          ui.openSession({ kind: 'session', sessionId: observerId })
-        }
+        openNew(observerId)
       }
 
       const jump = () => {
@@ -173,10 +203,21 @@ window.__ModuleLoader__.load({
               type: 'button',
               disabled: busy,
               style: { ...CHIP, cursor: busy ? 'default' : 'pointer' },
-              title: bound === '' ? `为主会话 ${sessionId} 召唤副脑` : `已绑定 ${bound}`,
-              onClick: bound === '' ? summon : jump,
+              title:
+                bound === ''
+                  ? sessionId.length === 0
+                    ? '在空白会话里先与副脑磋商需求'
+                    : `为主会话 ${sessionId} 召唤副脑`
+                  : `已绑定 ${bound}`,
+              onClick: bound !== '' ? jump : sessionId.length === 0 ? consult : summon,
             },
-            busy ? '🧠 召唤中…' : bound === '' ? '🧠 召唤副脑' : `🧠 切换至副脑 (${bound})`,
+            busy
+              ? '🧠 处理中…'
+              : bound !== ''
+                ? `🧠 切换至副脑 (${bound})`
+                : sessionId.length === 0
+                  ? '🧠 副脑磋商'
+                  : '🧠 召唤副脑',
           ),
           error.length > 0 ? h('span', { key: 'e', style: { color: '#b91c1c' } }, error) : null,
         ],
@@ -187,21 +228,28 @@ window.__ModuleLoader__.load({
      * Function-component error trap: a throwing render leaves a red chip, not a blank strip.
      * (No class component — the sandbox React throws on `React.Component` at module scope,
      * which kills registration before it happens.)
+     *
+     * `allowConsult` is for the ROOT-scoped seats (composer / sidebar): they can render with no
+     * Session at all (the blank page), and there the chip is a pre-discussion companion rather
+     * than a follower. The turn-tail seat keeps the strict rule and renders nothing without an
+     * id, because binding a companion to a guessed session is what we must never do.
      */
-    const makeEntry = (bridge) => (props) => {
-      try {
-        const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
-        if (sessionId.length === 0) {
-          console.warn('[dsh-observer] turnTail: no sessionId; prop keys =', props ? Object.keys(props) : props)
-          return null
+    const makeEntry =
+      (bridge, { allowConsult = false } = {}) =>
+      (props) => {
+        try {
+          const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
+          if (sessionId.length === 0 && !allowConsult) {
+            console.warn('[dsh-observer] turnTail: no sessionId; prop keys =', props ? Object.keys(props) : props)
+            return null
+          }
+          return h(TurnTail, { sessionId, bridge })
+        } catch (error) {
+          const message = String((error && error.message) || error)
+          console.error('[dsh-observer] entry crashed:', message)
+          return h('span', { style: { color: '#b91c1c', fontSize: '12px' } }, `[Observer Error] ${message}`)
         }
-        return h(TurnTail, { sessionId, bridge })
-      } catch (error) {
-        const message = String((error && error.message) || error)
-        console.error('[dsh-observer] turnTail crashed:', message)
-        return h('span', { style: { color: '#b91c1c', fontSize: '12px' } }, `[Observer Error] ${message}`)
       }
-    }
 
     return {
       /** Service keys, not package names — the Cordis guard reads this array. */
@@ -215,21 +263,34 @@ window.__ModuleLoader__.load({
             return undefined
           }
         }
-        try {
-          ctx.slots.inject('conversation.chat.turnTail', () =>
-            ctx.slots.register(
-              {
-                name: 'conversation.chat.turnTail',
-                id: 'observer-turntail',
-                order: 60,
-                label: () => '副脑',
-              },
-              makeEntry(bridge),
-            ),
-          )
-          console.log('[dsh-observer] turnTail registered')
-        } catch (error) {
-          console.error('[dsh-observer] slot registration failed:', String((error && error.message) || error))
+        /**
+         * THREE SEATS, one component.
+         *
+         * `conversation.chat.turnTail`   — after a completed turn (session scope, needs an id).
+         * `conversation.input.left`      — compact control in the composer tool row.
+         * `sidebar.footer.action`        — ROOT scope, so it exists on the blank page too, where
+         *                                  there is no Session to bind and the chip becomes
+         *                                  「🧠 副脑磋商」 (pre-discussion, no pointer).
+         */
+        const seats = [
+          { name: 'conversation.chat.turnTail', id: 'observer-turntail', order: 60, allowConsult: false },
+          { name: 'conversation.input.left', id: 'observer-composer', order: 60, allowConsult: true },
+          { name: 'sidebar.footer.action', id: 'observer-sidebar', order: 60, allowConsult: true },
+        ]
+        for (const seat of seats) {
+          try {
+            ctx.slots.inject(seat.name, () => {
+              ctx.slots.register(
+                { name: seat.name, id: seat.id, order: seat.order, label: () => '副脑' },
+                makeEntry(bridge, { allowConsult: seat.allowConsult }),
+              )
+              return () => {}
+            })
+            console.log(`[dsh-observer] registered ${seat.name}`)
+          } catch (error) {
+            // One missing seat must not cost the others: report and continue.
+            console.error(`[dsh-observer] ${seat.name} registration failed:`, String((error && error.message) || error))
+          }
         }
       },
       __makeEntryForTest: makeEntry,
