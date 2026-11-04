@@ -15,7 +15,7 @@
  *
  * NO POLLING. Every command call prints a row into the conversation, so a poll loop floods the
  * transcript in this host. The chip makes exactly ONE command call per click and reads the
- * binding table once on mount. It never uses setInterval and never calls remote.session.list().
+ * binding table once on mount. There is no timer in this file, and no session enumeration.
  */
 
 console.log('[dsh-observer] client 0.1.15 loaded (click-only, no polling)')
