@@ -122,12 +122,41 @@ test('observer: an unknown transfer changes nothing', () => {
 })
 
 /**
- * v0.1.2 — THE COMMAND-LINE FALLBACK.
+ * v1.0.1 — THE BIND-ONLY ENTRY, AND THE CLIENT'S PLAN B.
  *
- * The turn-tail chip depends on the Client bundle loading, which is a different failure
- * mode from the Host logic. These commands must work even when no UI exists at all: typing
- * `/observer-create` in the composer is the guaranteed path.
+ * The Client now creates the session with `sessions.create` (the only client API returning an
+ * id) and opens it; the Host only records the pointer and sends the mission. These tests pin the
+ * pair: `observer_bind` writes and VERIFIES the pointer, and it refuses the two dishonest cases
+ * (missing ids, a companion binding a companion).
  */
+test('observer_bind: writes the pointer, verifies it on disk, and sends the mission', async () => {
+  const { tools, prompts, bindingsPath } = boot()
+  const bind = tools.get('observer_bind')
+  assert.ok(bind !== undefined, 'observer_bind is registered')
+
+  const result = await bind.execute({ mainSessionId: 'main-9', observerSessionId: 'obs-9' })
+  assert.equal(result.ok, true)
+  assert.deepEqual(debugObserverState().bindings, { 'main-9': 'obs-9' })
+  assert.equal(debugObserverState().reverse['obs-9'], 'main-9')
+  assert.match(readFileSync(bindingsPath, 'utf8'), /main-9/u, 'the pointer reached the file')
+  const mission = prompts[prompts.length - 1]
+  assert.match(mission.content[0].text, /副脑启动/u, 'the companion is told its role')
+})
+
+test('observer_bind: refuses missing ids and a companion that would bind another', async () => {
+  const { tools } = boot()
+  const bind = tools.get('observer_bind')
+
+  const missing = await bind.execute({ mainSessionId: 'main-9', observerSessionId: '' })
+  assert.equal(missing.ok, false)
+  assert.match(missing.text, /缺少/u)
+
+  await bind.execute({ mainSessionId: 'main-9', observerSessionId: 'obs-9' })
+  // obs-9 is now a follower; it must not be used as a MAIN session.
+  const chained = await bind.execute({ mainSessionId: 'obs-9', observerSessionId: 'obs-10' })
+  assert.equal(chained.ok, false)
+  assert.match(chained.text, /副脑会话/u)
+})
 test('observer: the three UI commands are registered and the create one works', async () => {
   const { commands, prompts } = boot()
   for (const name of ['observer-state', 'observer-create', 'observer-focus-ack']) {

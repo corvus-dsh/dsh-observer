@@ -1,128 +1,33 @@
 /**
- * dsh-observer — the Client half: turn-tail / composer / sidebar entry.
+ * dsh-observer — the Client half. DELIBERATELY MINIMAL (v1.0.1).
  *
- * LOADER CONTRACT (the shape that actually works on this host):
+ * WHAT THIS FILE DOES, IN ORDER:
+ *   1. prints a cache probe (first statement);
+ *   2. registers one chip in three seats;
+ *   3. on click: `sessions.create()` → `uiWorkspace.openSession(newId)` → `observer_bind(...)`.
  *
- *     window.__ModuleLoader__.load({
- *       id: 'dsh-observer',
- *       factory(require, styles, host) { ...; return { inject: [...], apply(ctx) {...} } },
- *     })
+ * WHAT IT NO LONGER DOES — each removed because it caused a visible failure:
+ *   - no `/observer-state` read of ANY kind. The three seats re-render constantly, and every
+ *     command call prints a row into the conversation; that is the "ghost polling" in the
+ *     transcript. The chip therefore cannot show "已绑定" — it only offers 召唤副脑.
+ *   - no `/observer-create` command. The gateway wraps command replies unreliably (`{kind,text}`,
+ *     `{result}`, `{ok,value:{commandId}}`, and a JSON string nested inside `text`), and the id
+ *     was lost inside that wrapping while the session WAS created.
+ *   - no session enumeration, no timers, no waiting loops.
  *
- * The id is the PLAIN package name. v0.1.14 renamed it to `dsh-observer-v14` and pointed
- * `exports['./client']` at a versioned copy; the next start died with
- * `desktop welcome: Web authentication failed`, so the id and the specifier are stable again.
- * Cache invalidation belongs to the package version, never to renaming this module.
- *
- * NO POLLING. Every command call prints a row into the conversation, so a poll loop floods the
- * transcript in this host. The chip makes exactly ONE command call per click and reads the
- * binding table once on mount. There is no timer in this file, and no session enumeration.
+ * WHY `sessions.create` AND NOT `uiWorkspace.startSession`: `startSession()` returns void — it
+ * opens a blank session but hands back no id. `sessions.create(opts)` returns
+ * `Promise<SessionId>`, which is exactly what a caller needs in order to open and then bind.
  */
 
-/**
- * CACHE PROBE — must be the FIRST statement in this file.
- *
- * If the running page does not print this line, the module on screen is not this file, and no
- * amount of logic fixing helps: the rest of the diagnosis has to move to the loader's cache.
- * The global makes that answerable from the console without reading a log at all.
- */
-window.__OBSERVER_LOADED__ = '1.0.0'
-console.log('%c[dsh-observer] FUCK CACHE 1.0.0 — this client file is really loaded', 'color:#16a34a;font-weight:bold')
-
-console.log('[dsh-observer] client 1.0.0 loaded (click-only, no polling)')
+window.__OBSERVER_LOADED__ = '1.0.1'
+console.log('%c[dsh-observer] FUCK CACHE 1.0.1 — minimal client loaded', 'color:#16a34a;font-weight:bold')
 
 window.__ModuleLoader__.load({
   id: 'dsh-observer',
   factory(require, styles, host) {
     const React = require('react')
     const h = React.createElement
-
-    /**
-     * Normalise a gateway command reply into `{ ok, text }`.
-     *
-     * Observed shapes:
-     *   1. `{ kind: 'success'|'error', text }`   — a command that produces a display line;
-     *   2. `{ result: … }`                       — the same, wrapped once;
-     *   3. `{ ok: true, value: { commandId } }`  — an ASYNC accept: the command was queued and
-     *      its output will not come back here. Treated as accepted, never as a failure.
-     */
-    const normaliseReply = (value) => {
-      const node = value && value.result !== undefined ? value.result : value
-      if (node === null || node === undefined) return undefined
-      if (typeof node.text === 'string') return { ok: node.kind !== 'error', text: node.text }
-      if (typeof node === 'object') return { ok: node.ok !== false && node.kind !== 'error', text: JSON.stringify(node) }
-      return undefined
-    }
-
-    /** Call one Host command AS the given session — the gateway resolves that id. */
-    const makeBridge = (ctx) => {
-      const callHost = async (agentId, line) => {
-        const remote = (() => {
-          try {
-            return ctx.get ? ctx.get('remote') : undefined
-          } catch {
-            return undefined
-          }
-        })()
-        const commands = remote && remote.commands
-        if (!commands || typeof commands.execute !== 'function') {
-          return { ok: false, text: 'remote.commands 不可用（inject 未生效）' }
-        }
-        try {
-          const settled = await commands.execute(agentId, line, [], undefined)
-          const execution = normaliseReply(settled)
-          if (execution === undefined) return { ok: false, text: `返回形状无法识别：${JSON.stringify(settled).slice(0, 120)}` }
-          return execution
-        } catch (error) {
-          return { ok: false, text: String((error && error.message) || error) }
-        }
-      }
-      const ui = () => {
-        try {
-          return ctx.get ? ctx.get('uiWorkspace') : undefined
-        } catch (error) {
-          /**
-           * v0.1.16 — THE REASON A RETURNED ID DID NOT OPEN A WINDOW.
-           *
-           * `uiWorkspace` was NOT in this plugin's `inject` array, so the Cordis property guard
-           * threw `cannot get property "uiWorkspace" without inject`; the old catch swallowed it,
-           * `ui()` answered undefined, and the chip fell through to "请稍后在列表中选择" while
-           * holding a perfectly good session id. It is in `inject` now (see the plugin object),
-           * and this logs instead of hiding the cause.
-           */
-          console.error('[dsh-observer] uiWorkspace unavailable:', String((error && error.message) || error))
-          return undefined
-        }
-      }
-      return { callHost, ui }
-    }
-
-    const parseJson = (text) => {
-      try {
-        const value = JSON.parse(text)
-        return value !== null && typeof value === 'object' ? value : undefined
-      } catch {
-        return undefined
-      }
-    }
-
-    /** Sessions whose state has already been read in this page load (see readOnce). */
-    const readSessions = new Set()
-
-    /** A JSON error blob becomes one sentence; the detail goes to the console. */
-    const friendly = (text, fallback) => {
-      const raw = String(text || '')
-      if (raw.trim().startsWith('{')) {
-        console.error('[dsh-observer] host failure:', raw)
-        try {
-          const parsed = JSON.parse(raw)
-          const code = parsed && parsed.error && parsed.error.code ? String(parsed.error.code) : ''
-          return `${fallback}（${code || '宿主异常'}）— 点击重试`
-        } catch {
-          return `${fallback} — 点击重试`
-        }
-      }
-      return raw.length > 0 ? raw : fallback
-    }
 
     const CHIP = {
       border: '1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.35))',
@@ -132,112 +37,103 @@ window.__ModuleLoader__.load({
       font: 'inherit',
     }
 
-    /** One button, and it says exactly what it will do. */
-    function ObserverChip({ sessionId, bridge }) {
-      const [bound, setBound] = React.useState('')
-      const [busy, setBusy] = React.useState(false)
-      const [error, setError] = React.useState('')
-      const [isObserver, setIsObserver] = React.useState(false)
-      const handled = React.useState({ id: '' })[0]
-
-      /**
-       * ONE read per session per page load — not per mount.
-       *
-       * Three seats render this chip (turn-tail, composer, sidebar), and every re-render used to
-       * fire its own `/observer-state`: that is the "ghost polling" the transcript showed, dozens
-       * of rows with no timer in the code. A shared Set makes it exactly one row per session,
-       * for the label and the nesting rule, and never again.
-       */
-      const readOnce = async () => {
-        if (sessionId.length === 0) return
-        const reply = await bridge.callHost(sessionId, '/observer-state')
-        if (!reply.ok) {
-          setError(friendly(reply.text, '读取副脑状态失败'))
-          return
-        }
-        const state = parseJson(reply.text)
-        if (state === undefined) return
-        const bindings = state.bindings && typeof state.bindings === 'object' ? state.bindings : {}
-        const reverse = state.reverse && typeof state.reverse === 'object' ? state.reverse : {}
-        setBound(typeof bindings[sessionId] === 'string' ? bindings[sessionId] : '')
-        setIsObserver(typeof reverse[sessionId] === 'string')
-        setError('')
-        // One-shot focus filed by a transfer: honour it once, then never again.
-        if (state.focus && typeof state.focus.sessionId === 'string' && state.focus.sessionId !== handled.id) {
-          open(state.focus.sessionId)
-          handled.id = state.focus.sessionId
-          void bridge.callHost(sessionId, '/observer-focus-ack')
+    const makeBridge = (ctx) => {
+      const get = (key) => {
+        try {
+          return ctx.get ? ctx.get(key) : undefined
+        } catch (error) {
+          console.error(`[dsh-observer] service ${key} unavailable:`, String((error && error.message) || error))
+          return undefined
         }
       }
 
-      React.useEffect(() => {
-        if (sessionId.length === 0) return
-        if (readSessions.has(sessionId)) return
-        readSessions.add(sessionId)
-        void readOnce()
-      }, [sessionId])
-
-      /**
-       * Open a session in the window.
-       *
-       * v1.0.0 — THE JUMP NEVER WORKED BECAUSE OF THIS LINE.
-       *
-       * The service contract is `openSession(target: SessionTarget): void` where
-       * `SessionTarget = SessionId | SubagentAddress` — a BARE ID STRING. I was passing
-       * `{ kind: 'session', sessionId }` (the shape `sessions.retain` uses), which is not a
-       * SessionTarget; the call is synchronous and returns void WITHOUT throwing, so `return true`
-       * ran anyway, the string fallback never executed, and a perfectly good companion id was
-       * silently dropped while the chip said "请稍后再找".
-       */
-      const open = (id) => {
-        if (id.length === 0) return false
-        const workspaceUi = bridge.ui()
-        if (!workspaceUi || typeof workspaceUi.openSession !== 'function') {
-          setError('uiWorkspace.openSession 不可用（inject 未生效）')
-          return false
+      /** Create an ordinary session; `sessions.create` resolves to its `SessionId`. */
+      const createSession = async () => {
+        const sessions = get('sessions')
+        if (!sessions || typeof sessions.create !== 'function') {
+          return { ok: false, sessionId: '', text: 'sessions.create 不可用（inject 未生效）' }
         }
+        try {
+          const sessionId = await sessions.create({})
+          if (typeof sessionId !== 'string' || sessionId.length === 0) {
+            return { ok: false, sessionId: '', text: `sessions.create 返回了空 id：${JSON.stringify(sessionId)}` }
+          }
+          return { ok: true, sessionId, text: '' }
+        } catch (error) {
+          return { ok: false, sessionId: '', text: String((error && error.message) || error) }
+        }
+      }
+
+      /** `openSession(target: SessionTarget)` — SessionTarget is a BARE id string. */
+      const openSession = (id) => {
+        const workspaceUi = get('uiWorkspace')
+        if (!workspaceUi || typeof workspaceUi.openSession !== 'function') return false
         try {
           workspaceUi.openSession(id)
           return true
         } catch (error) {
           console.error('[dsh-observer] openSession failed:', String((error && error.message) || error))
-          setError(`无法打开会话 ${id}`)
           return false
         }
       }
 
       /**
-       * ONE call, then report. The Host may answer with the id, or with an async accept whose
-       * output never returns; either way the UI stops here. No polling, no session listing, no
-       * watching the binding table — the worst case is a message that says where to look.
+       * Write the pointer.
+       *
+       * WHY A COMMAND AND NOT A TOOL: the Client service catalog of this host exposes only
+       * layout / locale / sessions / slots / theme / timer / uiWorkspace / workspaces — there is
+       * NO `tools` service on the client half, so `tools.execute` is not reachable from here.
+       * The command channel IS reachable (the transcript rows prove `/observer-*` lines run), and
+       * a pointer write is FIRE-AND-FORGET: we never read the reply, which is the layer that kept
+       * losing the session id.
        */
-      const act = async () => {
-        setBusy(true)
-        setError('')
-        const line = sessionId.length === 0 ? '/observer-consult' : `/observer-create ${sessionId}`
-        const reply = await bridge.callHost(sessionId, line)
-        setBusy(false)
-        const parsed = reply.ok ? parseJson(reply.text) : undefined
-        const observerId = parsed && typeof parsed.observerSessionId === 'string' ? parsed.observerSessionId : ''
-        if (observerId.length > 0) {
-          setBound(observerId)
-          if (open(observerId)) return
+      const bind = async (mainSessionId, observerSessionId) => {
+        const remote = get('remote')
+        const commands = remote && remote.commands
+        if (!commands || typeof commands.execute !== 'function') {
+          return { ok: false, text: 'remote.commands 不可用：指针未写入' }
         }
-        if (!reply.ok) {
-          setError(friendly((parsed && parsed.text) || reply.text, '副脑召唤失败'))
+        try {
+          await commands.execute(mainSessionId, `/observer-bind ${mainSessionId} ${observerSessionId}`, [], undefined)
+          return { ok: true, text: '' }
+        } catch (error) {
+          return { ok: false, text: String((error && error.message) || error) }
+        }
+      }
+
+      return { get, createSession, openSession, bind }
+    }
+
+    function ObserverChip({ sessionId, bridge }) {
+      const [busy, setBusy] = React.useState(false)
+      const [note, setNote] = React.useState('')
+
+      /**
+       * ONE click → create → open → bind.
+       *
+       * Open before binding so the user lands in the companion even if the bind fails; report
+       * the failure in the chip instead of pretending the summon succeeded.
+       */
+      const summon = async () => {
+        setBusy(true)
+        setNote('')
+        const created = await bridge.createSession()
+        if (!created.ok) {
+          setBusy(false)
+          setNote(`创建会话失败：${created.text}`)
           return
         }
-        setError('已提交，正在创建副脑；若界面未自动切换，请稍后在左侧会话列表中选择新会话。')
+        const observerSessionId = created.sessionId
+        const opened = bridge.openSession(observerSessionId)
+        const bound = await bridge.bind(sessionId, observerSessionId)
+        setBusy(false)
+        if (!bound.ok) {
+          console.error('[dsh-observer] bind failed:', bound.text)
+          setNote(`副脑 ${observerSessionId} 已打开，但指针未写入：${bound.text}`)
+          return
+        }
+        if (!opened) setNote(`副脑 ${observerSessionId} 已创建并绑定；请在左侧会话列表中选择它`)
       }
-
-      const jump = () => {
-        if (bound.length === 0) return
-        // open() already reports its own failure; a second generic message would hide which one.
-        open(bound)
-      }
-
-      /** A companion must not summon a companion: no chip at all in that session. */
-      if (isObserver) return null
 
       return h(
         'div',
@@ -250,35 +146,20 @@ window.__ModuleLoader__.load({
               type: 'button',
               disabled: busy,
               style: { ...CHIP, cursor: busy ? 'default' : 'pointer' },
-              title:
-                bound !== ''
-                  ? `已绑定 ${bound}`
-                  : sessionId.length === 0
-                    ? '在空白会话里先与副脑磋商需求'
-                    : `为主会话 ${sessionId} 召唤副脑`,
-              onClick: bound !== '' ? jump : act,
+              title: `为主会话 ${sessionId} 召唤副脑`,
+              onClick: summon,
             },
-            busy
-              ? '🧠 处理中…'
-              : bound !== ''
-                ? `🧠 切换至副脑 (${bound})`
-                : sessionId.length === 0
-                  ? '🧠 副脑磋商'
-                  : '🧠 召唤副脑',
+            busy ? '🧠 召唤中…' : '🧠 召唤副脑',
           ),
-          error.length > 0 ? h('span', { key: 'e', style: { color: '#b91c1c' } }, error) : null,
+          note.length > 0 ? h('span', { key: 'n', style: { color: '#b91c1c' } }, note) : null,
         ],
       )
     }
 
     /**
-     * Function-component error trap: a throwing render leaves a red chip, not a blank strip.
-     *
-     * v0.1.16: NO SEAT RENDERS WITHOUT A SESSION ID. A root-scoped seat (sidebar) has no
-     * `sessionId` prop, so the chip used to send `/observer-consult` with an EMPTY agent id —
-     * and the gateway answered `{"ok":false,"error":{"code":"gateway/internal"}}` before the
-     * handler ever ran. Rendering nothing there is honest; the composer and turn-tail seats do
-     * carry an id, so the feature stays reachable in every real conversation.
+     * Renders nothing without a session id: a seat with no id cannot create a BOUND companion
+     * (there would be nothing to observe), and an empty-id call is what produced
+     * `gateway/internal` before.
      */
     const makeEntry = (bridge) => (props) => {
       try {
@@ -294,13 +175,11 @@ window.__ModuleLoader__.load({
 
     return {
       /**
-       * Service keys, not package names — the Cordis guard reads this array.
-       *
-       * `uiWorkspace` belongs here: without it `ctx.get('uiWorkspace')` throws, the catch
-       * swallowed the message, and a freshly created companion id was never opened (the chip
-       * said "请稍后在列表中选择" while the id was already in hand).
+       * Service keys actually available on this Client half:
+       * `slots` (register), `sessions` (create, returns the id), `uiWorkspace` (open),
+       * `remote` + `remote.commands` (the fire-and-forget bind line).
        */
-      inject: ['slots', 'remote', 'remote.commands', 'uiWorkspace'],
+      inject: ['slots', 'sessions', 'uiWorkspace', 'remote', 'remote.commands'],
       apply(ctx) {
         const bridge = makeBridge(ctx)
         const seats = [
@@ -311,10 +190,7 @@ window.__ModuleLoader__.load({
         for (const seat of seats) {
           try {
             ctx.slots.inject(seat.name, () => {
-              ctx.slots.register(
-                { name: seat.name, id: seat.id, order: seat.order, label: () => '副脑' },
-                makeEntry(bridge),
-              )
+              ctx.slots.register({ name: seat.name, id: seat.id, order: seat.order, label: () => '副脑' }, makeEntry(bridge))
               return () => {}
             })
           } catch (error) {

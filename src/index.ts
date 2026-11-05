@@ -26,7 +26,7 @@ export const name = 'dsh-observer'
  * Client half is cached separately, and "did my build reach the app?" must be answerable
  * without guessing.
  */
-export const VERSION = '0.1.16'
+export const VERSION = '1.0.1'
 console.log(`[dsh-observer] host version ${VERSION}`)
 
 /**
@@ -278,6 +278,102 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
   }
 
   /**
+   * v1.0.1 — BIND-ONLY ENTRY (the "B plan" for the client).
+   *
+   * The Client now CREATES the session itself (`sessions.create`, the only client API that
+   * returns `Promise<SessionId>` — `uiWorkspace.startSession` returns void). This entry only
+   * records the pointer and sends the mission, so it takes both ids as arguments and creates
+   * nothing. Kept as a TOOL rather than a command because the command channel's reply wrapping
+   * is unreliable in this host.
+   */
+  const bindExisting = async (
+    mainSessionId: string,
+    observerSessionId: string,
+  ): Promise<{ ok: boolean; observerSessionId: string; text: string }> => {
+    if (mainSessionId.length === 0 || observerSessionId.length === 0) {
+      return { ok: false, observerSessionId: '', text: '缺少 mainSessionId 或 observerSessionId。' }
+    }
+    if (mainOfObserver(mainSessionId).length > 0) {
+      return { ok: false, observerSessionId: '', text: '这是一个副脑会话：它不能再绑定副脑。' }
+    }
+    const existing = observerOf(mainSessionId)
+    if (existing.length > 0 && existing !== observerSessionId) {
+      delete state.reverse[existing]
+    }
+    state.bindings[mainSessionId] = observerSessionId
+    state.reverse[observerSessionId] = mainSessionId
+    const written = save()
+    if (!written.ok) {
+      delete state.bindings[mainSessionId]
+      delete state.reverse[observerSessionId]
+      return { ok: false, observerSessionId, text: `绑定表写入失败：${written.error}（路径 ${written.path}）` }
+    }
+    load()
+    if (observerOf(mainSessionId) !== observerSessionId) {
+      return { ok: false, observerSessionId, text: `回读校验失败：${written.path} 中没有该绑定` }
+    }
+    try {
+      const controller = ctx.get?.('sessionController')
+      if (isRecord(controller) && typeof controller.prompt === 'function') {
+        await controller.prompt(
+          {
+            requestId: `observer-mission-${Date.now()}`,
+            sessionId: observerSessionId,
+            mode: 'queue',
+            content: [
+              {
+                type: 'text',
+                text:
+                  `[副脑启动] 你被绑定为会话 ${mainSessionId} 的观察者（跟随者）。` +
+                  '职责：读主会话日志、澄清需求、以确认卡形式提出方案；不直接改代码。' +
+                  '主会话转生后你会收到新的绑定目标，身份不变。',
+              },
+            ],
+          },
+          new AbortController().signal,
+        )
+      }
+    } catch (error) {
+      ctx.logger?.warn?.(`[dsh-observer] mission prompt failed: ${String((error as any)?.message ?? error)}`)
+    }
+    return { ok: true, observerSessionId, text: `已绑定 ${mainSessionId} → ${observerSessionId}。` }
+  }
+
+  ctx.tools?.register({
+    name: 'observer_bind',
+    description:
+      'Record a follower pointer for an ALREADY-CREATED session and send it the mission. Pair of the ' +
+      'Client-side create: the Client owns `sessions.create`, this owns the durable pointer.',
+    parameters: {
+      type: 'object',
+      properties: {
+        mainSessionId: { type: 'string', description: 'Session being observed.' },
+        observerSessionId: { type: 'string', description: 'The session that will follow it.' },
+      },
+      required: ['mainSessionId', 'observerSessionId'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          observerSessionId: { type: 'string' },
+          text: { type: 'string' },
+        },
+        required: ['ok'],
+        additionalProperties: true,
+      },
+      render: (_args: unknown, value: any) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: async (args: { mainSessionId?: unknown; observerSessionId?: unknown }) => {
+      const main = typeof args?.mainSessionId === 'string' ? args.mainSessionId.trim() : ''
+      const observer = typeof args?.observerSessionId === 'string' ? args.observerSessionId.trim() : ''
+      return bindExisting(main, observer)
+    },
+  })
+
+  /**
    * v0.1 CLIENT CHANNEL: the UI reaches the Host only through commands (tools need an
    * agent). Three of them, all session-independent, so a turn-tail button in ANY session
    * can call them — including one that is not the session being observed.
@@ -304,6 +400,32 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
 
   const commands = ctx.get?.('commands')
   if (isRecord(commands) && typeof commands.register === 'function') {
+    /**
+     * v1.0.1 — BIND FOR A SESSION THE CLIENT ALREADY CREATED.
+     *
+     * The Client creates the session itself (`sessions.create` is the only client API that
+     * returns an id) and jumps to it, then fires this line. The reply is NOT read by the client:
+     * the gateway's wrapping has swallowed the id twice, and a pointer write does not need a
+     * return value. The args are `[mainSessionId, observerSessionId]` in `rawInput`.
+     */
+    commands.register({
+      name: 'observer-bind',
+      description: '把已创建的会话登记为副脑：/observer-bind <mainSessionId> <observerSessionId>',
+      handler: async (invocation: any) => {
+        try {
+          const parts = commandArg(invocation).split(/\s+/u).filter(Boolean)
+          const result = await bindExisting(parts[0] ?? '', parts[1] ?? '')
+          return {
+            kind: result.ok ? ('success' as const) : ('error' as const),
+            text: JSON.stringify({ ok: result.ok, observerSessionId: result.observerSessionId, text: result.text }),
+          }
+        } catch (error) {
+          const detail = String((error as any)?.message ?? error)
+          ctx.logger?.warn?.(`[dsh-observer] observer-bind threw: ${detail}`)
+          return { kind: 'error' as const, text: JSON.stringify({ ok: false, text: `绑定失败：${detail}` }) }
+        }
+      },
+    })
     commands.register({
       name: 'observer-state',
       description: '读取副脑绑定状态与一次性焦点请求。Read the observer bindings.',
