@@ -18,8 +18,8 @@
  * `Promise<SessionId>`, which is exactly what a caller needs in order to open and then bind.
  */
 
-window.__OBSERVER_LOADED__ = '1.0.3'
-console.log('%c[dsh-observer] FUCK CACHE 1.0.3 — minimal client loaded', 'color:#16a34a;font-weight:bold')
+window.__OBSERVER_LOADED__ = '1.0.4'
+console.log('%c[dsh-observer] FUCK CACHE 1.0.4 — minimal client loaded', 'color:#16a34a;font-weight:bold')
 
 window.__ModuleLoader__.load({
   id: 'dsh-observer',
@@ -36,35 +36,34 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * v1.0.2 — COMPANIONS CREATED IN THIS PAGE, AND THE PAGE-LIFETIME LOCK.
+     * v1.0.4 — HOW THIS PAGE KNOWS IT IS LOOKING AT A COMPANION.
      *
-     * `companions` answers "am I looking at a companion?" without any host round trip: the id is
-     * remembered the moment it is created, and persisted so a reload does not bring the summon
-     * button back inside a companion (which is how the nesting button reappeared).
+     * Two sources, neither of which sends a request:
+     *
+     *   1. THE TITLE, read from the LOCAL session snapshot. The Host renames every companion to
+     *      `[副脑] 跟随 …`, so the marker is durable session metadata rather than page state. The
+     *      scan is deliberately structural (walk the summary's strings) because the field that
+     *      holds a title is a projection the app owns, not this plugin.
+     *   2. THE IN-MEMORY SET of ids created in this page. The rename lands slightly AFTER the
+     *      jump, so for a moment the fresh companion has no title yet; the set covers exactly that
+     *      window. It is deliberately NOT localStorage — a stale entry there could hide the button
+     *      in a session that is not a companion at all.
      *
      * `summoning` is a MODULE-level latch rather than component state: three seats render this
-     * chip, so a per-component `busy` flag still let the other two seats fire — that is the
-     * "无限多开" the screenshots showed.
+     * chip, so a per-component `busy` flag still let the other two fire — that is the 无限多开 the
+     * screenshots showed.
      */
-    const COMPANION_STORE = 'dsh-observer:companions'
-    const readCompanions = () => {
-      try {
-        const raw = window.localStorage ? window.localStorage.getItem(COMPANION_STORE) : null
-        const parsed = raw === null ? [] : JSON.parse(raw)
-        return new Set(Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string') : [])
-      } catch {
-        return new Set()
-      }
-    }
-    const writeCompanions = (ids) => {
-      try {
-        if (window.localStorage) window.localStorage.setItem(COMPANION_STORE, JSON.stringify([...ids]))
-      } catch {
-        // A blocked storage is not a reason to lose the in-memory set.
-      }
-    }
-    const companions = readCompanions()
+    const companions = new Set()
     let summoning = false
+
+    /** Every string reachable inside a value, so a title is found wherever the app keeps it. */
+    const containsMarker = (value, depth = 0) => {
+      if (depth > 3 || value === null || value === undefined) return false
+      if (typeof value === 'string') return value.includes('[副脑]')
+      if (Array.isArray(value)) return value.some((item) => containsMarker(item, depth + 1))
+      if (typeof value === 'object') return Object.values(value).some((item) => containsMarker(item, depth + 1))
+      return false
+    }
 
     const makeBridge = (ctx) => {
       const get = (key) => {
@@ -77,24 +76,35 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * The main session's working directory, read from the LOCAL list snapshot.
+       * The local session snapshot — read synchronously, never requested.
        *
-       * `SessionSummary.cwd` is already in the client store, so this is a synchronous snapshot
-       * read — no RPC, therefore no transcript row. A companion created without it lands in
-       * "未分组" instead of the project the user is actually working in.
+       * Used for two facts that are already in the client store: the main session's `cwd` (so a
+       * companion lands in the same project instead of 未分组) and the companion marker in a
+       * session's title (so the chip hides itself without asking the Host anything).
        */
-      const cwdOf = (sessionId) => {
+      const snapshotOf = (sessionId) => {
         try {
           const sessions = get('sessions')
           const list = sessions && sessions.list
           const snapshot = list && typeof list.getSnapshot === 'function' ? list.getSnapshot() : undefined
-          const summary = snapshot && snapshot.byId ? snapshot.byId[sessionId] : undefined
-          const cwd = summary && typeof summary.cwd === 'string' ? summary.cwd : ''
-          return cwd
+          return snapshot && snapshot.byId ? snapshot.byId[sessionId] : undefined
         } catch (error) {
-          console.error('[dsh-observer] cwd lookup failed:', String((error && error.message) || error))
-          return ''
+          console.error('[dsh-observer] session snapshot read failed:', String((error && error.message) || error))
+          return undefined
         }
+      }
+
+      const cwdOf = (sessionId) => {
+        const summary = snapshotOf(sessionId)
+        return summary && typeof summary.cwd === 'string' ? summary.cwd : ''
+      }
+
+      /** v1.0.4: the Host titles every companion `[副脑] 跟随 …`; that title is the marker. */
+      const isCompanion = (sessionId) => {
+        if (sessionId.length === 0) return false
+        if (companions.has(sessionId)) return true
+        const summary = snapshotOf(sessionId)
+        return summary !== undefined && containsMarker(summary)
       }
 
       /** Create an ordinary session; `sessions.create` resolves to its `SessionId`. */
@@ -149,7 +159,7 @@ window.__ModuleLoader__.load({
         }
       }
 
-      return { get, cwdOf, createSession, openSession, bind }
+      return { get, cwdOf, isCompanion, createSession, openSession, bind }
     }
 
     function ObserverChip({ sessionId, bridge }) {
@@ -178,9 +188,9 @@ window.__ModuleLoader__.load({
             return
           }
           const observerSessionId = created.sessionId
-          // Remember it BEFORE opening, so the chip inside the companion already knows to hide.
+          // Remember it BEFORE opening: the rename lands a moment after the jump, and the chip
+          // inside the fresh companion must not appear in that gap.
           companions.add(observerSessionId)
-          writeCompanions(companions)
           const opened = bridge.openSession(observerSessionId)
           const bound = await bridge.bind(sessionId, observerSessionId)
           if (!bound.ok) {
@@ -221,14 +231,14 @@ window.__ModuleLoader__.load({
      *
      * The first rule keeps an empty-id call (which produced `gateway/internal`) impossible. The
      * second is the no-nesting rule the Host also enforces: a companion that summons a companion
-     * chains forever. It is answered locally from the id set — no host round trip, so the
-     * transcript stays clean.
+     * chains forever. It is answered from local data only — the session's own `[副脑]` title plus
+     * the ids this page created — so no request is made and the transcript stays clean.
      */
     const makeEntry = (bridge) => (props) => {
       try {
         const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
         if (sessionId.length === 0) return null
-        if (companions.has(sessionId)) return null
+        if (bridge.isCompanion(sessionId)) return null
         return h(ObserverChip, { sessionId, bridge })
       } catch (error) {
         const message = String((error && error.message) || error)
@@ -241,7 +251,7 @@ window.__ModuleLoader__.load({
       /**
        * Service keys actually available on this Client half:
        * `slots` (register), `sessions` (create, returns the id), `uiWorkspace` (open),
-       * `remote` + `remote.commands` (the fire-and-forget bind line).
+       * `remote` + `remote.commands` (the single bind line per click).
        */
       inject: ['slots', 'sessions', 'uiWorkspace', 'remote', 'remote.commands'],
       apply(ctx) {
@@ -262,6 +272,36 @@ window.__ModuleLoader__.load({
           }
         }
         console.log('[dsh-observer] client seats registered (turntail, composer, sidebar)')
+
+        /**
+         * v1.0.4 — FOCUS PULL, EVENT DRIVEN.
+         *
+         * A handoff announces `graft/session-transferred { sourceSessionId, newSessionId }`. When
+         * that event reaches this half, open the new main session directly — no poll, no state
+         * read, no lookup.
+         *
+         * HONEST LIMIT: this listener only fires if the harness bridges Host plugin events to the
+         * Client. If it does not, the listener is inert and the user navigates by hand; nothing
+         * else depends on it, and `ctx.on` is probed so a host without an event bus cannot break
+         * registration.
+         */
+        try {
+          if (typeof ctx.on === 'function') {
+            ctx.on('graft/session-transferred', (payload) => {
+              try {
+                const newSessionId = typeof payload?.newSessionId === 'string' ? payload.newSessionId : ''
+                if (newSessionId.length === 0) return
+                bridge.openSession(newSessionId)
+                console.log(`[dsh-observer] transfer seen; opened ${newSessionId}`)
+              } catch (error) {
+                console.error('[dsh-observer] transfer handler failed:', String((error && error.message) || error))
+              }
+            })
+            console.log('[dsh-observer] listening for graft/session-transferred')
+          }
+        } catch (error) {
+          console.error('[dsh-observer] could not subscribe to the transfer event:', String((error && error.message) || error))
+        }
       },
       __makeEntryForTest: makeEntry,
       __makeBridgeForTest: makeBridge,

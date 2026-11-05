@@ -1,10 +1,13 @@
 /**
- * dsh-observer — the CREATE/STAGE contract, asserted through the TOOLS.
+ * dsh-observer — the CREATE/BIND contract, asserted through the TOOLS.
  *
  * v1.0.3 moved this file off the command surface: `observer-create` and `observer-consult` are
  * deleted (every command invocation printed a row into the conversation, which is the ghost
  * polling the user kept seeing). The same logic is reachable as `observer_create` /
  * `observer_consult` / `observer_bind`, and that is what these cases exercise.
+ *
+ * v1.0.4 dropped the `agent/pre-step` staging entirely: the role is now one ordinary message plus
+ * a `[副脑]` title, so nothing here touches the decision the agent loop builds.
  */
 
 import test from 'node:test'
@@ -20,6 +23,7 @@ function boot(bindingsPath) {
   const commands = new Map()
   const listeners = new Map()
   const prompts = []
+  const renames = []
   let created = 0
   const ctx = {
     get(name) {
@@ -34,6 +38,10 @@ function boot(bindingsPath) {
             prompts.push(request)
             return { accepted: true }
           },
+          async rename(request) {
+            renames.push(request)
+            return { title: request.title, seq: renames.length }
+          },
         }
       }
       return undefined
@@ -46,11 +54,8 @@ function boot(bindingsPath) {
   }
   const path = bindingsPath ?? join(mkdtempSync(join(tmpdir(), 'dsh-observer-')), 'observer-bindings.json')
   apply(ctx, { bindingsPath: path })
-  return { tools, commands, listeners, prompts, path }
+  return { tools, commands, listeners, prompts, renames, path }
 }
-
-/** The documented pre-step decision: `{ kind: 'reject' } | { kind: 'enter'; messages }`. */
-const enter = (messages = []) => async () => ({ kind: 'enter', messages })
 
 test('observer_create: answers with the observer session id and binds it', async () => {
   const { tools } = boot()
@@ -87,94 +92,63 @@ test('observer_create: an unwritable bindings path is reported, never claimed as
   assert.match(reply.text, /绑定表写入失败/u)
 })
 
-test('observer_consult: a companion with NO pointer and a STAGED pre-discussion mission', async () => {
-  const { tools, prompts, listeners } = boot()
+test('observer_consult: a companion with NO pointer, titled and told its role', async () => {
+  const { tools, prompts, renames } = boot()
   const reply = await tools.get('observer_consult').execute({})
   assert.equal(reply.ok, true)
   assert.equal(reply.observerSessionId, 'obs-1')
   assert.deepEqual(debugObserverState().bindings, {}, 'a consultation companion is not bound to anything')
-  assert.equal(prompts.length, 0, 'nothing is pushed — the consultation opens blank')
-
-  const decision = await listeners.get('agent/pre-step')({ agent: { id: 'obs-1' } }, enter())
-  assert.equal(decision.messages.length, 1, 'and it still receives its role on the first step')
-  assert.match(decision.messages[0].content[0].text, /前置需求分析副脑/u)
-  assert.match(decision.messages[0].content[0].text, /最终 Prompt/u)
+  assert.match(renames[0].title, /\[副脑\]/u)
+  assert.match(prompts[0].content[0].text, /前置需求分析副脑/u)
+  assert.match(prompts[0].content[0].text, /最终 Prompt/u)
 })
 
 /**
- * v1.0.3 — THE END-TO-END CASE THE USER ASKED FOR.
+ * v1.0.4 — THE SETUP MUST NOT LIE ABOUT A PARTIAL RESULT.
  *
- * A companion created and bound, then the user types their FIRST message in it: pre-step fires,
- * and the decision that leaves the listener must (a) still be `kind: 'enter'` — the shape the loop
- * accepts — and (b) carry the `[副脑启动]` mission. The earlier suite mocked `{ messages: [] }`,
- * a shape the host never produces, so it certified nothing.
+ * If the rename or the role message fails, the reply says so instead of reporting a clean summon:
+ * a companion that can never be recognised by its title would keep showing the summon button.
  */
-test('end to end: the companion\'s first user message carries the mission into the step', async () => {
-  const { tools, listeners } = boot()
-  await tools.get('observer_create').execute({}, { agent: { id: 'main-e2e' } })
-
-  // The user's first message in the companion is what triggers this step.
-  const firstUserMessage = { id: 'user-msg-1', role: 'user', content: [{ type: 'text', text: '帮我看下主会话在做什么' }] }
-  const decision = await listeners.get('agent/pre-step')(
-    { agent: { id: 'obs-1' }, messages: [firstUserMessage], turn: 1, step: 1 },
-    enter([firstUserMessage]),
-  )
-
-  assert.equal(decision.kind, 'enter', 'the loop only accepts an `enter` decision')
-  assert.equal(decision.messages.length, 2, 'the user message is preserved and the mission is appended')
-  assert.equal(decision.messages[0].id, 'user-msg-1', 'the user message is never replaced')
-  const mission = decision.messages[1]
-  assert.equal(mission.role, 'user', 'pre-step messages travel as user messages')
-  assert.match(mission.content[0].text, /\[副脑启动\]/u, 'the mission text is present')
-  assert.match(mission.content[0].text, /观察者/u, 'and it says what the companion is')
-
-  // Second step: no repetition.
-  const second = await listeners.get('agent/pre-step')(
-    { agent: { id: 'obs-1' }, messages: [firstUserMessage], turn: 1, step: 2 },
-    enter([firstUserMessage]),
-  )
-  assert.deepEqual(second.messages, [firstUserMessage], 'the mission is delivered exactly once')
-})
-
-test('pre-step: a decision that is not `enter` is passed through untouched', async () => {
-  const { tools, listeners } = boot()
-  await tools.get('observer_create').execute({}, { agent: { id: 'main-reject' } })
-  const preStep = listeners.get('agent/pre-step')
-
-  const rejected = await preStep({ agent: { id: 'obs-1' } }, async () => ({ kind: 'reject' }))
-  assert.deepEqual(rejected, { kind: 'reject' }, 'a rejection is never decorated')
-
-  const unknown = await preStep({ agent: { id: 'obs-1' } }, async () => ({ something: 'else' }))
-  assert.deepEqual(unknown, { something: 'else' }, 'an unrecognised decision is not rewritten into a guess')
-})
-
-test('pre-step: the agents.currentInitiator fallback resolves a payload without an agent', async () => {
-  const listeners = new Map()
+test('observer_create: a failed rename or role message is reported in the reply', async () => {
+  const tools = new Map()
   const ctx = {
     get(name) {
-      if (name === 'agents') return { currentInitiator: () => ({ id: 'obs-fallback' }) }
       if (name === 'commands') return { register: () => {} }
+      if (name === 'sessionController') {
+        return {
+          async create() {
+            return { sessionId: 'obs-broken' }
+          },
+          async prompt() {
+            throw new Error('prompt refused')
+          },
+          async rename() {
+            throw new Error('rename refused')
+          },
+        }
+      }
       return undefined
     },
     logger: { info() {}, warn() {} },
-    on(event, listener) {
-      listeners.set(event, listener)
-    },
-    tools: { register: () => {} },
+    on() {},
+    tools: { register: (definition) => tools.set(definition.name, definition) },
   }
-  const path = join(mkdtempSync(join(tmpdir(), 'dsh-observer-')), 'observer-bindings.json')
-  apply(ctx, { bindingsPath: path })
+  apply(ctx, { bindingsPath: join(mkdtempSync(join(tmpdir(), 'dsh-observer-')), 'observer-bindings.json') })
 
-  // Stage a mission directly for the id the fallback will supply.
-  await listeners.get('agent/pre-step') // touch, to be explicit that it is registered
-  const tools = new Map()
-  const ctx2WithTools = { ...ctx, tools: { register: (d) => tools.set(d.name, d) } }
-  apply(ctx2WithTools, { bindingsPath: path })
-  await tools
-    .get('observer_bind')
-    .execute({ mainSessionId: 'main-fallback', observerSessionId: 'obs-fallback' })
+  const reply = await tools.get('observer_create').execute({}, { agent: { id: 'main-broken' } })
+  assert.equal(reply.ok, true, 'the pointer IS durable, so the summon itself succeeded')
+  assert.match(reply.text, /部分步骤未完成/u, 'but the partial failure is stated, not hidden')
+  assert.match(reply.text, /rename refused/u)
+  assert.match(reply.text, /prompt refused/u)
+})
 
-  const decision = await listeners.get('agent/pre-step')({ agent: {} }, enter())
-  assert.equal(decision.messages.length, 1, 'the fallback id receives the mission')
-  assert.match(decision.messages[0].content[0].text, /\[副脑启动\]/u)
+/**
+ * v1.0.4 — THE STEP PATH IS UNTOUCHED.
+ *
+ * This is the regression guard for the 404: if any future change registers a listener on
+ * `agent/pre-step` again, this fails immediately.
+ */
+test('no listener is registered on agent/pre-step', () => {
+  const { listeners } = boot()
+  assert.equal(listeners.has('agent/pre-step'), false, 'the request pipeline must stay untouched')
 })

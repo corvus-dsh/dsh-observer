@@ -1,9 +1,9 @@
 /**
  * dsh-observer host tests.
  *
- * The moved graft tests asserted "the follower never gets a tape"; these assert the same
- * rule from the owner's side: the pointer only ever MOVES, a follower cannot chain, and the
- * focus request is consumed exactly once.
+ * The moved graft tests asserted "the follower never gets a tape"; these assert the same rule from
+ * the owner's side: the pointer only ever MOVES, a follower cannot chain, and the companion is
+ * marked so the Client can recognise it without asking anyone.
  */
 
 import test from 'node:test'
@@ -20,6 +20,8 @@ function boot() {
   const listeners = new Map()
   const commands = new Map()
   const prompts = []
+  const renames = []
+  let created = 0
   const ctx = {
     get(name) {
       if (name === 'commands') {
@@ -28,11 +30,16 @@ function boot() {
       if (name === 'sessionController') {
         return {
           async create() {
-            return { sessionId: `obs-${prompts.length + 1}` }
+            created += 1
+            return { sessionId: `obs-${created}` }
           },
           async prompt(request) {
             prompts.push(request)
             return { accepted: true }
+          },
+          async rename(request) {
+            renames.push(request)
+            return { title: request.title, seq: renames.length }
           },
         }
       }
@@ -46,12 +53,21 @@ function boot() {
   }
   const bindingsPath = join(root, 'observer-bindings.json')
   apply(ctx, { bindingsPath })
-  return { ctx, tools, listeners, commands, prompts, bindingsPath }
+  return { ctx, tools, listeners, commands, prompts, renames, bindingsPath }
 }
 
 test('observer: mounting writes nothing until a follower is created', () => {
   const { bindingsPath } = boot()
   assert.equal(existsSync(bindingsPath), false)
+})
+
+test('observer: NO agent/pre-step listener — the request pipeline is left alone', () => {
+  const { listeners } = boot()
+  assert.deepEqual(
+    [...listeners.keys()],
+    ['graft/session-transferred'],
+    'only the transfer event is observed; nothing in the step path is intercepted',
+  )
 })
 
 test('observer: summoning without a session is refused, never guessed', async () => {
@@ -62,53 +78,34 @@ test('observer: summoning without a session is refused, never guessed', async ()
 })
 
 /**
- * v1.0.2 — THE MISSION IS STAGED, NOT PUSHED.
+ * v1.0.4 — THE ROLE IS AN ORDINARY MESSAGE, AND THE SESSION IS TITLED.
  *
- * v1.0.1 sent `[副脑启动]` with `sessionController.prompt` the moment the pointer was written,
- * so a companion opened on a message the user never wrote and could not answer. The mission is
- * now held in the bindings document and released by the companion's FIRST `agent/pre-step`.
+ * Injecting through `agent/pre-step` put this plugin inside the agent loop's request construction
+ * and produced an opaque upstream failure. The role now travels with `sessionController.prompt`
+ * (the channel any message uses) and the companion's TITLE carries `[副脑]`, which is the marker
+ * the Client reads from its own local snapshot to hide the summon chip.
  */
-test('observer: a follower gets its pointer, and the mission is STAGED (not pushed)', async () => {
-  const { tools, prompts, bindingsPath } = boot()
+test('observer: a follower gets its pointer, a titled session, and an ordinary role message', async () => {
+  const { tools, prompts, renames, bindingsPath } = boot()
   const created = await tools.get('observer_create').execute({}, { agent: { id: 'main-1' } })
   assert.equal(created.ok, true)
   assert.deepEqual(debugObserverState().bindings, { 'main-1': 'obs-1' })
-  assert.equal(prompts.length, 0, 'nothing is pushed into the companion — it must open blank')
-  assert.ok(readFileSync(bindingsPath, 'utf8').includes('副脑启动'), 'the mission is held in the document')
+  assert.ok(readFileSync(bindingsPath, 'utf8').includes('main-1'), 'the pointer is durable')
+
+  assert.equal(renames.length, 1, 'the companion is renamed once')
+  assert.equal(renames[0].sessionId, 'obs-1')
+  assert.match(renames[0].title, /\[副脑\]/u, 'the title carries the marker the Client reads')
+
+  assert.equal(prompts.length, 1, 'the role is delivered as one ordinary message')
+  const text = prompts[0].content[0].text
+  assert.match(text, /\[系统设定\]/u, 'it is framed as an ordinary system setting, not a step rewrite')
+  assert.match(text, /副脑/u)
+  assert.match(text, /main-1/u, 'and it names the session being observed')
 
   const again = await tools.get('observer_create').execute({}, { agent: { id: 'main-1' } })
   assert.equal(again.ok, true)
   assert.match(again.text, /未重复创建/u)
-})
-
-test('observer: the first real step releases the mission exactly once', async () => {
-  const { tools, listeners, prompts } = boot()
-  await tools.get('observer_create').execute({}, { agent: { id: 'main-1' } })
-  const preStep = listeners.get('agent/pre-step')
-  assert.ok(preStep !== undefined, 'the pre-step listener is registered at mount')
-
-  const first = await preStep({ agent: { id: 'obs-1' } }, async () => ({ kind: 'enter', messages: [] }))
-  assert.equal(first.messages.length, 1, 'the companion receives its role on the first step')
-  assert.match(first.messages[0].content[0].text, /副脑启动/u)
-
-  const second = await preStep({ agent: { id: 'obs-1' } }, async () => ({ kind: 'enter', messages: [] }))
-  assert.equal(second.messages.length, 0, 'and never again')
-  assert.equal(prompts.length, 0, 'this channel never pushes a turn of its own')
-})
-
-test('observer: an unrelated session receives nothing', async () => {
-  const { listeners } = boot()
-  const preStep = listeners.get('agent/pre-step')
-  const decision = await preStep({ agent: { id: 'someone-else' } }, async () => ({ kind: 'enter', messages: [] }))
-  assert.deepEqual(decision.messages, [])
-})
-
-test('observer: a rejected step is passed through untouched', async () => {
-  const { tools, listeners } = boot()
-  await tools.get('observer_create').execute({}, { agent: { id: 'main-1' } })
-  const preStep = listeners.get('agent/pre-step')
-  const rejected = await preStep({ agent: { id: 'obs-1' } }, async () => ({ kind: 'reject' }))
-  assert.equal(rejected.kind, 'reject', 'a rejection is never decorated with a mission')
+  assert.equal(prompts.length, 1, 'a second summon does not re-send the role')
 })
 
 test('observer: a follower cannot be given a follower of its own', async () => {
@@ -129,19 +126,17 @@ test('observer: the transfer listener MOVES the pointer and leaves the follower 
   const moved = debugObserverState()
   assert.deepEqual(moved.bindings, { 'main-b': 'obs-1' }, 'the pointer moved, the follower id is unchanged')
   assert.equal(moved.reverse['obs-1'], 'main-b')
-  assert.equal(moved.focus.sessionId, 'main-b', 'and the UI is asked to follow once')
+  assert.equal(moved.focus.sessionId, 'main-b', 'and a focus note is filed for the new main')
 })
 
 test('observer: focus is one-shot — ack consumes it exactly once', async () => {
   const { tools } = boot()
   await tools.get('observer_create').execute({}, { agent: { id: 'main-1' } })
-  // Follow a transfer directly (the event bus is not present in this process).
   const followed = debugFollowTransfer('main-1', 'main-2')
   assert.equal(followed.followed, true)
   const state = debugObserverState()
-  assert.deepEqual(state.bindings, { 'main-2': 'obs-1' }, 'the pointer moved to the new main')
-  assert.equal(state.reverse['obs-1'], 'main-2', 'and the reverse index agrees')
-  assert.equal(state.focus.sessionId, 'main-2', 'a focus request was filed for the new main')
+  assert.deepEqual(state.bindings, { 'main-2': 'obs-1' })
+  assert.equal(state.focus.sessionId, 'main-2')
 
   const status = tools.get('observer_status')
   const first = await status.execute({ ackFocus: true })
@@ -157,57 +152,15 @@ test('observer: an unknown transfer changes nothing', () => {
 })
 
 /**
- * v1.0.1 — THE BIND-ONLY ENTRY, AND THE CLIENT'S PLAN B.
- *
- * The Client now creates the session with `sessions.create` (the only client API returning an
- * id) and opens it; the Host only records the pointer and sends the mission. These tests pin the
- * pair: `observer_bind` writes and VERIFIES the pointer, and it refuses the two dishonest cases
- * (missing ids, a companion binding a companion).
- */
-test('observer_bind: writes the pointer, verifies it on disk, and STAGES the mission', async () => {
-  const { tools, prompts, bindingsPath, listeners } = boot()
-  const bind = tools.get('observer_bind')
-  assert.ok(bind !== undefined, 'observer_bind is registered')
-
-  const result = await bind.execute({ mainSessionId: 'main-9', observerSessionId: 'obs-9' })
-  assert.equal(result.ok, true)
-  assert.deepEqual(debugObserverState().bindings, { 'main-9': 'obs-9' })
-  assert.equal(debugObserverState().reverse['obs-9'], 'main-9')
-  const document = readFileSync(bindingsPath, 'utf8')
-  assert.match(document, /main-9/u, 'the pointer reached the file')
-  assert.match(document, /副脑启动/u, 'and so did the staged mission (one durable fact)')
-  assert.equal(prompts.length, 0, 'nothing is pushed: the companion must open blank')
-
-  const preStep = listeners.get('agent/pre-step')
-  const decision = await preStep({ agent: { id: 'obs-9' } }, async () => ({ kind: 'enter', messages: [] }))
-  assert.equal(decision.messages.length, 1, 'the role arrives on the first real step')
-  assert.match(decision.messages[0].content[0].text, /副脑启动/u)
-})
-
-test('observer_bind: refuses missing ids and a companion that would bind another', async () => {
-  const { tools } = boot()
-  const bind = tools.get('observer_bind')
-
-  const missing = await bind.execute({ mainSessionId: 'main-9', observerSessionId: '' })
-  assert.equal(missing.ok, false)
-  assert.match(missing.text, /缺少/u)
-
-  await bind.execute({ mainSessionId: 'main-9', observerSessionId: 'obs-9' })
-  // obs-9 is now a follower; it must not be used as a MAIN session.
-  const chained = await bind.execute({ mainSessionId: 'obs-9', observerSessionId: 'obs-10' })
-  assert.equal(chained.ok, false)
-  assert.match(chained.text, /副脑会话/u)
-})
-/**
  * v1.0.3 — ONLY THE CLICK PATH'S COMMAND SURVIVES.
  *
  * `observer-state` / `observer-create` / `observer-consult` / `observer-focus-ack` were the
  * client-polling channel and are physically deleted: every command invocation prints a row into
- * the conversation, so as long as they existed a stale client could keep flooding the transcript.
- * The capability stays available to the MODEL as tools.
+ * the conversation, so while they existed a stale client could keep flooding the transcript. The
+ * capability stays available to the MODEL as tools.
  */
 test('observer: exactly one command remains, and the tools keep the capability', async () => {
-  const { commands, tools, listeners } = boot()
+  const { commands, tools, prompts, renames } = boot()
   assert.deepEqual([...commands.keys()], ['observer-bind'], 'only the click path command is registered')
   for (const name of ['observer_bind', 'observer_create', 'observer_consult', 'observer_status']) {
     assert.ok(tools.has(name), `${name} stays available as a tool`)
@@ -216,10 +169,7 @@ test('observer: exactly one command remains, and the tools keep the capability',
   // The client-side plan: the Client creates the session, the Host only records the pointer.
   const bound = await commands.get('observer-bind').handler({ rawInput: 'main-bind obs-bind' })
   assert.equal(bound.kind, 'success')
-  const decision = await listeners.get('agent/pre-step')({ agent: { id: 'obs-bind' } }, async () => ({
-    kind: 'enter',
-    messages: [],
-  }))
-  assert.equal(decision.messages.length, 1, 'the bound companion gets its role on its first step')
-  assert.equal(decision.kind, 'enter', 'the decision keeps the contract the loop expects')
+  assert.deepEqual(debugObserverState().bindings, { 'main-bind': 'obs-bind' })
+  assert.equal(renames[renames.length - 1].sessionId, 'obs-bind', 'the bound session is titled too')
+  assert.equal(prompts[prompts.length - 1].sessionId, 'obs-bind', 'and receives its role message')
 })

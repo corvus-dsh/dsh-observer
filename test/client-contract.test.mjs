@@ -97,18 +97,40 @@ test('client: one click inherits cwd, creates, opens the bare id, then binds', (
 })
 
 /**
- * v1.0.2 — NO NESTING AND NO RE-ENTRY.
+ * v1.0.4 — NO NESTING (from session metadata) AND NO RE-ENTRY (from a module latch).
  *
- * The chip hides itself inside a companion using a locally remembered id set (no host round trip),
- * and a MODULE-level latch makes the three seats share one in-flight summon — a per-component
- * `busy` flag still let the other two seats fire, which is the 无限多开 in the screenshots.
+ * The chip hides itself inside a companion using TWO local sources: the `[副脑]` title the Host
+ * writes into the session, read from the client's own snapshot, and the ids this page created
+ * (covering the moment between the jump and the rename). localStorage is deliberately NOT used —
+ * a stale entry there could hide the button in a session that is not a companion at all.
  */
-test('client: the chip hides inside a companion and the summon is exclusive', () => {
-  assert.match(code, /const companions = readCompanions\(\)/u, 'remembered ids survive a reload')
-  assert.match(code, /if \(companions\.has\(sessionId\)\) return null/u, 'a companion renders no chip')
-  assert.match(code, /companions\.add\(observerSessionId\)/u, 'the new id is remembered before opening')
+test('client: a companion is recognised from its own title, with no request and no storage', () => {
+  assert.match(code, /const isCompanion = \(sessionId\)/u, 'one place answers "is this a companion?"')
+  assert.match(code, /containsMarker\(summary\)/u, 'the session metadata is scanned for the marker')
+  assert.match(code, /'\[副脑\]'/u, 'the marker is the title the Host writes')
+  assert.match(code, /const companions = new Set\(\)/u, 'a page-local set covers the rename window')
+  assert.match(code, /if \(bridge\.isCompanion\(sessionId\)\) return null/u, 'a companion renders no chip')
+  assert.doesNotMatch(code, /localStorage/u, 'page storage was removed: it can go stale and lie')
+})
+
+test('client: the summon is exclusive across all three seats', () => {
   assert.match(code, /^\s*let summoning = false$/mu, 'the latch is module-scoped, not per component')
   assert.match(code, /if \(summoning\) return/u, 'a second click while one is running is ignored')
+  assert.match(code, /summoning = false/u, 'and it is always released')
+})
+
+/**
+ * v1.0.4 — FOCUS PULL, EVENT DRIVEN.
+ *
+ * A handoff announces `graft/session-transferred`; the Client opens the new main session straight
+ * from the event. No poll, no state read, no lookup.
+ */
+test('client: the transfer event opens the new session directly', () => {
+  assert.match(code, /ctx\.on\('graft\/session-transferred'/u, 'the transfer event is subscribed')
+  const handler = code.slice(code.indexOf("ctx.on('graft/session-transferred'"), code.indexOf('console.log(`[dsh-observer] transfer seen'))
+  assert.match(handler, /payload\?\.newSessionId/u, 'the new session id comes from the event payload')
+  assert.match(handler, /bridge\.openSession\(newSessionId\)/u, 'and it is opened immediately')
+  assert.doesNotMatch(handler, /setInterval|await|setTimeout/u, 'the handler is synchronous — nothing to poll')
 })
 
 test('client: the bind line is fired once and its reply is never read', () => {

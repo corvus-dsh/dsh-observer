@@ -26,7 +26,7 @@ export const name = 'dsh-observer'
  * Client half is cached separately, and "did my build reach the app?" must be answerable
  * without guessing.
  */
-export const VERSION = '1.0.3'
+export const VERSION = '1.0.4'
 console.log(`[dsh-observer] host version ${VERSION}`)
 
 /**
@@ -41,22 +41,13 @@ interface ObserverBindings {
   /** observerSessionId -> mainSessionId */
   reverse: Record<string, string>
   /**
-   * A one-shot focus request, consumed by the Client (which owns `uiWorkspace`). The Host
-   * cannot move a window, so it leaves a note and the UI acts on it exactly once.
+   * A one-shot focus request, left by a transfer.
+   *
+   * v1.0.4 NOTE: with every client state read removed, nothing consumes this any more. It is kept
+   * because it is one durable fact about a handoff (and `observer_status` can still read it), not
+   * because something currently acts on it.
    */
   focus: { sessionId: string; at: number } | null
-  /**
-   * v1.0.2 — THE MISSION IS HELD, NOT PUSHED.
-   *
-   * observerSessionId -> the role text that must be delivered as the companion's FIRST
-   * `agent/pre-step` context. v1.0.1 sent it with `sessionController.prompt` the instant the
-   * pointer was written, which put a `[副脑启动]` message into a session the user had not
-   * spoken in yet — a companion cannot discuss requirements with nobody. Holding it here and
-   * releasing it on the first real step keeps the new session a clean blank page.
-   */
-  missions: Record<string, string>
-  /** Observers whose mission has already been delivered (so it is never repeated). */
-  missionsSent: Record<string, true>
 }
 
 interface PluginContextLike {
@@ -66,10 +57,10 @@ interface PluginContextLike {
   tools?: { register: (definition: any) => unknown }
 }
 
-const EMPTY: ObserverBindings = { bindings: {}, reverse: {}, focus: null, missions: {}, missionsSent: {} }
+const EMPTY: ObserverBindings = { bindings: {}, reverse: {}, focus: null }
 
 let bindingsPath = ''
-let state: ObserverBindings = { bindings: {}, reverse: {}, focus: null, missions: {}, missionsSent: {} }
+let state: ObserverBindings = { bindings: {}, reverse: {}, focus: null }
 
 function isRecord(value: unknown): value is Record<string, any> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -82,13 +73,7 @@ function writeAtomic(path: string, value: unknown): void {
   renameSync(temp, path)
 }
 
-const EMPTY_STATE = (): ObserverBindings => ({
-  bindings: {},
-  reverse: {},
-  focus: null,
-  missions: {},
-  missionsSent: {},
-})
+const EMPTY_STATE = (): ObserverBindings => ({ bindings: {}, reverse: {}, focus: null })
 
 function load(): void {
   // Start from empty on EVERY load: the module-level state must describe THIS file, and a
@@ -112,14 +97,8 @@ function load(): void {
     if (isRecord(parsed.focus) && typeof parsed.focus.sessionId === 'string') {
       next.focus = { sessionId: parsed.focus.sessionId, at: Number(parsed.focus.at) || 0 }
     }
-    if (isRecord(parsed.missions)) {
-      for (const [observer, text] of Object.entries(parsed.missions)) {
-        if (typeof text === 'string' && text.length > 0) next.missions[observer] = text
-      }
-    }
-    if (isRecord(parsed.missionsSent)) {
-      for (const observer of Object.keys(parsed.missionsSent)) next.missionsSent[observer] = true
-    }
+    // `missions` / `missionsSent` from 1.0.2–1.0.3 are deliberately NOT read: the staged-injection
+    // design is gone, and a legacy key must not resurrect it.
     state = next
   } catch {
     // Absent (first run) or torn: start empty. A stale pointer is repairable; a crash is not.
@@ -273,126 +252,100 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
 
     const mission =
       mode === 'bind'
-        ? `[副脑启动] 你被绑定为会话 ${mainSessionId} 的观察者（跟随者）。` +
-          '职责：读主会话日志、澄清需求、以确认卡形式提出方案；不直接改代码。' +
-          '主会话转生后你会收到新的绑定目标，身份不变。'
-        : '[副脑启动] 你是一个前置需求分析副脑（尚未绑定任何主会话）。' +
+        ? missionText(mainSessionId)
+        : '[系统设定] 你是一个前置需求分析副脑（尚未绑定任何主会话）。' +
           '职责：帮用户理清需求、指出遗漏与风险，必要时给出 2~3 个方案对比。' +
           '确认方案后，请输出一段可直接粘贴到主会话的最终 Prompt，并在末尾提示用户「复制到主会话开始执行」。'
 
     /**
-     * v1.0.2 — STAGE, DO NOT PUSH.
+     * v1.0.4 — SEND IT AS AN ORDINARY MESSAGE, AND MARK THE SESSION.
      *
-     * v1.0.1 called `sessionController.prompt` here, so the companion opened on a `[副脑启动]`
-     * message the user never wrote and could not answer — there was nothing to discuss yet. The
-     * mission is now stored and released by this session's FIRST `agent/pre-step` (see the
-     * listener below), which keeps the new companion a clean blank page until the user speaks.
+     * The role travels with `sessionController.prompt` (nothing about the request pipeline is
+     * touched), and the companion's TITLE carries `[副脑]` so the Client can hide the summon chip
+     * by reading its own local session snapshot — no RPC, no localStorage.
      */
-    stageMission(observerSessionId, mission)
+    const marked = await markCompanion(mainSessionId, observerSessionId, mission)
+    if (!marked.delivered || !marked.renamed) {
+      ctx.logger?.warn?.(`[dsh-observer] companion setup incomplete: ${marked.detail}`)
+    }
 
     return {
       ok: true,
       observerSessionId,
       text:
         mode === 'bind'
-          ? `已召唤副脑 ${observerSessionId}，绑定到 ${mainSessionId}。`
-          : `已开启前置磋商副脑 ${observerSessionId}（未绑定主会话）。`,
+          ? `已召唤副脑 ${observerSessionId}，绑定到 ${mainSessionId}。` +
+            (marked.detail.length > 0 ? `（部分步骤未完成：${marked.detail}）` : '')
+          : `已开启前置磋商副脑 ${observerSessionId}（未绑定主会话）。` +
+            (marked.detail.length > 0 ? `（部分步骤未完成：${marked.detail}）` : ''),
     }
   }
 
   /**
-   * Hold the mission for a companion until its first real step.
+   * SEND THE ROLE AS AN ORDINARY MESSAGE, and mark the companion with a title.
    *
-   * Storing it in the same document as the pointer means one durable fact: a companion either
-   * has a pending mission or it does not, and a restart cannot deliver it twice.
+   * v1.0.4 — THE `agent/pre-step` LISTENER IS GONE, DELIBERATELY.
+   *
+   * v1.0.2/1.0.3 staged the mission and released it from a pre-step waterfall listener. That put
+   * this plugin in the middle of the agent loop's request construction, and the result was an
+   * opaque upstream failure (`astudio: 请求被上游拒绝 (HTTP 404) API endpoint not found`) with no
+   * way for the plugin to prove it was innocent. Injecting a system setting is not worth owning
+   * part of the request pipeline, so the mission now travels as one ordinary user message sent
+   * with `sessionController.prompt` — the same channel any other message uses, with nothing about
+   * the step decision altered.
+   *
+   * The companion is ALSO renamed to carry `[副脑]`. That is the marker the Client reads from its
+   * local session snapshot to hide the summon chip inside a companion, which is what makes the
+   * no-nesting rule work without any RPC.
    */
-  function stageMission(observerSessionId: string, mission: string): void {
-    state.missions[observerSessionId] = mission
-    delete state.missionsSent[observerSessionId]
-    save()
-  }
+  const markCompanion = async (
+    mainSessionId: string,
+    observerSessionId: string,
+    mission: string,
+  ): Promise<{ renamed: boolean; delivered: boolean; detail: string }> => {
+    const controller = ctx.get?.('sessionController')
+    let renamed = false
+    let delivered = false
+    const problems: string[] = []
 
-  /**
-   * Release the mission as the companion's first `agent/pre-step` context, exactly once.
-   *
-   * WHY THIS CHANNEL: writing a log event would collide with the agent loop's step numbering
-   * (the same reason dsh-graft-slice injects through `messages`), and `messages` only shapes the
-   * upcoming request — it does not fabricate a turn the user never started.
-   */
-  /**
-   * RESOLVE THE STEP'S AGENT.
-   *
-   * `payload.agent.id` is the SessionId (the Event contract says `Agent = { id: SessionId }`).
-   * The `agents.currentInitiator()` fallback is the same one dsh-graft-slice carries, because a
-   * payload without an agent must not silently skip the injection.
-   */
-  const agentIdOf = (payload: any): string => {
-    const direct = payload?.agent?.id
-    if (typeof direct === 'string' && direct.length > 0) return direct
-    try {
-      const agents = ctx.get?.('agents')
-      const current = isRecord(agents) && typeof agents.currentInitiator === 'function' ? agents.currentInitiator() : undefined
-      const fallback = isRecord(current) ? current.id : undefined
-      return typeof fallback === 'string' ? fallback : ''
-    } catch {
-      return ''
-    }
-  }
-
-  const PRE_STEP_EVENT = 'agent/pre-step'
-  ctx.on?.(PRE_STEP_EVENT, async (payload: any, next: any) => {
-    const decision = await next()
-    try {
-      /**
-       * THE REAL CONTRACT, and the reason the first attempt proved nothing:
-       *
-       *   PreStepDecision = { kind: 'reject' } | { kind: 'enter'; messages: UserMessage[] }
-       *
-       * The earlier version spread `decision` and appended to `decision.messages`, which happens
-       * to work when `kind: 'enter'` is already present — but its UNIT TEST mocked `{ messages: [] }`,
-       * a shape the host never produces. The guard and the injection are now written against the
-       * documented shape, so a decision without `kind: 'enter'` is passed through untouched rather
-       * than decorated into something the loop may drop.
-       */
-      if (!isRecord(decision)) return decision
-      if (decision.kind === 'reject') return decision
-      if (decision.kind !== 'enter') {
-        ctx.logger?.warn?.(`[dsh-observer] unexpected pre-step decision kind: ${JSON.stringify(decision.kind)}`)
-        return decision
+    if (isRecord(controller) && typeof controller.rename === 'function') {
+      try {
+        await controller.rename({ sessionId: observerSessionId, title: `[副脑] 跟随 ${mainSessionId.slice(0, 12)}…` })
+        renamed = true
+      } catch (error) {
+        problems.push(`重命名失败：${String((error as any)?.message ?? error)}`)
       }
+    } else {
+      problems.push('sessionController.rename 不可用')
+    }
 
-      const agentId = agentIdOf(payload)
-      if (agentId.length === 0) return decision
-      const mission = state.missions[agentId]
-      if (mission === undefined || state.missionsSent[agentId] === true) return decision
-
-      // Mark first, inject second: a double release is worse than a lost one, and the write is
-      // what makes "exactly once" durable across a restart.
-      state.missionsSent[agentId] = true
-      save()
-      ctx.logger?.info?.(`[dsh-observer] releasing the mission for ${agentId}`)
-
-      const base = Array.isArray(decision.messages) ? decision.messages : []
-      return {
-        kind: 'enter' as const,
-        ...(decision.startsRequestSeries === true ? { startsRequestSeries: true as const } : {}),
-        messages: [
-          ...base,
+    if (isRecord(controller) && typeof controller.prompt === 'function') {
+      try {
+        await controller.prompt(
           {
-            id: `observer-mission-${agentId}` as any,
-            // Pre-step messages are projected as user/message; the explicit header is what a
-            // pre-step listener can legitimately deliver (matching dsh-graft-slice).
-            role: 'user' as const,
+            requestId: `observer-mission-${Date.now()}`,
+            sessionId: observerSessionId,
+            mode: 'queue',
             content: [{ type: 'text', text: mission }],
           },
-        ],
+          new AbortController().signal,
+        )
+        delivered = true
+      } catch (error) {
+        problems.push(`设定消息发送失败：${String((error as any)?.message ?? error)}`)
       }
-    } catch (error) {
-      // A listener must never break the step it observes.
-      ctx.logger?.warn?.(`[dsh-observer] mission release failed: ${String((error as any)?.message ?? error)}`)
-      return decision
+    } else {
+      problems.push('sessionController.prompt 不可用')
     }
-  })
+
+    return { renamed, delivered, detail: problems.join('；') }
+  }
+
+  /** The role text, as an ordinary message the companion sees like any other. */
+  const missionText = (mainSessionId: string): string =>
+    `[系统设定] 你是会话 ${mainSessionId} 的副脑（观察者 / 跟随者）。` +
+    '职责：读主会话日志、澄清需求、以确认卡形式提出方案；不直接改代码。' +
+    '主会话转生后你会收到新的绑定目标，身份不变。'
 
   /**
    * v1.0.1 — BIND-ONLY ENTRY (the "B plan" for the client).
@@ -430,16 +383,20 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       return { ok: false, observerSessionId, text: `回读校验失败：${written.path} 中没有该绑定` }
     }
     /**
-     * v1.0.2: stage the mission instead of pushing it. The companion opens as a clean blank
-     * page and receives its role the moment the user actually speaks in it.
+     * v1.0.4: send the role as an ordinary message and title the session `[副脑] …`. The title is
+     * what hides the summon chip inside the companion, read by the Client from its local snapshot.
      */
-    stageMission(
+    const marked = await markCompanion(mainSessionId, observerSessionId, missionText(mainSessionId))
+    if (!marked.delivered || !marked.renamed) {
+      ctx.logger?.warn?.(`[dsh-observer] companion setup incomplete: ${marked.detail}`)
+    }
+    return {
+      ok: true,
       observerSessionId,
-      `[副脑启动] 你被绑定为会话 ${mainSessionId} 的观察者（跟随者）。` +
-        '职责：读主会话日志、澄清需求、以确认卡形式提出方案；不直接改代码。' +
-        '主会话转生后你会收到新的绑定目标，身份不变。',
-    )
-    return { ok: true, observerSessionId, text: `已绑定 ${mainSessionId} → ${observerSessionId}。` }
+      text:
+        `已绑定 ${mainSessionId} → ${observerSessionId}。` +
+        (marked.detail.length > 0 ? `（部分步骤未完成：${marked.detail}）` : ''),
+    }
   }
 
   ctx.tools?.register({
