@@ -27,7 +27,7 @@ export const name = 'dsh-observer'
  * Client half is cached separately, and "did my build reach the app?" must be answerable
  * without guessing.
  */
-export const VERSION = '1.0.5'
+export const VERSION = '1.0.6'
 console.log(`[dsh-observer] host version ${VERSION}`)
 
 /**
@@ -164,7 +164,61 @@ export function apply(ctx                   , config                          = 
   load()
 
   /**
-   * THE event. Grafted plugins announce, this one listens; nothing is imported in either
+   * v1.0.6 — THE BINDING IS DERIVED FROM THE TITLE, NOT REQUESTED THROUGH A COMMAND.
+   *
+   * `commands.execute` is BROADCAST: the host renders every command invocation as a row in the
+   * conversation, whatever the handler returns. The user saw it for `observer-state`,
+   * `observer-create` and finally `observer-bind` — an empty reply removes the TEXT but not the
+   * ROW. So the command channel is abandoned entirely for binding.
+   *
+   * Instead the Client renames the companion through a plain Remote call
+   * (`remote.session.rename`, which is not a command and prints nothing):
+   *
+   *     [副脑] 跟随 <full main session id>
+   *
+   * The host then reads its OWN event feed. `session/event` fires post-commit for every appended
+   * event, so a `session/title` carrying the marker is the moment to write the pointer and inject
+   * the setting. Nothing is polled, nothing is broadcast, and the title doubles as the marker the
+   * Client uses to hide the summon chip.
+   */
+  const COMPANION_TITLE = /^\[副脑\]\s*跟随\s+(\S+)/u
+
+  ctx.on?.('session/event', (...args       ) => {
+    try {
+      // `session/event` is scoped: (session, event). Read defensively so a shape change cannot
+      // throw inside a post-commit feed.
+      const event = args.length >= 2 ? args[1] : args[0]
+      if (!isRecord(event) || event.type !== 'session/title') return
+      const title = typeof event.data?.title === 'string' ? event.data.title : ''
+      const matched = COMPANION_TITLE.exec(title)
+      if (matched === null) return
+      const mainSessionId = matched[1]
+      const observerSessionId =
+        typeof event.data?.sessionId === 'string'
+          ? event.data.sessionId
+          : typeof args[0]?.id === 'string'
+            ? args[0].id
+            : ''
+      if (observerSessionId.length === 0 || mainSessionId === observerSessionId) return
+      // Already bound to the same pair: a repeated title event must not re-inject the setting.
+      if (observerOf(mainSessionId) === observerSessionId) return
+
+      state.bindings[mainSessionId] = observerSessionId
+      state.reverse[observerSessionId] = mainSessionId
+      const written = save()
+      if (!written.ok) {
+        ctx.logger?.warn?.(`[dsh-observer] title-derived bind failed to persist: ${written.error}`)
+        return
+      }
+      ctx.logger?.info?.(`[dsh-observer] bound ${mainSessionId} -> ${observerSessionId} from its title`)
+      void injectSetting(observerSessionId, missionText(mainSessionId))
+    } catch (error) {
+      ctx.logger?.warn?.(`[dsh-observer] title-derived bind failed: ${String((error       )?.message ?? error)}`)
+    }
+  })
+
+  /**
+   * THE transfer event. Grafted plugins announce, this one listens; nothing is imported in either
    * direction. Registered defensively: a host without the event bus must not fail to mount.
    */
   ctx.on?.('graft/session-transferred', (payload     ) => {
@@ -473,78 +527,18 @@ export function apply(ctx                   , config                          = 
   })
 
   /**
-   * v0.1 CLIENT CHANNEL: the UI reaches the Host only through commands (tools need an
-   * agent). Three of them, all session-independent, so a turn-tail button in ANY session
-   * can call them — including one that is not the session being observed.
+   * v1.0.6 — NO COMMANDS AT ALL.
+   *
+   * `commands.execute` is BROADCAST: every invocation is rendered as a row in the conversation,
+   * regardless of what the handler returns. An empty reply removes the text but not the row, so
+   * the channel cannot be used for silent bookkeeping. The binding now arrives through the
+   * `session/event` title feed above, and every former command has an equivalent TOOL for the
+   * model (`observer_status`, `observer_create`, `observer_consult`, `observer_bind`).
    */
-  /**
-   * Parse the command line. The gateway has handed this handler different shapes across
-   * builds (`rawInput`, `line`, `args.rawInput`), so all of them are read defensively — the
-   * alternative is a silent "no session id" that looks like a broken button.
-   */
-  const commandArg = (invocation     )         => {
-    const raw =
-      invocation?.rawInput ??
-      invocation?.line ??
-      invocation?.args?.rawInput ??
-      invocation?.args?.line ??
-      invocation?.text ??
-      ''
-    return String(raw).replace(/^\/\S+\s*/u, '').trim()
-  }
-  const commandAgent = (invocation     )         => {
-    const id = invocation?.agent?.id ?? invocation?.agentId ?? invocation?.args?.agentId ?? ''
-    return typeof id === 'string' ? id : ''
-  }
-
   const commands = ctx.get?.('commands')
   if (isRecord(commands) && typeof commands.register === 'function') {
-    /**
-     * v1.0.1 — BIND FOR A SESSION THE CLIENT ALREADY CREATED.
-     *
-     * The Client creates the session itself (`sessions.create` is the only client API that
-     * returns an id) and jumps to it, then fires this line. The reply is NOT read by the client:
-     * the gateway's wrapping has swallowed the id twice, and a pointer write does not need a
-     * return value. The args are `[mainSessionId, observerSessionId]` in `rawInput`.
-     */
-    commands.register({
-      name: 'observer-bind',
-      description: '把已创建的会话登记为副脑：/observer-bind <mainSessionId> <observerSessionId>',
-      /**
-       * v1.0.5 — THE REPLY IS EMPTY, ON PURPOSE.
-       *
-       * The gateway renders a command's returned `text` as a row in the conversation. A bind is a
-       * bookkeeping step the user did not ask to read, so it now reports NOTHING on success: an
-       * empty string produces no visible block. Only a FAILURE carries text, because a silent
-       * failure would be worse than a visible row.
-       */
-      handler: async (invocation     ) => {
-        try {
-          const parts = commandArg(invocation).split(/\s+/u).filter(Boolean)
-          const result = await bindExisting(parts[0] ?? '', parts[1] ?? '')
-          return {
-            kind: result.ok ? ('success'         ) : ('error'         ),
-            text: result.ok ? '' : `副脑绑定失败：${result.text}`,
-          }
-        } catch (error) {
-          const detail = String((error       )?.message ?? error)
-          ctx.logger?.warn?.(`[dsh-observer] observer-bind threw: ${detail}`)
-          return { kind: 'error'         , text: `副脑绑定失败：${detail}` }
-        }
-      },
-    })
-    /**
-     * v1.0.3 — THE OTHER FOUR COMMANDS ARE GONE, AND THAT IS THE POINT.
-     *
-     * `observer-state`, `observer-create`, `observer-consult` and `observer-focus-ack` existed
-     * only for the client polling that has been removed. Every command invocation prints a
-     * `observer-state: {…}` row into the conversation, so as long as these were registered a
-     * stale client could keep flooding the transcript. They are physically deleted; the
-     * equivalent capability stays available to the MODEL as tools (`observer_status`,
-     * `observer_create`, `observer_consult`), which is where it belongs.
-     *
-     * `observer-bind` remains because the Client's click path fires it.
-     */
+    // Intentionally empty: registering anything here puts a visible row in the user's transcript.
+    ctx.logger?.info?.('[dsh-observer] no commands registered — binding arrives via session/event')
   }
 
   ctx.tools?.register({

@@ -60,39 +60,50 @@ test('client: the plugin object injects exactly the services the minimal flow ne
 })
 
 /**
- * v1.0.2 — NO STATE READ, NO POLL, NO CREATE COMMAND, NO RPC ENUMERATION.
+ * v1.0.6 — NO STATE READ, NO POLL, NO COMMAND CHANNEL, NO ENUMERATION.
  *
- * `sessions.list.getSnapshot()` IS allowed: a synchronous read of the LOCAL store that yields the
- * main session's `cwd`, so it performs no request and prints no transcript row. An actual list
- * CALL, or the `remote.session` namespace, is not.
+ * `sessions.list.getSnapshot()` IS allowed: a synchronous read of the LOCAL store. An actual list
+ * CALL is not. `remote.session.rename` IS allowed — a plain Remote call, not a command, so it
+ * prints no transcript row (that is the whole point of v1.0.6).
  */
-test('client: no state read, no polling, no create command, no RPC enumeration', () => {
-  assert.doesNotMatch(code, /observer-state/u, 'the state command is gone entirely')
-  assert.doesNotMatch(code, /observer-create/u, 'the create command is gone (it lost the session id)')
+test('client: no state read, no polling, no command channel, no enumeration', () => {
+  assert.doesNotMatch(code, /observer-state|observer-create/u, 'the polling commands are gone entirely')
   assert.doesNotMatch(code, /setInterval|setTimeout/u, 'no timers')
-  assert.doesNotMatch(code, /sessions\.list\(|remote\.session/u, 'no list RPC — only the local snapshot')
+  assert.doesNotMatch(code, /sessions\.list\(/u, 'no list RPC — only the local snapshot')
   assert.doesNotMatch(code, /readSessions/u, 'the read-once guard is gone with the read it guarded')
   assert.doesNotMatch(code, /tools\.execute/u, 'there is no client tools service on this host')
+  /**
+   * THE BROADCAST CHANNEL IS GONE. `commands.execute` renders a row in the conversation whatever
+   * the handler returns, so it cannot be used for silent bookkeeping.
+   */
+  assert.doesNotMatch(code, /commands\.execute|observer-bind/u, 'nothing is sent over the command channel')
 })
 
 /**
- * v1.0.2 — THE CLICK PATH, INCLUDING WORKSPACE INHERITANCE.
+ * v1.0.6 — THE CLICK PATH, INCLUDING WORKSPACE INHERITANCE.
  *
- * `cwdOf` reads the main session's working directory from the local snapshot so the companion
- * lands in the SAME project instead of 未分组; `sessions.create` then receives it. The jump passes
- * the BARE id (`SessionTarget = SessionId | SubagentAddress`), and the pointer is written by ONE
- * fire-and-forget command line whose reply is never read.
+ * `locationOf` finds the main session's PATH or WORKSPACE from the local snapshot so the companion
+ * lands in the same project instead of a "选择工作区" empty page — and a session with no location is
+ * refused rather than created and abandoned. The jump passes the BARE id
+ * (`SessionTarget = SessionId | SubagentAddress`). The binding is not requested: the companion is
+ * MARKED with a title, and the Host derives the pointer from its own event feed.
  */
-test('client: one click inherits cwd, creates, opens the bare id, then binds', () => {
+test('client: one click inherits the location, creates, marks, then opens', () => {
   assert.match(code, /sessions\.create\(/u, 'creation goes through sessions.create (it returns SessionId)')
-  assert.doesNotMatch(code, /startSession\(/u, 'startSession returns void — it cannot supply the id to bind')
+  assert.doesNotMatch(code, /startSession\(/u, 'startSession returns void — it cannot supply the id')
   assert.match(code, /openSession\(observerSessionId\)/u, 'the jump passes the bare SessionTarget id')
   assert.doesNotMatch(code, /openSession\(\{\s*kind/u, 'a { kind, sessionId } wrapper is silently ignored')
-  assert.match(code, /observer-bind/u, 'the pointer is written by the observer-bind line')
+  assert.match(code, /markCompanion/u, 'the companion is marked, not bound through a command')
+  assert.match(code, /remote\.session\.rename|namespace\.rename/u, 'the mark is a plain Remote rename')
+  assert.match(code, /\[副脑\] 跟随/u, 'and the title is the marker the Host parses')
+  assert.match(code, /拿不到主会话的工作区或路径/u, 'a locationless create is refused, not attempted')
 
   const summon = code.slice(code.indexOf('const summon ='), code.indexOf('return h('))
-  const order = ['cwdOf(', 'createSession(', 'openSession(', 'bridge.bind('].map((step) => summon.indexOf(step))
-  assert.ok(order.every((at) => at >= 0), 'the flow is cwd → create → open → bind')
+  // `locationOf` is the ARGUMENT of `createSession`, so textually it comes second; what matters is
+  // that the location is computed for that call, and that mark precedes open.
+  assert.match(summon, /createSession\(bridge\.locationOf\(sessionId\)\)/u, 'the location feeds the create call')
+  const order = ['createSession(', 'markCompanion(', 'openSession('].map((step) => summon.indexOf(step))
+  assert.ok(order.every((at) => at >= 0), 'the flow is create → mark → open')
   assert.deepEqual([...order].sort((a, b) => a - b), order, 'the steps must run in that order')
 })
 
@@ -133,19 +144,22 @@ test('client: the transfer event opens the new session directly', () => {
   assert.doesNotMatch(handler, /setInterval|await|setTimeout/u, 'the handler is synchronous — nothing to poll')
 })
 
-test('client: the bind line is fired once and its reply is never read', () => {
-  const bind = code.slice(code.indexOf('const bind ='), code.indexOf('return { get,'))
-  assert.equal(
-    (bind.match(/commands\.execute\(/gu) ?? []).length,
-    1,
-    'exactly one bind line per click',
-  )
-  assert.doesNotMatch(bind, /JSON\.parse|\.text\b/u, 'the wrapped reply is not parsed — that layer lost the id')
-})
+/**
+ * v1.0.6 — THE MARKING CALL IS A PLAIN REMOTE, AND ITS FAILURE IS VISIBLE.
+ *
+ * `remote.session.rename` is used instead of a command precisely because a command is broadcast
+ * into the conversation. If the rename fails the chip says the companion was created but NOT
+ * marked, because an unmarked companion would keep showing the summon button inside itself.
+ */
+test('client: the marking call is a plain rename and its failure is reported', () => {
+  const mark = code.slice(code.indexOf('const markCompanion ='), code.indexOf('return { get,'))
+  assert.match(mark, /namespace\.rename\(/u, 'it renames through the Remote namespace')
+  assert.doesNotMatch(mark, /commands\.execute/u, 'never through the broadcast command channel')
+  assert.equal((mark.match(/rename\(/gu) ?? []).length, 1, 'exactly one rename per click')
+  assert.match(mark, /副脑未被标记/u, 'a failure names what did not happen')
 
-test('client: a failed bind is reported, never swallowed', () => {
-  assert.match(code, /指针未写入/u, 'a bind failure is stated in the chip')
-  assert.match(code, /console\.error\('\[dsh-observer\] bind failed:'/u, 'and logged with its reason')
+  assert.match(code, /但未被标记/u, 'and the chip states it instead of pretending success')
+  assert.match(code, /console\.error\('\[dsh-observer\] mark failed:'/u, 'the detail is logged')
 })
 
 test('client: a seat without a session id renders nothing', () => {

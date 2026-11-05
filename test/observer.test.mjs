@@ -71,13 +71,44 @@ test('observer: mounting writes nothing until a follower is created', () => {
   assert.equal(existsSync(bindingsPath), false)
 })
 
-test('observer: NO agent/pre-step listener — the request pipeline is left alone', () => {
+test('observer: the step path is never intercepted, and the title feed is observed', () => {
   const { listeners } = boot()
-  assert.deepEqual(
-    [...listeners.keys()],
-    ['graft/session-transferred'],
-    'only the transfer event is observed; nothing in the step path is intercepted',
-  )
+  assert.equal(listeners.has('agent/pre-step'), false, 'nothing in the step path is intercepted')
+  assert.equal(listeners.has('session/event'), true, 'the post-commit feed is how a binding arrives')
+  assert.equal(listeners.has('graft/session-transferred'), true, 'and transfers are still followed')
+})
+
+/**
+ * v1.0.6 — THE BINDING ARRIVES THROUGH THE EVENT FEED.
+ *
+ * The Client renames its new session to `[副脑] 跟随 <main id>` through a PLAIN Remote call
+ * (`remote.session.rename`), which is not a command and therefore prints no row. The Host reads
+ * its own `session/event` feed, parses the title, writes the pointer and injects the setting.
+ */
+test('observer: a [副脑] title binds the pair and injects the setting', async () => {
+  const { listeners, appends } = boot()
+  const onEvent = listeners.get('session/event')
+
+  onEvent({ id: 'obs-title' }, { type: 'session/title', data: { title: '[副脑] 跟随 main-title' } })
+
+  assert.deepEqual(debugObserverState().bindings, { 'main-title': 'obs-title' })
+  assert.equal(debugObserverState().reverse['obs-title'], 'main-title')
+  assert.equal(appends.length, 1, 'the setting is written once')
+  assert.equal(appends[0].type, 'developer/message')
+  assert.match(appends[0].data.message.content[0].text, /main-title/u)
+})
+
+test('observer: an unrelated or repeated title changes nothing', async () => {
+  const { listeners, appends } = boot()
+  const onEvent = listeners.get('session/event')
+
+  onEvent({ id: 'some-session' }, { type: 'session/title', data: { title: '普通标题' } })
+  assert.deepEqual(debugObserverState().bindings, {}, 'a normal retitle is not a binding')
+  assert.equal(appends.length, 0)
+
+  onEvent({ id: 'obs-title' }, { type: 'session/title', data: { title: '[副脑] 跟随 main-title' } })
+  onEvent({ id: 'obs-title' }, { type: 'session/title', data: { title: '[副脑] 跟随 main-title' } })
+  assert.equal(appends.length, 1, 'a repeated title event must not inject the setting twice')
 })
 
 test('observer: summoning without a session is refused, never guessed', async () => {
@@ -165,34 +196,24 @@ test('observer: an unknown transfer changes nothing', () => {
 })
 
 /**
- * v1.0.3 — ONLY THE CLICK PATH'S COMMAND SURVIVES.
+ * v1.0.6 — NO COMMANDS AT ALL.
  *
- * `observer-state` / `observer-create` / `observer-consult` / `observer-focus-ack` were the
- * client-polling channel and are physically deleted: every command invocation prints a row into
- * the conversation, so while they existed a stale client could keep flooding the transcript. The
- * capability stays available to the MODEL as tools.
- *
- * v1.0.5 — AND ITS SUCCESS REPLY IS EMPTY, so the one remaining invocation renders no row either.
- * Only a failure carries text, because a silent failure is worse than a visible row.
+ * Every command invocation is rendered as a row in the conversation no matter what the handler
+ * returns (an empty reply removes the text, not the row), so the channel is unusable for silent
+ * bookkeeping. The capability stays available to the MODEL as tools.
  */
-test('observer: one command remains, its success reply is empty, and the tools keep the capability', async () => {
+test('observer: no command is registered, and the tools keep the capability', async () => {
   const { commands, tools, prompts, appends, renames } = boot()
-  assert.deepEqual([...commands.keys()], ['observer-bind'], 'only the click path command is registered')
+  assert.deepEqual([...commands.keys()], [], 'nothing is registered on the broadcast channel')
   for (const name of ['observer_bind', 'observer_create', 'observer_consult', 'observer_status']) {
     assert.ok(tools.has(name), `${name} stays available as a tool`)
   }
 
-  // The client-side plan: the Client creates the session, the Host only records the pointer.
-  const bound = await commands.get('observer-bind').handler({ rawInput: 'main-bind obs-bind' })
-  assert.equal(bound.kind, 'success')
-  assert.equal(bound.text, '', 'an empty reply renders no visible block in the conversation')
-  assert.deepEqual(debugObserverState().bindings, { 'main-bind': 'obs-bind' })
-  assert.equal(renames[renames.length - 1].sessionId, 'obs-bind', 'the bound session is titled too')
-  assert.equal(appends[appends.length - 1].id, 'obs-bind', 'and receives its setting physically')
-  assert.equal(prompts.length, 0, 'still no prompt anywhere in the bind path')
-
-  // A failure must NOT be silent: that is the one case worth a visible row.
-  const refused = await commands.get('observer-bind').handler({ rawInput: 'obs-bind obs-other' })
-  assert.equal(refused.kind, 'error')
-  assert.match(refused.text, /副脑绑定失败/u)
+  // The model-facing path still writes the pointer AND titles the session.
+  const bound = await tools.get('observer_bind').execute({ mainSessionId: 'main-tool', observerSessionId: 'obs-tool' })
+  assert.equal(bound.ok, true)
+  assert.deepEqual(debugObserverState().bindings, { 'main-tool': 'obs-tool' })
+  assert.equal(renames[renames.length - 1].sessionId, 'obs-tool')
+  assert.equal(appends[appends.length - 1].id, 'obs-tool', 'the setting is written physically')
+  assert.equal(prompts.length, 0, 'no prompt anywhere in the bind path')
 })

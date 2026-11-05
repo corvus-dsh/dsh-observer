@@ -18,8 +18,8 @@
  * `Promise<SessionId>`, which is exactly what a caller needs in order to open and then bind.
  */
 
-window.__OBSERVER_LOADED__ = '1.0.5'
-console.log('%c[dsh-observer] FUCK CACHE 1.0.5 — minimal client loaded', 'color:#16a34a;font-weight:bold')
+window.__OBSERVER_LOADED__ = '1.0.6'
+console.log('%c[dsh-observer] FUCK CACHE 1.0.6 — no command channel, title-marked companions', 'color:#16a34a;font-weight:bold')
 
 window.__ModuleLoader__.load({
   id: 'dsh-observer',
@@ -94,9 +94,47 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const cwdOf = (sessionId) => {
+      /**
+       * THE MAIN SESSION'S WORKING DIRECTORY — and why the first attempt landed the user on a
+       * "选择工作区" page.
+       *
+       * `sessions.create({})` with no location creates a session with NO workspace, and the UI
+       * then shows the choose-a-workspace empty state. So the location must be supplied, and it
+       * must be found defensively:
+       *   1. `SessionSummary.cwd` — the documented field;
+       *   2. a structural scan of the same summary for a path-shaped string, because the app owns
+       *      which projection carries it and `cwd` may be absent on some builds;
+       *   3. a workspace id, taken from the snapshot's own maps if one is reachable.
+       */
+      const PATH_SHAPED = /^(?:[A-Za-z]:[\\/]|\\\\|\/)/u
+
+      const firstPathIn = (value, depth = 0) => {
+        if (depth > 3 || value === null || value === undefined) return ''
+        if (typeof value === 'string') return PATH_SHAPED.test(value) ? value : ''
+        if (Array.isArray(value)) {
+          for (const item of value) {
+            const found = firstPathIn(item, depth + 1)
+            if (found.length > 0) return found
+          }
+          return ''
+        }
+        if (typeof value === 'object') {
+          for (const item of Object.values(value)) {
+            const found = firstPathIn(item, depth + 1)
+            if (found.length > 0) return found
+          }
+          return ''
+        }
+        return ''
+      }
+
+      const locationOf = (sessionId) => {
         const summary = snapshotOf(sessionId)
-        return summary && typeof summary.cwd === 'string' ? summary.cwd : ''
+        if (summary === undefined) return { cwd: '', workspaceId: '' }
+        const cwd = typeof summary.cwd === 'string' && summary.cwd.length > 0 ? summary.cwd : firstPathIn(summary)
+        const workspaceId =
+          typeof summary.workspaceId === 'string' && summary.workspaceId.length > 0 ? summary.workspaceId : ''
+        return { cwd, workspaceId }
       }
 
       /** v1.0.4: the Host titles every companion `[副脑] 跟随 …`; that title is the marker. */
@@ -107,14 +145,29 @@ window.__ModuleLoader__.load({
         return summary !== undefined && containsMarker(summary)
       }
 
-      /** Create an ordinary session; `sessions.create` resolves to its `SessionId`. */
-      const createSession = async (cwd) => {
+      /**
+       * Create an ordinary session IN THE SAME PLACE as the main one.
+       *
+       * A location is mandatory: without it the user is dropped on an empty "choose a workspace"
+       * page, so a session with no location is refused here rather than created and abandoned.
+       */
+      const createSession = async ({ cwd, workspaceId }) => {
         const sessions = get('sessions')
         if (!sessions || typeof sessions.create !== 'function') {
           return { ok: false, sessionId: '', text: 'sessions.create 不可用（inject 未生效）' }
         }
+        const location = {}
+        if (cwd.length > 0) location.cwd = cwd
+        if (workspaceId.length > 0) location.workspaceId = workspaceId
+        if (cwd.length === 0 && workspaceId.length === 0) {
+          return {
+            ok: false,
+            sessionId: '',
+            text: '拿不到主会话的工作区或路径，拒绝创建一个没有归属的会话（否则会跳到“选择工作区”空页面）',
+          }
+        }
         try {
-          const sessionId = await sessions.create(cwd.length > 0 ? { cwd } : {})
+          const sessionId = await sessions.create(location)
           if (typeof sessionId !== 'string' || sessionId.length === 0) {
             return { ok: false, sessionId: '', text: `sessions.create 返回了空 id：${JSON.stringify(sessionId)}` }
           }
@@ -138,28 +191,33 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * Write the pointer: ONE fire-and-forget line per click.
+       * v1.0.6 — MARK THE COMPANION WITH A PLAIN REMOTE CALL, NOT A COMMAND.
        *
-       * It has to be a command. This host's Client service catalog exposes only
-       * layout / locale / sessions / slots / theme / timer / uiWorkspace / workspaces — there is
-       * no tool-execution service on the client half — and the reply is deliberately NOT read,
-       * because the gateway's wrapping is what lost the session id in the first place.
+       * `commands.execute` is BROADCAST: the host renders every invocation as a row in the
+       * conversation whatever the handler returns (an empty reply removes the text, not the row).
+       * That is the `observer-bind:` bubble the user kept seeing, and it cannot be fixed from the
+       * handler side.
+       *
+       * `remote.session.rename` is an ordinary Remote call — no row — and the title itself is the
+       * signal: the Host watches its own `session/event` feed, sees `[副脑] 跟随 <main id>`, writes
+       * the pointer and injects the setting. One call, no broadcast, and the title doubles as the
+       * marker that hides the summon chip inside a companion.
        */
-      const bind = async (mainSessionId, observerSessionId) => {
+      const markCompanion = async (mainSessionId, observerSessionId) => {
         const remote = get('remote')
-        const commands = remote && remote.commands
-        if (!commands || typeof commands.execute !== 'function') {
-          return { ok: false, text: 'remote.commands 不可用：指针未写入' }
+        const namespace = remote && (remote.session || remote.sessionController)
+        if (!namespace || typeof namespace.rename !== 'function') {
+          return { ok: false, text: 'remote.session.rename 不可用：副脑未被标记' }
         }
         try {
-          await commands.execute(mainSessionId, `/observer-bind ${mainSessionId} ${observerSessionId}`, [], undefined)
+          await namespace.rename({ sessionId: observerSessionId, title: `[副脑] 跟随 ${mainSessionId}` })
           return { ok: true, text: '' }
         } catch (error) {
           return { ok: false, text: String((error && error.message) || error) }
         }
       }
 
-      return { get, cwdOf, isCompanion, createSession, openSession, bind }
+      return { get, locationOf, isCompanion, createSession, openSession, markCompanion }
     }
 
     function ObserverChip({ sessionId, bridge }) {
@@ -181,8 +239,7 @@ window.__ModuleLoader__.load({
         setBusy(true)
         setNote('')
         try {
-          const cwd = bridge.cwdOf(sessionId)
-          const created = await bridge.createSession(cwd)
+          const created = await bridge.createSession(bridge.locationOf(sessionId))
           if (!created.ok) {
             setNote(`创建会话失败：${created.text}`)
             return
@@ -191,14 +248,14 @@ window.__ModuleLoader__.load({
           // Remember it BEFORE opening: the rename lands a moment after the jump, and the chip
           // inside the fresh companion must not appear in that gap.
           companions.add(observerSessionId)
-          const opened = bridge.openSession(observerSessionId)
-          const bound = await bridge.bind(sessionId, observerSessionId)
-          if (!bound.ok) {
-            console.error('[dsh-observer] bind failed:', bound.text)
-            setNote(`副脑 ${observerSessionId} 已打开，但指针未写入：${bound.text}`)
+          const marked = await bridge.markCompanion(sessionId, observerSessionId)
+          if (!marked.ok) {
+            console.error('[dsh-observer] mark failed:', marked.text)
+            setNote(`副脑 ${observerSessionId} 已创建，但未被标记：${marked.text}`)
             return
           }
-          if (!opened) setNote(`副脑 ${observerSessionId} 已创建并绑定；请在左侧会话列表中选择它`)
+          const opened = bridge.openSession(observerSessionId)
+          if (!opened) setNote(`副脑 ${observerSessionId} 已创建并标记；请在左侧会话列表中选择它`)
         } finally {
           summoning = false
           setBusy(false)
