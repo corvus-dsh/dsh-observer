@@ -18,8 +18,8 @@
  * `Promise<SessionId>`, which is exactly what a caller needs in order to open and then bind.
  */
 
-window.__OBSERVER_LOADED__ = '1.0.7'
-console.log('%c[dsh-observer] FUCK CACHE 1.0.7 — loud failures, remote.session injected', 'color:#16a34a;font-weight:bold')
+window.__OBSERVER_LOADED__ = '1.0.8'
+console.log('%c[dsh-observer] FUCK CACHE 1.0.8 — location from the host list', 'color:#16a34a;font-weight:bold')
 
 window.__ModuleLoader__.load({
   id: 'dsh-observer',
@@ -128,12 +128,44 @@ window.__ModuleLoader__.load({
         return ''
       }
 
-      const locationOf = (sessionId) => {
+      /**
+       * v1.0.8 — THE LOCATION IS TAKEN FROM THE HOST, NOT GUESSED.
+       *
+       * The local snapshot's summary did not carry `cwd` on this build, so the earlier version fell
+       * through to "no location" and `sessions.create({})` produced a session with NO workspace —
+       * the page the user saw was the "选择工作区" empty draft.
+       *
+       * `remote.session.list()` is the HOST's own summary read (`SessionSummary.cwd` is populated
+       * there), and it is a plain Remote call: no command, so no row in the conversation. That is
+       * the authoritative source; the local snapshot and a structural scan stay as fallbacks for a
+       * build where the list omits the field.
+       */
+      const locationOf = async (sessionId) => {
         const summary = snapshotOf(sessionId)
-        if (summary === undefined) return { cwd: '', workspaceId: '' }
-        const cwd = typeof summary.cwd === 'string' && summary.cwd.length > 0 ? summary.cwd : firstPathIn(summary)
-        const workspaceId =
-          typeof summary.workspaceId === 'string' && summary.workspaceId.length > 0 ? summary.workspaceId : ''
+        let cwd = typeof summary?.cwd === 'string' ? summary.cwd : ''
+        let workspaceId = typeof summary?.workspaceId === 'string' ? summary.workspaceId : ''
+
+        try {
+          const remote = get('remote')
+          const namespace = remote && (remote.session || remote.sessionController)
+          if (namespace && typeof namespace.list === 'function') {
+            const reply = await namespace.list({}, undefined)
+            const items = reply && Array.isArray(reply.items) ? reply.items : []
+            const row = items.find((item) => item && item.sessionId === sessionId)
+            if (row !== undefined) {
+              if (typeof row.cwd === 'string' && row.cwd.length > 0) cwd = row.cwd
+              if (typeof row.workspaceId === 'string' && row.workspaceId.length > 0) workspaceId = row.workspaceId
+            }
+            console.log(
+              `[dsh-observer] host list: ${items.length} session(s); ` +
+                `this one -> cwd=${JSON.stringify(row?.cwd ?? null)} workspaceId=${JSON.stringify(row?.workspaceId ?? null)}`,
+            )
+          }
+        } catch (error) {
+          console.error('[dsh-observer] host list failed:', String((error && error.message) || error))
+        }
+
+        if (cwd.length === 0 && summary !== undefined) cwd = firstPathIn(summary)
         return { cwd, workspaceId }
       }
 
@@ -146,10 +178,17 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * Create an ordinary session IN THE SAME PLACE as the main one.
+       * Create an ordinary session IN THE SAME PLACE as the main one — and NEVER WITHOUT ONE.
        *
-       * A location is mandatory: without it the user is dropped on an empty "choose a workspace"
-       * page, so a session with no location is refused here rather than created and abandoned.
+       * A locationless create is what produced the "选择工作区" empty draft, so when the location
+       * cannot be resolved this REFUSES with a reason rather than creating an orphan.
+       *
+       * v1.0.8 — LAST RESORT BEFORE REFUSING: `uiWorkspace.startSession()`.
+       *
+       * That client API opens the Workspace blank `connectWorkspace` resolves, and with no argument
+       * it inherits the CURRENT workspace — the exact placement we want, with no path guessing at
+       * all. It returns void, so the new id is recovered from the session list (one read, right
+       * after an explicit click; this is not polling).
        */
       const createSession = async ({ cwd, workspaceId }) => {
         const sessions = get('sessions')
@@ -159,11 +198,16 @@ window.__ModuleLoader__.load({
         const location = {}
         if (cwd.length > 0) location.cwd = cwd
         if (workspaceId.length > 0) location.workspaceId = workspaceId
+
         if (cwd.length === 0 && workspaceId.length === 0) {
+          const viaWorkspace = await createInCurrentWorkspace()
+          if (viaWorkspace.ok) return viaWorkspace
           return {
             ok: false,
             sessionId: '',
-            text: '拿不到主会话的工作区或路径，拒绝创建一个没有归属的会话（否则会跳到“选择工作区”空页面）',
+            text:
+              `拿不到主会话的工作区或路径，且 uiWorkspace.startSession 也不可用（${viaWorkspace.text}）；` +
+              '拒绝创建一个没有归属的会话（否则会跳到“选择工作区”空页面）',
           }
         }
         try {
@@ -175,6 +219,41 @@ window.__ModuleLoader__.load({
         } catch (error) {
           return { ok: false, sessionId: '', text: String((error && error.message) || error) }
         }
+      }
+
+      /**
+       * LAST RESORT: let the CLIENT open a blank in the CURRENT workspace.
+       *
+       * `uiWorkspace.startSession()` takes no location and inherits the workspace the user is
+       * already in — no path is guessed. It returns void, so the new id is read back from the
+       * session list: one read immediately after an explicit click, which is not polling.
+       */
+      const createInCurrentWorkspace = async () => {
+        const workspaceUi = get('uiWorkspace')
+        if (!workspaceUi || typeof workspaceUi.startSession !== 'function') {
+          return { ok: false, sessionId: '', text: 'uiWorkspace.startSession 不可用' }
+        }
+        const sessions = get('sessions')
+        const idsOf = () => {
+          try {
+            const snapshot = sessions && sessions.list && typeof sessions.list.getSnapshot === 'function' ? sessions.list.getSnapshot() : undefined
+            return Array.isArray(snapshot?.ids) ? [...snapshot.ids] : []
+          } catch {
+            return []
+          }
+        }
+        const before = idsOf()
+        try {
+          workspaceUi.startSession()
+        } catch (error) {
+          return { ok: false, sessionId: '', text: String((error && error.message) || error) }
+        }
+        // The store needs one tick to publish the new session.
+        await new Promise((resolve) => setTimeout(resolve, 250))
+        const fresh = idsOf().filter((id) => before.indexOf(id) < 0)
+        if (fresh.length === 0) return { ok: false, sessionId: '', text: 'startSession 之后没有出现新会话' }
+        console.log(`[dsh-observer] startSession created ${fresh[0]}`)
+        return { ok: true, sessionId: fresh[0], text: '' }
       }
 
       /** `openSession(target: SessionTarget)` — SessionTarget is a BARE id string. */
@@ -249,7 +328,7 @@ window.__ModuleLoader__.load({
         setBusy(true)
         setNote('')
         try {
-          const location = bridge.locationOf(sessionId)
+          const location = await bridge.locationOf(sessionId)
           console.log('[dsh-observer] location:', JSON.stringify(location))
           const created = await bridge.createSession(location)
           console.log('[dsh-observer] create result:', JSON.stringify(created))

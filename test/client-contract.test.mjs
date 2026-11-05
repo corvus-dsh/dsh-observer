@@ -68,8 +68,8 @@ test('client: the plugin object injects exactly the services the minimal flow ne
  */
 test('client: no state read, no polling, no command channel, no enumeration', () => {
   assert.doesNotMatch(code, /observer-state|observer-create/u, 'the polling commands are gone entirely')
-  assert.doesNotMatch(code, /setInterval|setTimeout/u, 'no timers')
-  assert.doesNotMatch(code, /sessions\.list\(/u, 'no list RPC — only the local snapshot')
+  assert.doesNotMatch(code, /setInterval/u, 'no repeating timer — polling is what flooded the transcript')
+  assert.doesNotMatch(code, /sessions\.list\(/u, 'no local list CALL is used for state')
   assert.doesNotMatch(code, /readSessions/u, 'the read-once guard is gone with the read it guarded')
   assert.doesNotMatch(code, /tools\.execute/u, 'there is no client tools service on this host')
   /**
@@ -77,6 +77,22 @@ test('client: no state read, no polling, no command channel, no enumeration', ()
    * the handler returns, so it cannot be used for silent bookkeeping.
    */
   assert.doesNotMatch(code, /commands\.execute|observer-bind/u, 'nothing is sent over the command channel')
+})
+
+/**
+ * v1.0.8 — ONE BOUNDED WAIT, AND ONLY AFTER A CLICK.
+ *
+ * `uiWorkspace.startSession()` returns void, so the last-resort path reads the session list once
+ * after a short settle. That is a single `setTimeout`, not a poll loop, and it only runs when the
+ * location could not be resolved from the host — the case that otherwise refuses the summon.
+ */
+test('client: the last-resort wait is a single settle, not a poll', () => {
+  const fallback = code.slice(code.indexOf('const createInCurrentWorkspace ='), code.indexOf('const openSession ='))
+  assert.match(fallback, /startSession\(\)/u, 'it uses the client-side startSession')
+  assert.equal((fallback.match(/setTimeout\(/gu) ?? []).length, 1, 'exactly one settle, no loop')
+  assert.equal((fallback.match(/await new Promise/gu) ?? []).length, 1, 'awaited once')
+  assert.doesNotMatch(fallback, /setInterval|while \(/u, 'no polling')
+  assert.match(fallback, /没有出现新会话/u, 'and it refuses rather than guessing an id')
 })
 
 /**
@@ -90,7 +106,8 @@ test('client: no state read, no polling, no command channel, no enumeration', ()
  */
 test('client: one click inherits the location, creates, marks, then opens', () => {
   assert.match(code, /sessions\.create\(/u, 'creation goes through sessions.create (it returns SessionId)')
-  assert.doesNotMatch(code, /startSession\(/u, 'startSession returns void — it cannot supply the id')
+  // `startSession` is the LAST RESORT only: it returns void, so its id must be read back.
+  assert.match(code, /const createInCurrentWorkspace =/u, 'the fallback exists for a missing location')
   assert.match(code, /openSession\(observerSessionId\)/u, 'the jump passes the bare SessionTarget id')
   assert.doesNotMatch(code, /openSession\(\{\s*kind/u, 'a { kind, sessionId } wrapper is silently ignored')
   assert.match(code, /markCompanion/u, 'the companion is marked, not bound through a command')
@@ -99,12 +116,29 @@ test('client: one click inherits the location, creates, marks, then opens', () =
   assert.match(code, /拿不到主会话的工作区或路径/u, 'a locationless create is refused, not attempted')
 
   const summon = code.slice(code.indexOf('const summon ='), code.indexOf('return h('))
-  // The location is computed once and handed to the create call; mark precedes open.
-  assert.match(summon, /const location = bridge\.locationOf\(sessionId\)/u, 'the location is computed')
+  // The location is fetched from the HOST list (await) and handed to the create call.
+  assert.match(summon, /const location = await bridge\.locationOf\(sessionId\)/u, 'the location is fetched')
   assert.match(summon, /bridge\.createSession\(location\)/u, 'and feeds the create call')
   const order = ['createSession(', 'markCompanion(', 'openSession('].map((step) => summon.indexOf(step))
   assert.ok(order.every((at) => at >= 0), 'the flow is create → mark → open')
   assert.deepEqual([...order].sort((a, b) => a - b), order, 'the steps must run in that order')
+})
+
+/**
+ * v1.0.8 — THE LOCATION COMES FROM THE HOST, NOT FROM A GUESS.
+ *
+ * The local snapshot did not carry `cwd` on this build, so `sessions.create({})` produced a session
+ * with no workspace and the user landed on the "选择工作区" empty draft. `remote.session.list()` is
+ * the host's own summary read (a plain Remote call — no command, so no conversation row) and is now
+ * the primary source, with the local snapshot as a fallback.
+ */
+test('client: the location is read from the host list, with the local snapshot as fallback', () => {
+  const locate = code.slice(code.indexOf('const locationOf ='), code.indexOf('const isCompanion ='))
+  assert.match(locate, /namespace\.list\(/u, 'it asks the host through the session list Remote')
+  assert.match(locate, /row\.cwd/u, 'and reads cwd from the host summary')
+  assert.match(locate, /row\.workspaceId/u, 'and workspaceId when the host provides one')
+  assert.match(locate, /firstPathIn\(summary\)/u, 'the local snapshot stays as a fallback')
+  assert.doesNotMatch(locate, /commands\.execute/u, 'never through the broadcast command channel')
 })
 
 /**
