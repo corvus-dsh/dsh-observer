@@ -1,27 +1,25 @@
 /**
- * dsh-observer — the Client half. DELIBERATELY MINIMAL (v1.0.1).
+ * dsh-observer — the Client half. DELIBERATELY MINIMAL (v1.0.3).
  *
  * WHAT THIS FILE DOES, IN ORDER:
  *   1. prints a cache probe (first statement);
  *   2. registers one chip in three seats;
- *   3. on click: `sessions.create()` → `uiWorkspace.openSession(newId)` → `observer_bind(...)`.
+ *   3. on click: read the main session's cwd → `sessions.create` → `uiWorkspace.openSession` →
+ *      ONE fire-and-forget bind line.
  *
- * WHAT IT NO LONGER DOES — each removed because it caused a visible failure:
- *   - no `/observer-state` read of ANY kind. The three seats re-render constantly, and every
- *     command call prints a row into the conversation; that is the "ghost polling" in the
- *     transcript. The chip therefore cannot show "已绑定" — it only offers 召唤副脑.
- *   - no `/observer-create` command. The gateway wraps command replies unreliably (`{kind,text}`,
- *     `{result}`, `{ok,value:{commandId}}`, and a JSON string nested inside `text`), and the id
- *     was lost inside that wrapping while the session WAS created.
- *   - no session enumeration, no timers, no waiting loops.
+ * THE ONLY HOST CALL IN THIS FILE IS THE BIND LINE, AND IT EXISTS FOR ONE CLICK.
+ * Every command invocation prints a row into the conversation, so the previous state-reading
+ * chip flooded the transcript on every re-render. There is no state read here, no timer, no
+ * session enumeration and no waiting loop: the chip keeps no view of the binding table and
+ * offers exactly one action.
  *
  * WHY `sessions.create` AND NOT `uiWorkspace.startSession`: `startSession()` returns void — it
  * opens a blank session but hands back no id. `sessions.create(opts)` returns
  * `Promise<SessionId>`, which is exactly what a caller needs in order to open and then bind.
  */
 
-window.__OBSERVER_LOADED__ = '1.0.2'
-console.log('%c[dsh-observer] FUCK CACHE 1.0.2 — minimal client loaded', 'color:#16a34a;font-weight:bold')
+window.__OBSERVER_LOADED__ = '1.0.3'
+console.log('%c[dsh-observer] FUCK CACHE 1.0.3 — minimal client loaded', 'color:#16a34a;font-weight:bold')
 
 window.__ModuleLoader__.load({
   id: 'dsh-observer',
@@ -130,14 +128,12 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * Write the pointer.
+       * Write the pointer: ONE fire-and-forget line per click.
        *
-       * WHY A COMMAND AND NOT A TOOL: the Client service catalog of this host exposes only
+       * It has to be a command. This host's Client service catalog exposes only
        * layout / locale / sessions / slots / theme / timer / uiWorkspace / workspaces — there is
-       * NO `tools` service on the client half, so `tools.execute` is not reachable from here.
-       * The command channel IS reachable (the transcript rows prove `/observer-*` lines run), and
-       * a pointer write is FIRE-AND-FORGET: we never read the reply, which is the layer that kept
-       * losing the session id.
+       * no tool-execution service on the client half — and the reply is deliberately NOT read,
+       * because the gateway's wrapping is what lost the session id in the first place.
        */
       const bind = async (mainSessionId, observerSessionId) => {
         const remote = get('remote')

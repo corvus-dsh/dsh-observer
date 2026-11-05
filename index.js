@@ -27,7 +27,7 @@ export const name = 'dsh-observer'
  * Client half is cached separately, and "did my build reach the app?" must be answerable
  * without guessing.
  */
-export const VERSION = '1.0.2'
+export const VERSION = '1.0.3'
 console.log(`[dsh-observer] host version ${VERSION}`)
 
 /**
@@ -320,28 +320,70 @@ export function apply(ctx                   , config                          = 
    * (the same reason dsh-graft-slice injects through `messages`), and `messages` only shapes the
    * upcoming request — it does not fabricate a turn the user never started.
    */
+  /**
+   * RESOLVE THE STEP'S AGENT.
+   *
+   * `payload.agent.id` is the SessionId (the Event contract says `Agent = { id: SessionId }`).
+   * The `agents.currentInitiator()` fallback is the same one dsh-graft-slice carries, because a
+   * payload without an agent must not silently skip the injection.
+   */
+  const agentIdOf = (payload     )         => {
+    const direct = payload?.agent?.id
+    if (typeof direct === 'string' && direct.length > 0) return direct
+    try {
+      const agents = ctx.get?.('agents')
+      const current = isRecord(agents) && typeof agents.currentInitiator === 'function' ? agents.currentInitiator() : undefined
+      const fallback = isRecord(current) ? current.id : undefined
+      return typeof fallback === 'string' ? fallback : ''
+    } catch {
+      return ''
+    }
+  }
+
   const PRE_STEP_EVENT = 'agent/pre-step'
   ctx.on?.(PRE_STEP_EVENT, async (payload     , next     ) => {
     const decision = await next()
     try {
-      const agentId = payload?.agent?.id
-      if (typeof agentId !== 'string' || agentId.length === 0) return decision
+      /**
+       * THE REAL CONTRACT, and the reason the first attempt proved nothing:
+       *
+       *   PreStepDecision = { kind: 'reject' } | { kind: 'enter'; messages: UserMessage[] }
+       *
+       * The earlier version spread `decision` and appended to `decision.messages`, which happens
+       * to work when `kind: 'enter'` is already present — but its UNIT TEST mocked `{ messages: [] }`,
+       * a shape the host never produces. The guard and the injection are now written against the
+       * documented shape, so a decision without `kind: 'enter'` is passed through untouched rather
+       * than decorated into something the loop may drop.
+       */
+      if (!isRecord(decision)) return decision
+      if (decision.kind === 'reject') return decision
+      if (decision.kind !== 'enter') {
+        ctx.logger?.warn?.(`[dsh-observer] unexpected pre-step decision kind: ${JSON.stringify(decision.kind)}`)
+        return decision
+      }
+
+      const agentId = agentIdOf(payload)
+      if (agentId.length === 0) return decision
       const mission = state.missions[agentId]
       if (mission === undefined || state.missionsSent[agentId] === true) return decision
-      if (!isRecord(decision) || decision.kind === 'reject') return decision
+
+      // Mark first, inject second: a double release is worse than a lost one, and the write is
+      // what makes "exactly once" durable across a restart.
       state.missionsSent[agentId] = true
       save()
       ctx.logger?.info?.(`[dsh-observer] releasing the mission for ${agentId}`)
+
       const base = Array.isArray(decision.messages) ? decision.messages : []
       return {
-        ...decision,
+        kind: 'enter'         ,
+        ...(decision.startsRequestSeries === true ? { startsRequestSeries: true          } : {}),
         messages: [
           ...base,
           {
             id: `observer-mission-${agentId}`       ,
             // Pre-step messages are projected as user/message; the explicit header is what a
             // pre-step listener can legitimately deliver (matching dsh-graft-slice).
-            role: 'user',
+            role: 'user'         ,
             content: [{ type: 'text', text: mission }],
           },
         ],
@@ -488,84 +530,18 @@ export function apply(ctx                   , config                          = 
         }
       },
     })
-    commands.register({
-      name: 'observer-state',
-      description: '读取副脑绑定状态与一次性焦点请求。Read the observer bindings.',
-      handler: async () => ({
-        kind: 'success'         ,
-        text: JSON.stringify({
-          bindings: { ...state.bindings },
-          reverse: { ...state.reverse },
-          focus: state.focus === null ? null : { ...state.focus },
-        }),
-      }),
-    })
-    commands.register({
-      name: 'observer-create',
-      description: '为主会话召唤副脑：/observer-create [mainSessionId]',
-      /**
-       * v0.1.8: no `input` hint. That key is not part of the observed command registration
-       * shape, and while it was present this single command never registered — the gateway
-       * answered the unknown line with a bare `{ok:true}`, which the UI reported as a
-       * successful summon with no follower. Fewer keys, verifiable behaviour.
-       */
-      handler: async (invocation     ) => {
-        try {
-          const explicit = commandArg(invocation)
-          const mainSessionId = explicit.length > 0 ? explicit : commandAgent(invocation)
-          // One line per invocation, not a JSON dump: the log must not become the transcript
-          // problem this plugin was just accused of.
-          ctx.logger?.info?.(`[dsh-observer] create -> ${mainSessionId || '(none)'}`)
-          const result = await createObserver(mainSessionId, 'bind')
-          return {
-            kind: result.ok ? ('success'         ) : ('error'         ),
-            // JSON, so the client can read `observerSessionId` without a second round trip.
-            text: JSON.stringify({
-              ok: result.ok,
-              observerSessionId: result.observerSessionId,
-              mainSessionId,
-              text: result.text,
-            }),
-          }
-        } catch (error) {
-          /**
-           * v0.1.14 P0: an uncaught throw inside a command handler surfaces to the UI as
-           * `{"ok":false,"error":{"code":"gateway/internal"}}` — a blob the chip used to render
-           * verbatim. Every failure now leaves as a sentence, and the detail goes to the log.
-           */
-          const detail = String((error       )?.message ?? error)
-          ctx.logger?.warn?.(`[dsh-observer] observer-create threw: ${detail}`)
-          return { kind: 'error'         , text: JSON.stringify({ ok: false, observerSessionId: '', text: `召唤失败：${detail}` }) }
-        }
-      },
-    })
-    commands.register({
-      name: 'observer-consult',
-      description: '开启前置需求磋商副脑（不绑定主会话）：/observer-consult',
-      handler: async () => {
-        // Same rule as observer-create: a throw here would reach the UI as
-        // `{"ok":false,"error":{"code":"gateway/internal"}}` instead of a sentence.
-        try {
-          const result = await createObserver('', 'consult')
-          return {
-            kind: result.ok ? ('success'         ) : ('error'         ),
-            text: JSON.stringify({ ok: result.ok, observerSessionId: result.observerSessionId, text: result.text }),
-          }
-        } catch (error) {
-          const detail = String((error       )?.message ?? error)
-          ctx.logger?.warn?.(`[dsh-observer] observer-consult threw: ${detail}`)
-          return { kind: 'error'         , text: JSON.stringify({ ok: false, observerSessionId: '', text: `磋商失败：${detail}` }) }
-        }
-      },
-    })
-    commands.register({
-      name: 'observer-focus-ack',
-      description: '控制台已消费一次焦点牵引请求。Acknowledge the one-shot focus request.',
-      handler: async () => {
-        takeFocus()
-        return { kind: 'success'         , text: 'focus-acked' }
-      },
-    })
+    /**
+     * v1.0.3 — THE OTHER FOUR COMMANDS ARE GONE, AND THAT IS THE POINT.
+     *
+     * `observer-state`, `observer-create`, `observer-consult` and `observer-focus-ack` existed
+     * only for the client polling that has been removed. Every command invocation prints a
+     * `observer-state: {…}` row into the conversation, so as long as these were registered a
+     * stale client could keep flooding the transcript. They are physically deleted; the
+     * equivalent capability stays available to the MODEL as tools (`observer_status`,
+     * `observer_create`, `observer_consult`), which is where it belongs.
+     *
+     * `observer-bind` remains because the Client's click path fires it.
+     */
   }
 
   ctx.tools?.register({

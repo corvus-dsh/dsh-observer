@@ -87,11 +87,11 @@ test('observer: the first real step releases the mission exactly once', async ()
   const preStep = listeners.get('agent/pre-step')
   assert.ok(preStep !== undefined, 'the pre-step listener is registered at mount')
 
-  const first = await preStep({ agent: { id: 'obs-1' } }, async () => ({ messages: [] }))
+  const first = await preStep({ agent: { id: 'obs-1' } }, async () => ({ kind: 'enter', messages: [] }))
   assert.equal(first.messages.length, 1, 'the companion receives its role on the first step')
   assert.match(first.messages[0].content[0].text, /副脑启动/u)
 
-  const second = await preStep({ agent: { id: 'obs-1' } }, async () => ({ messages: [] }))
+  const second = await preStep({ agent: { id: 'obs-1' } }, async () => ({ kind: 'enter', messages: [] }))
   assert.equal(second.messages.length, 0, 'and never again')
   assert.equal(prompts.length, 0, 'this channel never pushes a turn of its own')
 })
@@ -99,7 +99,7 @@ test('observer: the first real step releases the mission exactly once', async ()
 test('observer: an unrelated session receives nothing', async () => {
   const { listeners } = boot()
   const preStep = listeners.get('agent/pre-step')
-  const decision = await preStep({ agent: { id: 'someone-else' } }, async () => ({ messages: [] }))
+  const decision = await preStep({ agent: { id: 'someone-else' } }, async () => ({ kind: 'enter', messages: [] }))
   assert.deepEqual(decision.messages, [])
 })
 
@@ -179,7 +179,7 @@ test('observer_bind: writes the pointer, verifies it on disk, and STAGES the mis
   assert.equal(prompts.length, 0, 'nothing is pushed: the companion must open blank')
 
   const preStep = listeners.get('agent/pre-step')
-  const decision = await preStep({ agent: { id: 'obs-9' } }, async () => ({ messages: [] }))
+  const decision = await preStep({ agent: { id: 'obs-9' } }, async () => ({ kind: 'enter', messages: [] }))
   assert.equal(decision.messages.length, 1, 'the role arrives on the first real step')
   assert.match(decision.messages[0].content[0].text, /副脑启动/u)
 })
@@ -198,36 +198,28 @@ test('observer_bind: refuses missing ids and a companion that would bind another
   assert.equal(chained.ok, false)
   assert.match(chained.text, /副脑会话/u)
 })
-test('observer: the five UI commands are registered, and create stages instead of pushing', async () => {
-  const { commands, prompts, tools, listeners } = boot()
-  for (const name of ['observer-bind', 'observer-state', 'observer-create', 'observer-consult', 'observer-focus-ack']) {
-    assert.ok(commands.has(name), `${name} is registered`)
+/**
+ * v1.0.3 — ONLY THE CLICK PATH'S COMMAND SURVIVES.
+ *
+ * `observer-state` / `observer-create` / `observer-consult` / `observer-focus-ack` were the
+ * client-polling channel and are physically deleted: every command invocation prints a row into
+ * the conversation, so as long as they existed a stale client could keep flooding the transcript.
+ * The capability stays available to the MODEL as tools.
+ */
+test('observer: exactly one command remains, and the tools keep the capability', async () => {
+  const { commands, tools, listeners } = boot()
+  assert.deepEqual([...commands.keys()], ['observer-bind'], 'only the click path command is registered')
+  for (const name of ['observer_bind', 'observer_create', 'observer_consult', 'observer_status']) {
+    assert.ok(tools.has(name), `${name} stays available as a tool`)
   }
-
-  const created = await commands.get('observer-create').handler({ rawInput: 'main-cmd', agent: { id: 'main-cmd' } })
-  assert.equal(created.kind, 'success')
-  assert.match(created.text, /已召唤副脑 obs-1/u)
-  assert.equal(prompts.length, 0, 'the command does not push a turn into the new companion')
-
-  const state = JSON.parse((await commands.get('observer-state').handler({})).text)
-  assert.deepEqual(state.bindings, { 'main-cmd': 'obs-1' })
-
-  // A transfer moves the pointer; the command surface reports the new target.
-  const follow = debugFollowTransfer('main-cmd', 'main-cmd-2')
-  assert.equal(follow.followed, true)
-  const after = JSON.parse((await commands.get('observer-state').handler({})).text)
-  assert.deepEqual(after.bindings, { 'main-cmd-2': 'obs-1' })
-  assert.equal(after.focus.sessionId, 'main-cmd-2')
-
-  const acked = await commands.get('observer-focus-ack').handler({})
-  assert.equal(acked.kind, 'success')
-  const cleared = JSON.parse((await commands.get('observer-state').handler({})).text)
-  assert.equal(cleared.focus, null)
 
   // The client-side plan: the Client creates the session, the Host only records the pointer.
   const bound = await commands.get('observer-bind').handler({ rawInput: 'main-bind obs-bind' })
   assert.equal(bound.kind, 'success')
-  assert.ok(tools.get('observer_bind') !== undefined, 'the same logic is reachable as a tool')
-  const mission = await listeners.get('agent/pre-step')({ agent: { id: 'obs-bind' } }, async () => ({ messages: [] }))
-  assert.equal(mission.messages.length, 1, 'the bound companion gets its role on its first step')
+  const decision = await listeners.get('agent/pre-step')({ agent: { id: 'obs-bind' } }, async () => ({
+    kind: 'enter',
+    messages: [],
+  }))
+  assert.equal(decision.messages.length, 1, 'the bound companion gets its role on its first step')
+  assert.equal(decision.kind, 'enter', 'the decision keeps the contract the loop expects')
 })
