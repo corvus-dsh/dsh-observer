@@ -27,7 +27,7 @@ export const name = 'dsh-observer'
  * Client half is cached separately, and "did my build reach the app?" must be answerable
  * without guessing.
  */
-export const VERSION = '1.1.0'
+export const VERSION = '1.2.0'
 console.log(`[dsh-observer] host version ${VERSION}`)
 
 /**
@@ -49,6 +49,30 @@ export const inject = ['tools', 'sessionController']
                                             
      
                                                  
+     
+                                                    
+    
+                                                                                               
+                                                                                                  
+                                                                                                   
+                                                                     
+    
+                                                                                                
+                                          
+     
+                                     
+                                                                      
+                                
+ 
+
+                        
+                                                        
+                           
+                                        
+                       
+            
+                                                                                   
+                                  
  
 
                              
@@ -58,10 +82,10 @@ export const inject = ['tools', 'sessionController']
                                                     
  
 
-const EMPTY                   = { bindings: {}, reverse: {}, focus: null }
+const EMPTY                   = { bindings: {}, reverse: {}, focus: null, pairs: {}, pairOf: {} }
 
 let bindingsPath = ''
-let state                   = { bindings: {}, reverse: {}, focus: null }
+let state                   = { bindings: {}, reverse: {}, focus: null, pairs: {}, pairOf: {} }
 
 function isRecord(value         )                               {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -74,7 +98,7 @@ function writeAtomic(path        , value         )       {
   renameSync(temp, path)
 }
 
-const EMPTY_STATE = ()                   => ({ bindings: {}, reverse: {}, focus: null })
+const EMPTY_STATE = ()                   => ({ bindings: {}, reverse: {}, focus: null, pairs: {}, pairOf: {} })
 
 function load()       {
   // Start from empty on EVERY load: the module-level state must describe THIS file, and a
@@ -97,6 +121,30 @@ function load()       {
     }
     if (isRecord(parsed.focus) && typeof parsed.focus.sessionId === 'string') {
       next.focus = { sessionId: parsed.focus.sessionId, at: Number(parsed.focus.at) || 0 }
+    }
+    // v1.2.0 — the pair table. A row is only accepted when both members are non-empty strings and
+    // they differ: a self-pair would make every role question answer "both".
+    if (isRecord(parsed.pairs)) {
+      for (const [key, value] of Object.entries(parsed.pairs)) {
+        if (!isRecord(value)) continue
+        const observerSessionId = typeof value.observerSessionId === 'string' ? value.observerSessionId : ''
+        const mainSessionId = typeof value.mainSessionId === 'string' ? value.mainSessionId : ''
+        if (observerSessionId.length === 0 || mainSessionId.length === 0) continue
+        if (observerSessionId === mainSessionId) continue
+        next.pairs[key] = {
+          observerSessionId,
+          mainSessionId,
+          at: Number(value.at) || 0,
+          origin: value.origin === 'summoned' ? 'summoned' : 'incubated',
+        }
+      }
+    }
+    if (isRecord(parsed.pairOf)) {
+      for (const [sessionId, key] of Object.entries(parsed.pairOf)) {
+        if (typeof key !== 'string' || key.length === 0) continue
+        if (next.pairs[key] === undefined) continue // no dangling index
+        next.pairOf[sessionId] = key
+      }
     }
     // `missions` / `missionsSent` from 1.0.2–1.0.3 are deliberately NOT read: the staged-injection
     // design is gone, and a legacy key must not resurrect it.
@@ -133,21 +181,87 @@ function mainOfObserver(observerSessionId        )         {
   return typeof main === 'string' ? main : ''
 }
 
+/* ── v1.2.0: the pair table ─────────────────────────────────────────────────── */
+
+/** Stable key for a pair. Order-independent, so a role swap cannot orphan the row. */
+function pairKeyOf(a        , b        )         {
+  return [a, b].sort().join('|')
+}
+
+function pairOf(sessionId        )                           {
+  const key = state.pairOf[sessionId]
+  if (key === undefined) return undefined
+  return state.pairs[key]
+}
+
+/** Record (or re-record) a pair, keeping the legacy one-way maps in step for old readers. */
+function recordPair(
+  observerSessionId        ,
+  mainSessionId        ,
+  origin                        ,
+)                                  {
+  if (observerSessionId.length === 0 || mainSessionId.length === 0 || observerSessionId === mainSessionId) {
+    return { ok: false, error: 'pair members must be two distinct non-empty session ids' }
+  }
+  const key = pairKeyOf(observerSessionId, mainSessionId)
+  state.pairs[key] = { observerSessionId, mainSessionId, at: Date.now(), origin }
+  state.pairOf[observerSessionId] = key
+  state.pairOf[mainSessionId] = key
+  // Legacy maps, kept so `observer_status` and older readers see the same world.
+  state.bindings[mainSessionId] = observerSessionId
+  state.reverse[observerSessionId] = mainSessionId
+  const written = save()
+  return written.ok ? { ok: true } : { ok: false, error: written.error }
+}
+
+/** True when the session is the OBSERVER half of a pair. */
+function isObserverHalf(sessionId        )          {
+  const pair = pairOf(sessionId)
+  return pair !== undefined && pair.observerSessionId === sessionId
+}
+
 /**
  * Follow a transfer: rewrite the pointer inside this plugin, and leave a focus note.
  *
  * This is the WHOLE cross-plugin coupling: a listener on an event name. It never calls into
  * graft, never blocks it, and a profile without graft simply never receives the event.
+ *
+ * v1.2.0 — BOTH HALVES FOLLOW, AND NOBODY WAITS.
+ *
+ * The first version only handled "the MAIN was transferred". With pairs, either half can be
+ * grafted (the companion is a session like any other, so it can hit the watermark on its own).
+ * The move is a POINTER REWRITE in either direction — there is no lock, no retirement of the
+ * other half, and no wait for it. That is what keeps the mutual-graft deadlock impossible: a
+ * deadlock needs two parties that each wait, and here neither party waits for anything.
  */
-function followTransfer(sourceSessionId        , newSessionId        )                                                   {
-  const observer = observerOf(sourceSessionId)
-  if (observer.length === 0) return { followed: false, observerSessionId: '' }
-  delete state.bindings[sourceSessionId]
-  state.bindings[newSessionId] = observer
-  state.reverse[observer] = newSessionId
-  state.focus = { sessionId: newSessionId, at: Date.now() }
+function followTransfer(
+  sourceSessionId        ,
+  newSessionId        ,
+)                                                                                {
+  const pair = pairOf(sourceSessionId)
+  if (pair === undefined) return { followed: false, role: '', otherSessionId: '' }
+
+  const wasObserver = pair.observerSessionId === sourceSessionId
+  const role                      = wasObserver ? 'observer' : 'main'
+  const otherSessionId = wasObserver ? pair.mainSessionId : pair.observerSessionId
+  const key = state.pairOf[sourceSessionId]
+  if (key !== undefined) delete state.pairs[key]
+  delete state.pairOf[sourceSessionId]
+  // The legacy maps must not keep pointing at the retired id.
+  if (wasObserver) delete state.reverse[sourceSessionId]
+  else delete state.bindings[sourceSessionId]
+
+  const written =
+    role === 'observer'
+      ? recordPair(newSessionId, otherSessionId, pair.origin)
+      : recordPair(otherSessionId, newSessionId, pair.origin)
+  if (!written.ok) return { followed: false, role: '', otherSessionId: '' }
+
+  // A focus note only makes sense for the MAIN half: that is the session the user should see.
+  const visible = role === 'main' ? newSessionId : otherSessionId
+  state.focus = { sessionId: visible, at: Date.now() }
   save()
-  return { followed: true, observerSessionId: observer }
+  return { followed: true, role, otherSessionId }
 }
 
 function takeFocus()                                           {
@@ -259,7 +373,12 @@ export function apply(ctx                   , config                          = 
       if (source.length === 0 || target.length === 0) return
       const result = followTransfer(source, target)
       if (result.followed) {
-        ctx.logger?.info?.(`[dsh-observer] ${result.observerSessionId} now follows ${target}`)
+        // Both halves can be grafted; the log says WHICH one moved, so a pair that follows twice
+        // is legible instead of looking like a duplicate event.
+        ctx.logger?.info?.(
+          `[dsh-observer] ${result.role} half moved ${source} -> ${target}; ` +
+            `the other half is ${result.otherSessionId}`,
+        )
       }
     } catch (error) {
       // A listener must never break the transfer that triggered it.
@@ -631,7 +750,7 @@ export function apply(ctx                   , config                          = 
 
     state.bindings[mainSessionId] = observerSessionId
     state.reverse[observerSessionId] = mainSessionId
-    const written = save()
+    const written = recordPair(observerSessionId, mainSessionId, 'summoned')
     if (!written.ok) {
       delete state.bindings[mainSessionId]
       delete state.reverse[observerSessionId]
@@ -645,6 +764,104 @@ export function apply(ctx                   , config                          = 
       text:
         `已创建副脑 ${observerSessionId}（cwd=${located.cwd}）` +
         (marked.detail.length > 0 ? `（部分步骤未完成：${marked.detail}）` : ''),
+    }
+  }
+
+  /**
+   * v1.2.0 — INCUBATE A MAIN SESSION FROM A CONSULTING ONE.
+   *
+   * THE ARCHITECTURE THIS IMPLEMENTS
+   *
+   *   A blank session starts with NO ROLE. The user talks to it; it clarifies requirements. When the
+   *   work turns out to be big enough that one context window will not hold it, that session calls
+   *   this tool and becomes the OBSERVER: the plan it just negotiated is handed to a NEWLY CREATED
+   *   session, which becomes the MAIN. Small tasks never come here — the consulting session simply
+   *   does the work itself.
+   *
+   * WHY THE PLAN TRAVELS AS A `developer/message`
+   *
+   * The plan is context the user already agreed to, not a prompt they typed. A prompt would admit a
+   * turn, so the new main would start working before the user even looked at it; a developer message
+   * lands as standing context and leaves the session asleep until the user speaks. This is the same
+   * mechanism the companion setting uses, for the same reason.
+   *
+   * PLACEMENT COMES FROM THE CALLING SESSION, never from a guess: `resolveMainCwd` reads the
+   * consulting session's own header, so the incubated main lands in the same workspace.
+   */
+  const spawnMainFromObserver = async (
+    observerSessionId        ,
+    plan        ,
+  )                                                            => {
+    if (observerSessionId.length === 0) {
+      return { ok: false, sessionId: '', text: '没有可用的发起会话 id' }
+    }
+    if (plan.trim().length === 0) {
+      return { ok: false, sessionId: '', text: '方案为空：请先把确认过的执行计划作为 plan 传入' }
+    }
+    // One pair per session: a session that already carries a MAIN role must not hatch another one.
+    const existing = pairOf(observerSessionId)
+    if (existing !== undefined && existing.observerSessionId !== observerSessionId) {
+      return { ok: false, sessionId: '', text: '这个会话已经是主脑：不能再孵化主脑' }
+    }
+
+    const located = resolveMainCwd(observerSessionId)
+    ctx.logger?.info?.(
+      `[dsh-observer] spawn_main from ${observerSessionId}: cwd=${JSON.stringify(located.cwd)} (${located.source})`,
+    )
+    if (located.cwd.length === 0) {
+      return { ok: false, sessionId: '', text: `拿不到发起会话的工作目录（${located.source}），拒绝创建没有归属的主脑` }
+    }
+
+    const controller = ctx.get?.('sessionController')
+    if (!isRecord(controller) || typeof controller.create !== 'function') {
+      return { ok: false, sessionId: '', text: 'sessionController.create 不可用' }
+    }
+
+    let mainSessionId = ''
+    try {
+      const created = await controller.create({ cwd: located.cwd })
+      mainSessionId = typeof created?.sessionId === 'string' ? created.sessionId : ''
+    } catch (error) {
+      return { ok: false, sessionId: '', text: `创建主脑会话失败：${String((error       )?.message ?? error)}` }
+    }
+    if (mainSessionId.length === 0) {
+      return { ok: false, sessionId: '', text: 'sessionController.create 返回了空 id' }
+    }
+
+    const problems           = []
+    const written = recordPair(observerSessionId, mainSessionId, 'incubated')
+    if (!written.ok) {
+      return { ok: false, sessionId: mainSessionId, text: `绑定表写入失败：${written.error}` }
+    }
+
+    // The plan becomes standing context for the new main.
+    const injected = await injectSetting(mainSessionId, plan)
+    if (!injected.ok) problems.push(`方案注入失败（${injected.detail}）`)
+
+    // Title both halves so the sidebar says which is which, and so the client's `[副脑]` marker
+    // still hides any summon affordance inside the observer.
+    const renames = [
+      { sessionId: mainSessionId, title: `[主脑] 由副脑孵化 · ${observerSessionId.slice(0, 8)}` },
+      { sessionId: observerSessionId, title: `[副脑] 孵化 ← ${mainSessionId.slice(0, 12)}` },
+    ]
+    for (const rename of renames) {
+      if (typeof controller.rename !== 'function') {
+        problems.push('sessionController.rename 不可用')
+        break
+      }
+      try {
+        await controller.rename(rename)
+      } catch (error) {
+        problems.push(`重命名 ${rename.sessionId} 失败：${String((error       )?.message ?? error)}`)
+      }
+    }
+
+    return {
+      ok: true,
+      sessionId: mainSessionId,
+      text:
+        `已孵化主脑 ${mainSessionId}（cwd=${located.cwd}），本会话成为副脑 ${observerSessionId}。` +
+        (problems.length > 0 ? `部分步骤未完成：${problems.join('；')}` : ''),
     }
   }
 
@@ -762,6 +979,67 @@ export function apply(ctx                   , config                          = 
     execute: async () => createObserver('', 'consult'),
   })
 
+  /**
+   * v1.2.0 — THE INCUBATION ENTRY POINT.
+   *
+   * A consulting session calls this once the user has AGREED to a plan and the work is too large for
+   * one context window. The session becomes the OBSERVER; a new session is created in the same
+   * workspace, receives the plan as a `developer/message` (context, so it stays asleep until the
+   * user speaks), and becomes the MAIN. The new id is answered directly to the model.
+   */
+  ctx.tools?.register({
+    name: 'observer_spawn_main',
+    description:
+      'Incubate a MAIN session from this consulting session. Call it only after the user has CONFIRMED a plan ' +
+      'AND the work is too large for a single context window. The Host creates the main session in this ' +
+      'session\'s own workspace, injects `plan` as standing context (developer/message — it does not start a ' +
+      'turn), titles both halves, records the pair, and returns the new main session id so the caller can ' +
+      'open it. This session becomes the observer (副脑) of that new main.',
+    parameters: {
+      type: 'object',
+      properties: {
+        plan: {
+          type: 'string',
+          description:
+            'The agreed execution plan, verbatim: goal, constraints, steps, verification. Becomes the main ' +
+            'session\'s standing context, so write it for the executor rather than as a chat reply.',
+        },
+        observerSessionId: {
+          type: 'string',
+          description: 'The consulting session that is hatching the main. Default: the calling session.',
+        },
+      },
+      required: ['plan'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          sessionId: { type: 'string' },
+          mainSessionId: { type: 'string' },
+          text: { type: 'string' },
+        },
+        required: ['ok'],
+        additionalProperties: true,
+      },
+      render: (_args         , value     ) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    execute: async (args                                                 , exec     ) => {
+      const plan = typeof args?.plan === 'string' ? args.plan : ''
+      const explicit = typeof args?.observerSessionId === 'string' ? args.observerSessionId.trim() : ''
+      const observerSessionId = explicit.length > 0 ? explicit : typeof exec?.agent?.id === 'string' ? exec.agent.id : ''
+      const spawned = await spawnMainFromObserver(observerSessionId, plan)
+      return {
+        ok: spawned.ok,
+        sessionId: spawned.sessionId,
+        mainSessionId: spawned.sessionId,
+        text: spawned.text,
+      }
+    },
+  })
+
   ctx.tools?.register({
     name: 'observer_status',
     description:
@@ -810,9 +1088,21 @@ export function debugObserverState()                   {
   return JSON.parse(JSON.stringify(state))
 }
 
-/** Test seam: follow a transfer without an event bus. */
-export function debugFollowTransfer(sourceSessionId        , newSessionId        )                                                   {
-  return followTransfer(sourceSessionId, newSessionId)
+/**
+ * Test seam: follow a transfer without an event bus.
+ *
+ * `observerSessionId` is kept in the answer for older tests that only asked about the companion
+ * half; `role` and `otherSessionId` describe what actually moved in v1.2.0.
+ */
+export function debugFollowTransfer(
+  sourceSessionId        ,
+  newSessionId        ,
+)                                                                                                           {
+  const result = followTransfer(sourceSessionId, newSessionId)
+  return {
+    ...result,
+    observerSessionId: result.role === 'observer' ? newSessionId : result.role === 'main' ? result.otherSessionId : '',
+  }
 }
 
 export { EMPTY }
