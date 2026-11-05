@@ -23,11 +23,21 @@ function boot(bindingsPath) {
   const commands = new Map()
   const listeners = new Map()
   const prompts = []
+  const appends = []
   const renames = []
   let created = 0
   const ctx = {
     get(name) {
       if (name === 'commands') return { register: (definition) => commands.set(definition.name, definition) }
+      if (name === 'sessions') {
+        return {
+          get: (id) => ({
+            append: (type, data) => {
+              appends.push({ id, type, data })
+            },
+          }),
+        }
+      }
       if (name === 'sessionController') {
         return {
           async create() {
@@ -54,7 +64,7 @@ function boot(bindingsPath) {
   }
   const path = bindingsPath ?? join(mkdtempSync(join(tmpdir(), 'dsh-observer-')), 'observer-bindings.json')
   apply(ctx, { bindingsPath: path })
-  return { tools, commands, listeners, prompts, renames, path }
+  return { tools, commands, listeners, prompts, appends, renames, path }
 }
 
 test('observer_create: answers with the observer session id and binds it', async () => {
@@ -92,35 +102,37 @@ test('observer_create: an unwritable bindings path is reported, never claimed as
   assert.match(reply.text, /绑定表写入失败/u)
 })
 
-test('observer_consult: a companion with NO pointer, titled and told its role', async () => {
-  const { tools, prompts, renames } = boot()
+test('observer_consult: a companion with NO pointer, titled and given its setting physically', async () => {
+  const { tools, prompts, appends, renames } = boot()
   const reply = await tools.get('observer_consult').execute({})
   assert.equal(reply.ok, true)
   assert.equal(reply.observerSessionId, 'obs-1')
   assert.deepEqual(debugObserverState().bindings, {}, 'a consultation companion is not bound to anything')
   assert.match(renames[0].title, /\[副脑\]/u)
-  assert.match(prompts[0].content[0].text, /前置需求分析副脑/u)
-  assert.match(prompts[0].content[0].text, /最终 Prompt/u)
+  assert.equal(prompts.length, 0, 'no prompt: nothing starts the agent loop')
+  assert.equal(appends[0].type, 'developer/message')
+  const text = appends[0].data.message.content[0].text
+  assert.match(text, /前置需求分析副脑/u)
+  assert.match(text, /最终 Prompt/u)
 })
 
 /**
- * v1.0.4 — THE SETUP MUST NOT LIE ABOUT A PARTIAL RESULT.
+ * v1.0.5 — THE SETUP MUST NOT LIE ABOUT A PARTIAL RESULT.
  *
- * If the rename or the role message fails, the reply says so instead of reporting a clean summon:
- * a companion that can never be recognised by its title would keep showing the summon button.
+ * If the rename fails, or the setting cannot be written by EITHER channel, the reply says so
+ * instead of reporting a clean summon: a companion that can never be recognised by its title would
+ * keep showing the summon button, and one with no background would silently misbehave.
  */
-test('observer_create: a failed rename or role message is reported in the reply', async () => {
+test('observer_create: a failed rename and an unwritable log are both reported', async () => {
   const tools = new Map()
   const ctx = {
     get(name) {
       if (name === 'commands') return { register: () => {} }
+      // No `sessions` service and no `sessionPersistence`: both write channels are unavailable.
       if (name === 'sessionController') {
         return {
           async create() {
             return { sessionId: 'obs-broken' }
-          },
-          async prompt() {
-            throw new Error('prompt refused')
           },
           async rename() {
             throw new Error('rename refused')
@@ -139,7 +151,7 @@ test('observer_create: a failed rename or role message is reported in the reply'
   assert.equal(reply.ok, true, 'the pointer IS durable, so the summon itself succeeded')
   assert.match(reply.text, /部分步骤未完成/u, 'but the partial failure is stated, not hidden')
   assert.match(reply.text, /rename refused/u)
-  assert.match(reply.text, /prompt refused/u)
+  assert.match(reply.text, /设定写入失败/u)
 })
 
 /**

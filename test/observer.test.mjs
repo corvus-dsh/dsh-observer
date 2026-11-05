@@ -20,12 +20,22 @@ function boot() {
   const listeners = new Map()
   const commands = new Map()
   const prompts = []
+  const appends = []
   const renames = []
   let created = 0
   const ctx = {
     get(name) {
       if (name === 'commands') {
         return { register: (definition) => commands.set(definition.name, definition) }
+      }
+      if (name === 'sessions') {
+        return {
+          get: (id) => ({
+            append: (type, data) => {
+              appends.push({ id, type, data })
+            },
+          }),
+        }
       }
       if (name === 'sessionController') {
         return {
@@ -53,7 +63,7 @@ function boot() {
   }
   const bindingsPath = join(root, 'observer-bindings.json')
   apply(ctx, { bindingsPath })
-  return { ctx, tools, listeners, commands, prompts, renames, bindingsPath }
+  return { ctx, tools, listeners, commands, prompts, appends, renames, bindingsPath }
 }
 
 test('observer: mounting writes nothing until a follower is created', () => {
@@ -78,15 +88,15 @@ test('observer: summoning without a session is refused, never guessed', async ()
 })
 
 /**
- * v1.0.4 — THE ROLE IS AN ORDINARY MESSAGE, AND THE SESSION IS TITLED.
+ * v1.0.5 — THE SETTING IS WRITTEN INTO THE LOG, NOT PROMPTED INTO THE AGENT.
  *
- * Injecting through `agent/pre-step` put this plugin inside the agent loop's request construction
- * and produced an opaque upstream failure. The role now travels with `sessionController.prompt`
- * (the channel any message uses) and the companion's TITLE carries `[副脑]`, which is the marker
- * the Client reads from its own local snapshot to hide the summon chip.
+ * v1.0.4 delivered the role with `sessionController.prompt`, which ADMITS A TURN: the companion
+ * opened already running and burned quota doing it. `developer/message` is CONTEXT — it never
+ * starts the agent loop — so the companion opens as a quiet blank page carrying its background.
+ * The tests therefore assert on the physical append and on `prompts` staying EMPTY.
  */
-test('observer: a follower gets its pointer, a titled session, and an ordinary role message', async () => {
-  const { tools, prompts, renames, bindingsPath } = boot()
+test('observer: a follower gets its pointer, a title, and a PHYSICALLY written setting', async () => {
+  const { tools, prompts, appends, renames, bindingsPath } = boot()
   const created = await tools.get('observer_create').execute({}, { agent: { id: 'main-1' } })
   assert.equal(created.ok, true)
   assert.deepEqual(debugObserverState().bindings, { 'main-1': 'obs-1' })
@@ -96,16 +106,19 @@ test('observer: a follower gets its pointer, a titled session, and an ordinary r
   assert.equal(renames[0].sessionId, 'obs-1')
   assert.match(renames[0].title, /\[副脑\]/u, 'the title carries the marker the Client reads')
 
-  assert.equal(prompts.length, 1, 'the role is delivered as one ordinary message')
-  const text = prompts[0].content[0].text
-  assert.match(text, /\[系统设定\]/u, 'it is framed as an ordinary system setting, not a step rewrite')
-  assert.match(text, /副脑/u)
+  assert.equal(prompts.length, 0, 'NO prompt: the agent loop must not be started by a summon')
+  assert.equal(appends.length, 1, 'the setting is written into the log instead')
+  assert.equal(appends[0].id, 'obs-1')
+  assert.equal(appends[0].type, 'developer/message', 'a developer message is context, not a turn')
+  assert.equal(appends[0].data.message.role, 'developer')
+  const text = appends[0].data.message.content[0].text
+  assert.match(text, /\[系统设定\]/u, 'the setting is framed as standing context')
   assert.match(text, /main-1/u, 'and it names the session being observed')
 
   const again = await tools.get('observer_create').execute({}, { agent: { id: 'main-1' } })
   assert.equal(again.ok, true)
   assert.match(again.text, /未重复创建/u)
-  assert.equal(prompts.length, 1, 'a second summon does not re-send the role')
+  assert.equal(appends.length, 1, 'a second summon does not write the setting twice')
 })
 
 test('observer: a follower cannot be given a follower of its own', async () => {
@@ -158,9 +171,12 @@ test('observer: an unknown transfer changes nothing', () => {
  * client-polling channel and are physically deleted: every command invocation prints a row into
  * the conversation, so while they existed a stale client could keep flooding the transcript. The
  * capability stays available to the MODEL as tools.
+ *
+ * v1.0.5 — AND ITS SUCCESS REPLY IS EMPTY, so the one remaining invocation renders no row either.
+ * Only a failure carries text, because a silent failure is worse than a visible row.
  */
-test('observer: exactly one command remains, and the tools keep the capability', async () => {
-  const { commands, tools, prompts, renames } = boot()
+test('observer: one command remains, its success reply is empty, and the tools keep the capability', async () => {
+  const { commands, tools, prompts, appends, renames } = boot()
   assert.deepEqual([...commands.keys()], ['observer-bind'], 'only the click path command is registered')
   for (const name of ['observer_bind', 'observer_create', 'observer_consult', 'observer_status']) {
     assert.ok(tools.has(name), `${name} stays available as a tool`)
@@ -169,7 +185,14 @@ test('observer: exactly one command remains, and the tools keep the capability',
   // The client-side plan: the Client creates the session, the Host only records the pointer.
   const bound = await commands.get('observer-bind').handler({ rawInput: 'main-bind obs-bind' })
   assert.equal(bound.kind, 'success')
+  assert.equal(bound.text, '', 'an empty reply renders no visible block in the conversation')
   assert.deepEqual(debugObserverState().bindings, { 'main-bind': 'obs-bind' })
   assert.equal(renames[renames.length - 1].sessionId, 'obs-bind', 'the bound session is titled too')
-  assert.equal(prompts[prompts.length - 1].sessionId, 'obs-bind', 'and receives its role message')
+  assert.equal(appends[appends.length - 1].id, 'obs-bind', 'and receives its setting physically')
+  assert.equal(prompts.length, 0, 'still no prompt anywhere in the bind path')
+
+  // A failure must NOT be silent: that is the one case worth a visible row.
+  const refused = await commands.get('observer-bind').handler({ rawInput: 'obs-bind obs-other' })
+  assert.equal(refused.kind, 'error')
+  assert.match(refused.text, /副脑绑定失败/u)
 })

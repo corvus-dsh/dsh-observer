@@ -1,25 +1,25 @@
 /**
- * dsh-observer — the Client half. DELIBERATELY MINIMAL (v1.0.3).
+ * dsh-observer — the Client half. DELIBERATELY MINIMAL (v1.0.5).
  *
  * WHAT THIS FILE DOES, IN ORDER:
  *   1. prints a cache probe (first statement);
  *   2. registers one chip in three seats;
  *   3. on click: read the main session's cwd → `sessions.create` → `uiWorkspace.openSession` →
- *      ONE fire-and-forget bind line.
+ *      ONE bind line whose success reply is EMPTY (so it renders no row).
+ *   4. listens for `graft/session-transferred` and opens the new main session from the event.
  *
  * THE ONLY HOST CALL IN THIS FILE IS THE BIND LINE, AND IT EXISTS FOR ONE CLICK.
- * Every command invocation prints a row into the conversation, so the previous state-reading
- * chip flooded the transcript on every re-render. There is no state read here, no timer, no
- * session enumeration and no waiting loop: the chip keeps no view of the binding table and
- * offers exactly one action.
+ * The chip keeps no view of the binding table: a companion is recognised from its own `[副脑]`
+ * title in the local session snapshot, so there is no state read, no timer, no enumeration and no
+ * waiting loop anywhere in this file.
  *
  * WHY `sessions.create` AND NOT `uiWorkspace.startSession`: `startSession()` returns void — it
  * opens a blank session but hands back no id. `sessions.create(opts)` returns
  * `Promise<SessionId>`, which is exactly what a caller needs in order to open and then bind.
  */
 
-window.__OBSERVER_LOADED__ = '1.0.4'
-console.log('%c[dsh-observer] FUCK CACHE 1.0.4 — minimal client loaded', 'color:#16a34a;font-weight:bold')
+window.__OBSERVER_LOADED__ = '1.0.5'
+console.log('%c[dsh-observer] FUCK CACHE 1.0.5 — minimal client loaded', 'color:#16a34a;font-weight:bold')
 
 window.__ModuleLoader__.load({
   id: 'dsh-observer',

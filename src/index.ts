@@ -26,7 +26,7 @@ export const name = 'dsh-observer'
  * Client half is cached separately, and "did my build reach the app?" must be answerable
  * without guessing.
  */
-export const VERSION = '1.0.4'
+export const VERSION = '1.0.5'
 console.log(`[dsh-observer] host version ${VERSION}`)
 
 /**
@@ -258,14 +258,14 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
           '确认方案后，请输出一段可直接粘贴到主会话的最终 Prompt，并在末尾提示用户「复制到主会话开始执行」。'
 
     /**
-     * v1.0.4 — SEND IT AS AN ORDINARY MESSAGE, AND MARK THE SESSION.
+     * v1.0.5 — WRITE THE SETTING PHYSICALLY, AND TITLE THE SESSION.
      *
-     * The role travels with `sessionController.prompt` (nothing about the request pipeline is
-     * touched), and the companion's TITLE carries `[副脑]` so the Client can hide the summon chip
-     * by reading its own local session snapshot — no RPC, no localStorage.
+     * The role is appended as a `developer/message` (context, never a turn), so the companion
+     * opens as a quiet blank page; the TITLE carries `[副脑]` so the Client can hide the summon
+     * chip by reading its own local session snapshot — no RPC, no page storage.
      */
     const marked = await markCompanion(mainSessionId, observerSessionId, mission)
-    if (!marked.delivered || !marked.renamed) {
+    if (!marked.injected || !marked.renamed) {
       ctx.logger?.warn?.(`[dsh-observer] companion setup incomplete: ${marked.detail}`)
     }
 
@@ -282,30 +282,81 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
   }
 
   /**
-   * SEND THE ROLE AS AN ORDINARY MESSAGE, and mark the companion with a title.
+   * WRITE THE SETTING INTO THE LOG — PHYSICALLY, WITHOUT STARTING A TURN.
    *
-   * v1.0.4 — THE `agent/pre-step` LISTENER IS GONE, DELIBERATELY.
+   * v1.0.5 — WHY `prompt` WAS WRONG.
    *
-   * v1.0.2/1.0.3 staged the mission and released it from a pre-step waterfall listener. That put
-   * this plugin in the middle of the agent loop's request construction, and the result was an
-   * opaque upstream failure (`astudio: 请求被上游拒绝 (HTTP 404) API endpoint not found`) with no
-   * way for the plugin to prove it was innocent. Injecting a system setting is not worth owning
-   * part of the request pipeline, so the mission now travels as one ordinary user message sent
-   * with `sessionController.prompt` — the same channel any other message uses, with nothing about
-   * the step decision altered.
+   * v1.0.4 sent the role with `sessionController.prompt`, which is a USER PROMPT: the companion
+   * opened already running (and burned quota doing it). A companion must open as a quiet blank
+   * page carrying its background, waiting for the human.
    *
-   * The companion is ALSO renamed to carry `[副脑]`. That is the marker the Client reads from its
-   * local session snapshot to hide the summon chip inside a companion, which is what makes the
-   * no-nesting rule work without any RPC.
+   * The mechanism is the one dsh-graft-slice already uses for its live notices: append a
+   * `developer/message` event. A developer message is CONTEXT, not a prompt — it never admits a
+   * turn, and DSH renders it as a system-level note rather than as something the user wrote.
+   *
+   * Two channels, in order:
+   *   1. `sessions.get(id).append(...)` when the session is LIVE (our case: the Client created it
+   *      through `sessions.create`, so it is in the live store);
+   *   2. `sessionPersistence.open(id)` + `handle.append(...)` + flush/close for a session that is
+   *      durable but not live. This is the store-owned writer, the same one that produced
+   *      `cannot append outside a SessionStore` when we tried to append to a PREPARED session.
+   *
+   * `turn: 0, step: 0` matches the shape dsh-graft-slice uses for a notice appended outside any
+   * turn, and `role: 'developer'` is what makes it context instead of conversation.
+   */
+  const injectSetting = async (
+    observerSessionId: string,
+    text: string,
+  ): Promise<{ ok: boolean; via: string; detail: string }> => {
+    const message = {
+      id: `observer-setting-${observerSessionId}`,
+      role: 'developer',
+      content: [{ type: 'text', text }],
+    }
+
+    try {
+      const sessions = ctx.get?.('sessions')
+      const live = isRecord(sessions) && typeof sessions.get === 'function' ? sessions.get(observerSessionId) : undefined
+      if (live !== undefined && typeof (live as any).append === 'function') {
+        ;(live as any).append('developer/message', { turn: 0, step: 0, message })
+        return { ok: true, via: 'live', detail: '' }
+      }
+    } catch (error) {
+      // Fall through to the persistence channel before reporting a failure.
+      ctx.logger?.warn?.(`[dsh-observer] live setting append failed: ${String((error as any)?.message ?? error)}`)
+    }
+
+    try {
+      const persistence = ctx.get?.('sessionPersistence')
+      if (isRecord(persistence) && typeof persistence.open === 'function') {
+        const handle = await persistence.open(observerSessionId)
+        if (handle !== undefined && typeof handle.append === 'function') {
+          await handle.append([{ type: 'developer/message', time: Date.now(), data: { turn: 0, step: 0, message } }])
+          if (typeof handle.flush === 'function') await handle.flush()
+          if (typeof handle.close === 'function') await handle.close()
+          return { ok: true, via: 'persistence', detail: '' }
+        }
+        return { ok: false, via: '', detail: 'sessionPersistence.open 没有返回可写的 handle' }
+      }
+      return { ok: false, via: '', detail: 'sessionPersistence 不可用，且该会话不在 live store 中' }
+    } catch (error) {
+      return { ok: false, via: '', detail: String((error as any)?.message ?? error) }
+    }
+  }
+
+  /**
+   * TITLE THE COMPANION, and write its setting into the log.
+   *
+   * The title is the marker the Client reads from its own snapshot to hide the summon chip, so a
+   * failed rename is reported rather than hidden.
    */
   const markCompanion = async (
     mainSessionId: string,
     observerSessionId: string,
-    mission: string,
-  ): Promise<{ renamed: boolean; delivered: boolean; detail: string }> => {
+    setting: string,
+  ): Promise<{ renamed: boolean; injected: boolean; detail: string }> => {
     const controller = ctx.get?.('sessionController')
     let renamed = false
-    let delivered = false
     const problems: string[] = []
 
     if (isRecord(controller) && typeof controller.rename === 'function') {
@@ -319,29 +370,16 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       problems.push('sessionController.rename 不可用')
     }
 
-    if (isRecord(controller) && typeof controller.prompt === 'function') {
-      try {
-        await controller.prompt(
-          {
-            requestId: `observer-mission-${Date.now()}`,
-            sessionId: observerSessionId,
-            mode: 'queue',
-            content: [{ type: 'text', text: mission }],
-          },
-          new AbortController().signal,
-        )
-        delivered = true
-      } catch (error) {
-        problems.push(`设定消息发送失败：${String((error as any)?.message ?? error)}`)
-      }
-    } else {
-      problems.push('sessionController.prompt 不可用')
-    }
+    const injected = await injectSetting(observerSessionId, setting)
+    if (!injected.ok) problems.push(`设定写入失败（${injected.detail}）`)
 
-    return { renamed, delivered, detail: problems.join('；') }
+    return { renamed, injected: injected.ok, detail: problems.join('；') }
   }
 
-  /** The role text, as an ordinary message the companion sees like any other. */
+  /**
+   * The role text. `[系统设定]` is the header a developer message carries so the model reads it as
+   * standing context rather than as an instruction the user typed.
+   */
   const missionText = (mainSessionId: string): string =>
     `[系统设定] 你是会话 ${mainSessionId} 的副脑（观察者 / 跟随者）。` +
     '职责：读主会话日志、澄清需求、以确认卡形式提出方案；不直接改代码。' +
@@ -387,7 +425,7 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
      * what hides the summon chip inside the companion, read by the Client from its local snapshot.
      */
     const marked = await markCompanion(mainSessionId, observerSessionId, missionText(mainSessionId))
-    if (!marked.delivered || !marked.renamed) {
+    if (!marked.injected || !marked.renamed) {
       ctx.logger?.warn?.(`[dsh-observer] companion setup incomplete: ${marked.detail}`)
     }
     return {
@@ -471,18 +509,26 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
     commands.register({
       name: 'observer-bind',
       description: '把已创建的会话登记为副脑：/observer-bind <mainSessionId> <observerSessionId>',
+      /**
+       * v1.0.5 — THE REPLY IS EMPTY, ON PURPOSE.
+       *
+       * The gateway renders a command's returned `text` as a row in the conversation. A bind is a
+       * bookkeeping step the user did not ask to read, so it now reports NOTHING on success: an
+       * empty string produces no visible block. Only a FAILURE carries text, because a silent
+       * failure would be worse than a visible row.
+       */
       handler: async (invocation: any) => {
         try {
           const parts = commandArg(invocation).split(/\s+/u).filter(Boolean)
           const result = await bindExisting(parts[0] ?? '', parts[1] ?? '')
           return {
             kind: result.ok ? ('success' as const) : ('error' as const),
-            text: JSON.stringify({ ok: result.ok, observerSessionId: result.observerSessionId, text: result.text }),
+            text: result.ok ? '' : `副脑绑定失败：${result.text}`,
           }
         } catch (error) {
           const detail = String((error as any)?.message ?? error)
           ctx.logger?.warn?.(`[dsh-observer] observer-bind threw: ${detail}`)
-          return { kind: 'error' as const, text: JSON.stringify({ ok: false, text: `绑定失败：${detail}` }) }
+          return { kind: 'error' as const, text: `副脑绑定失败：${detail}` }
         }
       },
     })
