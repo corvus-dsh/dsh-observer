@@ -18,6 +18,27 @@ const bundle = readFileSync(join(here, '..', 'client.js'), 'utf8')
  */
 const code = bundle.replace(/\/\*[\s\S]*?\*\//gu, '').replace(/(^|[^:])\/\/[^\n]*/gu, '$1')
 
+/**
+ * v1.0.0 — THE CACHE PROBE MUST BE THE FIRST STATEMENT.
+ *
+ * Three restarts changed nothing on screen. A marker that every later diagnostic depends on has
+ * to be unconditional and first: if the page does not print it, the file being served is not this
+ * file, and no logic fix can matter. It also lands on `window` so the answer is readable from the
+ * console without opening a log.
+ */
+test('client: the cache probe is the first statement and sets a window marker', () => {
+  const firstStatement = code
+    .split('\n')
+    .find((line) => line.trim().length > 0 && !line.trim().startsWith('*'))
+  assert.match(
+    firstStatement,
+    /window\.__OBSERVER_LOADED__/u,
+    `the probe must run before anything else, found: ${firstStatement}`,
+  )
+  assert.match(bundle, /FUCK CACHE/u, 'the visible marker names the cache problem')
+  assert.match(bundle, /__OBSERVER_LOADED__\s*=\s*'/u, 'it carries a version value, not just true')
+})
+
 test('client: registered through __ModuleLoader__.load with a factory and the PLAIN id', () => {
   assert.match(bundle, /window\.__ModuleLoader__\.load\(/u, 'the module registers itself with the loader')
   /**
@@ -52,14 +73,23 @@ test('client: the plugin object declares SERVICE keys, not package names', () =>
 })
 
 /**
- * v0.1.16 — WHY A RETURNED ID DID NOT OPEN A WINDOW.
+ * v1.0.0 — THE JUMP BUG, AND WHY THE OLD TEST MISSED IT.
  *
- * `uiWorkspace` was missing from `inject`, so `ctx.get('uiWorkspace')` threw, the catch hid it,
- * and the chip told the user to find the session by hand while holding its id.
+ * The service contract is `openSession(target: SessionTarget): void` with
+ * `SessionTarget = SessionId | SubagentAddress` — a BARE ID STRING. The earlier test asserted the
+ * OBJECT shape `{ kind: 'session', sessionId }` (which belongs to `sessions.retain`), so a wrong
+ * assertion certified a wrong call: the function is synchronous and returns void WITHOUT
+ * throwing, so `return true` ran and the string fallback never executed.
+ *
+ * The rule here is the contract: a bare id is passed, and nothing object-shaped is.
  */
-test('client: openSession uses the SessionTarget object through the injected service', () => {
-  assert.match(code, /workspaceUi\.openSession/u, 'it opens through the uiWorkspace service')
-  assert.match(code, /kind:\s*'session',\s*sessionId:\s*id/u, 'the documented target shape is used')
+test('client: openSession receives a BARE session id (SessionTarget), not a wrapper object', () => {
+  assert.match(code, /workspaceUi\.openSession\(id\)/u, 'the documented SessionTarget (bare id) is passed')
+  assert.doesNotMatch(
+    code,
+    /openSession\(\{\s*kind:\s*'session'/u,
+    'a { kind, sessionId } wrapper is not a SessionTarget and is ignored silently',
+  )
 })
 
 /**

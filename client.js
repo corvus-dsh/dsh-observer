@@ -18,7 +18,17 @@
  * binding table once on mount. There is no timer in this file, and no session enumeration.
  */
 
-console.log('[dsh-observer] client 0.1.15 loaded (click-only, no polling)')
+/**
+ * CACHE PROBE — must be the FIRST statement in this file.
+ *
+ * If the running page does not print this line, the module on screen is not this file, and no
+ * amount of logic fixing helps: the rest of the diagnosis has to move to the loader's cache.
+ * The global makes that answerable from the console without reading a log at all.
+ */
+window.__OBSERVER_LOADED__ = '1.0.0'
+console.log('%c[dsh-observer] FUCK CACHE 1.0.0 — this client file is really loaded', 'color:#16a34a;font-weight:bold')
+
+console.log('[dsh-observer] client 1.0.0 loaded (click-only, no polling)')
 
 window.__ModuleLoader__.load({
   id: 'dsh-observer',
@@ -168,9 +178,16 @@ window.__ModuleLoader__.load({
       }, [sessionId])
 
       /**
-       * Open a session in the window. `uiWorkspace.openSession` takes the SessionTarget object
-       * `{ kind: 'session', sessionId }`; the string form is kept as a fallback for a host that
-       * resolves a bare id, so a single signature change cannot silently eat the jump.
+       * Open a session in the window.
+       *
+       * v1.0.0 — THE JUMP NEVER WORKED BECAUSE OF THIS LINE.
+       *
+       * The service contract is `openSession(target: SessionTarget): void` where
+       * `SessionTarget = SessionId | SubagentAddress` — a BARE ID STRING. I was passing
+       * `{ kind: 'session', sessionId }` (the shape `sessions.retain` uses), which is not a
+       * SessionTarget; the call is synchronous and returns void WITHOUT throwing, so `return true`
+       * ran anyway, the string fallback never executed, and a perfectly good companion id was
+       * silently dropped while the chip said "请稍后再找".
        */
       const open = (id) => {
         if (id.length === 0) return false
@@ -180,17 +197,12 @@ window.__ModuleLoader__.load({
           return false
         }
         try {
-          workspaceUi.openSession({ kind: 'session', sessionId: id })
+          workspaceUi.openSession(id)
           return true
         } catch (error) {
-          try {
-            workspaceUi.openSession(id)
-            return true
-          } catch (fallbackError) {
-            console.error('[dsh-observer] openSession failed:', String((fallbackError && fallbackError.message) || fallbackError))
-            setError(`无法打开会话 ${id}`)
-            return false
-          }
+          console.error('[dsh-observer] openSession failed:', String((error && error.message) || error))
+          setError(`无法打开会话 ${id}`)
+          return false
         }
       }
 
@@ -219,8 +231,9 @@ window.__ModuleLoader__.load({
       }
 
       const jump = () => {
-        if (bound.length > 0 && open(bound)) return
-        setError('uiWorkspace.openSession 不可用')
+        if (bound.length === 0) return
+        // open() already reports its own failure; a second generic message would hide which one.
+        open(bound)
       }
 
       /** A companion must not summon a companion: no chip at all in that session. */
