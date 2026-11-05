@@ -34,8 +34,8 @@ function boot(bindingsPath) {
           /** A live session: the header carries the cwd Plan B resolves, append captures the setting. */
           get: (id) => ({
             header: { cwd: 'D:/test/project' },
-            append: (type, data) => {
-              appends.push({ id, type, data })
+            append: (type, data, options) => {
+              appends.push({ id, type, data, options })
             },
           }),
         }
@@ -112,8 +112,9 @@ test('observer_consult: a companion with NO pointer, titled and given its settin
   assert.deepEqual(debugObserverState().bindings, {}, 'a consultation companion is not bound to anything')
   assert.match(renames[0].title, /\[副脑\]/u)
   assert.equal(prompts.length, 0, 'no prompt: nothing starts the agent loop')
-  assert.equal(appends[0].type, 'developer/message')
-  const text = appends[0].data.message.content[0].text
+  const message = appends.find((entry) => entry.type === 'developer/message')
+  assert.ok(message !== undefined, 'a developer message is written')
+  const text = message.data.message.content[0].text
   assert.match(text, /前置需求分析副脑/u)
   assert.match(text, /最终 Prompt/u)
 })

@@ -38,7 +38,9 @@ function boot({ mainSession = { header: { cwd: 'D:/project' } }, workingDirector
       if (name === 'sessions') {
         return {
           get: (id) => {
-            if (id === 'obs-new' || String(id).startsWith('obs-')) return { append: (type, data) => appends.push({ id, type, data }) }
+            if (id === 'obs-new' || String(id).startsWith('obs-')) {
+            return { append: (type, data, options) => appends.push({ id, type, data, options }) }
+          }
             return mainSession ?? undefined
           },
         }
@@ -119,10 +121,10 @@ test('spawn: the companion is titled, given its setting physically, and never pr
   assert.match(harness.renames[0].title, /\[副脑\]/u, 'with the marker the client reads')
   assert.equal(harness.prompts.length, 0, 'NOT prompted: the agent loop must not start')
 
-  assert.equal(harness.appends.length, 1, 'the setting is written into the log')
-  assert.equal(harness.appends[0].type, 'developer/message', 'a developer message is context, not a turn')
-  assert.equal(harness.appends[0].data.message.role, 'developer')
-  assert.match(harness.appends[0].data.message.content[0].text, /\[系统设定\]/u)
+  const written = harness.appends.filter((entry) => entry.type === 'developer/message')
+  assert.equal(written.length, 1, 'the setting is written into the log')
+  assert.equal(written[0].data.message.role, 'developer', 'a developer message is context, not a turn')
+  assert.match(written[0].data.message.content[0].text, /\[系统设定\]/u)
 })
 
 test('spawn: an existing companion is reused instead of creating a second one', async () => {

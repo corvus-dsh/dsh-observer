@@ -1,7 +1,7 @@
 {
   "name": "dsh-observer",
-  "version": "1.2.1",
-  "description": "Companion session (鍓剳) for DSH: a follower session bound to a main session, co-transferring by pointer, never sliced.",
+  "version": "1.9.0",
+  "description": "Companion session (副脑) for DSH: a follower session bound to a main session, co-transferring by pointer, never sliced.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -26,10 +26,19 @@
     "dsh": ">=0.2.1-rc.5",
     "node": ">=20"
   },
+  "peerDependencies": {
+    "dsh-paradise": "*"
+  },
+  "peerDependenciesMeta": {
+    "dsh-paradise": {
+      "optional": true
+    }
+  },
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "node --test test/*.test.mjs",
-    "check": "node scripts/build.mjs && node --test test/*.test.mjs"
+    "preflight": "node scripts/preflight.mjs",
+    "check": "node scripts/build.mjs && node scripts/preflight.mjs && node --test test/*.test.mjs"
   },
   "files": [
     "index.js",

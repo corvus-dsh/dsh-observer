@@ -33,8 +33,8 @@ function boot() {
           /** A live session: the header carries the cwd Plan B resolves, append captures the setting. */
           get: (id) => ({
             header: { cwd: 'D:/test/project' },
-            append: (type, data) => {
-              appends.push({ id, type, data })
+            append: (type, data, options) => {
+              appends.push({ id, type, data, options })
             },
           }),
         }
@@ -95,9 +95,9 @@ test('observer: a [副脑] title binds the pair and injects the setting', async 
 
   assert.deepEqual(debugObserverState().bindings, { 'main-title': 'obs-title' })
   assert.equal(debugObserverState().reverse['obs-title'], 'main-title')
-  assert.equal(appends.length, 1, 'the setting is written once')
-  assert.equal(appends[0].type, 'developer/message')
-  assert.match(appends[0].data.message.content[0].text, /main-title/u)
+  const written = appends.filter((entry) => entry.type === 'developer/message')
+  assert.equal(written.length, 1, 'the setting is written once')
+  assert.match(written[0].data.message.content[0].text, /main-title/u)
 })
 
 test('observer: an unrelated or repeated title changes nothing', async () => {
@@ -110,7 +110,11 @@ test('observer: an unrelated or repeated title changes nothing', async () => {
 
   onEvent({ id: 'obs-title' }, { type: 'session/title', data: { title: '[副脑] 跟随 main-title' } })
   onEvent({ id: 'obs-title' }, { type: 'session/title', data: { title: '[副脑] 跟随 main-title' } })
-  assert.equal(appends.length, 1, 'a repeated title event must not inject the setting twice')
+  assert.equal(
+    appends.filter((entry) => entry.type === 'developer/message').length,
+    1,
+    'a repeated title event must not inject the setting twice',
+  )
 })
 
 test('observer: summoning without a session is refused, never guessed', async () => {
@@ -140,11 +144,11 @@ test('observer: a follower gets its pointer, a title, and a PHYSICALLY written s
   assert.match(renames[0].title, /\[副脑\]/u, 'the title carries the marker the Client reads')
 
   assert.equal(prompts.length, 0, 'NO prompt: the agent loop must not be started by a summon')
-  assert.equal(appends.length, 1, 'the setting is written into the log instead')
-  assert.equal(appends[0].id, 'obs-1')
-  assert.equal(appends[0].type, 'developer/message', 'a developer message is context, not a turn')
-  assert.equal(appends[0].data.message.role, 'developer')
-  const text = appends[0].data.message.content[0].text
+  const written = appends.filter((entry) => entry.type === 'developer/message')
+  assert.equal(written.length, 1, 'the setting is written into the log instead')
+  assert.equal(written[0].id, 'obs-1')
+  assert.equal(written[0].data.message.role, 'developer', 'a developer message is context, not a turn')
+  const text = written[0].data.message.content[0].text
   assert.match(text, /\[系统设定\]/u, 'the setting is framed as standing context')
   assert.match(text, /main-1/u, 'and it names the session being observed')
 
@@ -152,7 +156,11 @@ test('observer: a follower gets its pointer, a title, and a PHYSICALLY written s
   assert.equal(again.ok, true)
   assert.equal(again.sessionId, 'obs-1', 'the existing companion id is answered, so the caller can open it')
   assert.match(again.text, /已有副脑/u)
-  assert.equal(appends.length, 1, 'a second summon does not write the setting twice')
+  assert.equal(
+    appends.filter((entry) => entry.type === 'developer/message').length,
+    1,
+    'a second summon does not write the setting twice',
+  )
 })
 
 test('observer: a follower cannot be given a follower of its own', async () => {
