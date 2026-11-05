@@ -18,8 +18,8 @@
  * `Promise<SessionId>`, which is exactly what a caller needs in order to open and then bind.
  */
 
-window.__OBSERVER_LOADED__ = '1.0.6'
-console.log('%c[dsh-observer] FUCK CACHE 1.0.6 — no command channel, title-marked companions', 'color:#16a34a;font-weight:bold')
+window.__OBSERVER_LOADED__ = '1.0.7'
+console.log('%c[dsh-observer] FUCK CACHE 1.0.7 — loud failures, remote.session injected', 'color:#16a34a;font-weight:bold')
 
 window.__ModuleLoader__.load({
   id: 'dsh-observer',
@@ -191,29 +191,35 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * v1.0.6 — MARK THE COMPANION WITH A PLAIN REMOTE CALL, NOT A COMMAND.
+       * Mark the companion by RENAMING it — a plain Remote call, never a command.
        *
-       * `commands.execute` is BROADCAST: the host renders every invocation as a row in the
-       * conversation whatever the handler returns (an empty reply removes the text, not the row).
-       * That is the `observer-bind:` bubble the user kept seeing, and it cannot be fixed from the
-       * handler side.
+       * WHY A RENAME AND NOT A COMMAND: `commands.execute` is BROADCAST, so every invocation is
+       * rendered as a row in the conversation whatever the handler returns. An empty reply removes
+       * the text but not the row, which is exactly the `observer-bind:` bubble the user kept
+       * seeing. A Remote call prints nothing.
        *
-       * `remote.session.rename` is an ordinary Remote call — no row — and the title itself is the
-       * signal: the Host watches its own `session/event` feed, sees `[副脑] 跟随 <main id>`, writes
-       * the pointer and injects the setting. One call, no broadcast, and the title doubles as the
-       * marker that hides the summon chip inside a companion.
+       * WHY `remote.session` IS IN `inject`: without that key the access throws
+       * `cannot get property "remote.session" without inject` — the same failure
+       * dsh-graft-slice hit. It is declared in the plugin's inject list for this reason.
        */
       const markCompanion = async (mainSessionId, observerSessionId) => {
+        const title = `[副脑] 跟随 ${mainSessionId}`
         const remote = get('remote')
-        const namespace = remote && (remote.session || remote.sessionController)
+        if (!remote) return { ok: false, text: 'remote 服务不可用（inject 未生效）' }
+        const namespace = remote.session || remote.sessionController
         if (!namespace || typeof namespace.rename !== 'function') {
-          return { ok: false, text: 'remote.session.rename 不可用：副脑未被标记' }
+          const keys = remote && typeof remote === 'object' ? Object.keys(remote).join(',') : '(none)'
+          console.error('[dsh-observer] remote namespaces:', keys)
+          return { ok: false, text: `remote.session.rename 不可用（remote 上有：${keys}）` }
         }
         try {
-          await namespace.rename({ sessionId: observerSessionId, title: `[副脑] 跟随 ${mainSessionId}` })
+          await namespace.rename({ sessionId: observerSessionId, title })
+          console.log(`[dsh-observer] marked ${observerSessionId} as "${title}"`)
           return { ok: true, text: '' }
         } catch (error) {
-          return { ok: false, text: String((error && error.message) || error) }
+          const detail = String((error && error.message) || error)
+          console.error('[dsh-observer] rename failed:', detail)
+          return { ok: false, text: `重命名失败：${detail}` }
         }
       }
 
@@ -234,12 +240,19 @@ window.__ModuleLoader__.load({
        * state flag alone still allowed the other seats to fire and produce several companions.
        */
       const summon = async () => {
-        if (summoning) return
+        console.log('[dsh-observer] click: summoning=%s session=%s', summoning, sessionId)
+        if (summoning) {
+          setNote('上一次召唤还在进行中，请稍候')
+          return
+        }
         summoning = true
         setBusy(true)
         setNote('')
         try {
-          const created = await bridge.createSession(bridge.locationOf(sessionId))
+          const location = bridge.locationOf(sessionId)
+          console.log('[dsh-observer] location:', JSON.stringify(location))
+          const created = await bridge.createSession(location)
+          console.log('[dsh-observer] create result:', JSON.stringify(created))
           if (!created.ok) {
             setNote(`创建会话失败：${created.text}`)
             return
@@ -249,13 +262,25 @@ window.__ModuleLoader__.load({
           // inside the fresh companion must not appear in that gap.
           companions.add(observerSessionId)
           const marked = await bridge.markCompanion(sessionId, observerSessionId)
+          console.log('[dsh-observer] mark result:', JSON.stringify(marked))
           if (!marked.ok) {
-            console.error('[dsh-observer] mark failed:', marked.text)
             setNote(`副脑 ${observerSessionId} 已创建，但未被标记：${marked.text}`)
             return
           }
           const opened = bridge.openSession(observerSessionId)
+          console.log('[dsh-observer] opened:', opened)
           if (!opened) setNote(`副脑 ${observerSessionId} 已创建并标记；请在左侧会话列表中选择它`)
+        } catch (error) {
+          /**
+           * v1.0.7 — NOTHING FAILS SILENTLY.
+           *
+           * An exception here used to leave the chip unchanged: no note, no log, no reaction —
+           * the worst possible symptom, because the user cannot tell it apart from a dead button.
+           * The catch names the step that threw, and the message is shown AND logged.
+           */
+          const detail = String((error && error.message) || error)
+          console.error('[dsh-observer] summon threw:', detail, error)
+          setNote(`召唤失败：${detail}`)
         } finally {
           summoning = false
           setBusy(false)
@@ -306,12 +331,30 @@ window.__ModuleLoader__.load({
 
     return {
       /**
-       * Service keys actually available on this Client half:
-       * `slots` (register), `sessions` (create, returns the id), `uiWorkspace` (open),
-       * `remote` + `remote.commands` (the single bind line per click).
+       * Service keys actually available on this Client half.
+       *
+       * `remote.session` IS one of them: it is the namespace the marking rename travels through,
+       * and without the key in this array the access throws `cannot get property "remote.session"
+       * without inject` — the failure dsh-graft-slice documents. `remote.commands` is kept only so
+       * the contract stays explicit; no command is ever sent.
        */
-      inject: ['slots', 'sessions', 'uiWorkspace', 'remote', 'remote.commands'],
+      inject: ['slots', 'sessions', 'uiWorkspace', 'remote', 'remote.commands', 'remote.session'],
       apply(ctx) {
+        /**
+         * v1.0.7 — MOUNTING FAILS LOUDLY.
+         *
+         * If this throws, the seats are never registered and the user sees a dead button with no
+         * explanation. The catch prints the reason and re-throws after logging, so a broken mount
+         * is visible in the console instead of being inferred from silence.
+         */
+        try {
+          return mount(ctx)
+        } catch (error) {
+          console.error('[dsh-observer] MOUNT FAILED:', String((error && error.message) || error), error)
+          throw error
+        }
+
+        function mount(ctx) {
         const bridge = makeBridge(ctx)
         const seats = [
           { name: 'conversation.chat.turnTail', id: 'observer-turntail', order: 60 },
@@ -358,6 +401,7 @@ window.__ModuleLoader__.load({
           }
         } catch (error) {
           console.error('[dsh-observer] could not subscribe to the transfer event:', String((error && error.message) || error))
+        }
         }
       },
       __makeEntryForTest: makeEntry,

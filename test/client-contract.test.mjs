@@ -99,9 +99,9 @@ test('client: one click inherits the location, creates, marks, then opens', () =
   assert.match(code, /拿不到主会话的工作区或路径/u, 'a locationless create is refused, not attempted')
 
   const summon = code.slice(code.indexOf('const summon ='), code.indexOf('return h('))
-  // `locationOf` is the ARGUMENT of `createSession`, so textually it comes second; what matters is
-  // that the location is computed for that call, and that mark precedes open.
-  assert.match(summon, /createSession\(bridge\.locationOf\(sessionId\)\)/u, 'the location feeds the create call')
+  // The location is computed once and handed to the create call; mark precedes open.
+  assert.match(summon, /const location = bridge\.locationOf\(sessionId\)/u, 'the location is computed')
+  assert.match(summon, /bridge\.createSession\(location\)/u, 'and feeds the create call')
   const order = ['createSession(', 'markCompanion(', 'openSession('].map((step) => summon.indexOf(step))
   assert.ok(order.every((at) => at >= 0), 'the flow is create → mark → open')
   assert.deepEqual([...order].sort((a, b) => a - b), order, 'the steps must run in that order')
@@ -126,8 +126,33 @@ test('client: a companion is recognised from its own title, with no request and 
 
 test('client: the summon is exclusive across all three seats', () => {
   assert.match(code, /^\s*let summoning = false$/mu, 'the latch is module-scoped, not per component')
-  assert.match(code, /if \(summoning\) return/u, 'a second click while one is running is ignored')
-  assert.match(code, /summoning = false/u, 'and it is always released')
+  assert.match(code, /if \(summoning\) \{/u, 'a second click while one is running is reported, not queued')
+  assert.match(code, /上一次召唤还在进行中/u, 'and it says so instead of doing nothing')
+  assert.match(code, /summoning = false/u, 'the latch is always released')
+})
+
+/**
+ * v1.0.7 — NOTHING FAILS SILENTLY.
+ *
+ * "Click does nothing" was indistinguishable from a dead button, because an exception left the chip
+ * exactly as it was. Every await now logs its result, and the whole click is wrapped so a throw
+ * becomes a visible note plus a console error.
+ */
+test('client: every step of a click is logged and a throw becomes a visible note', () => {
+  const summon = code.slice(code.indexOf('const summon ='), code.indexOf('return h('))
+  assert.match(summon, /console\.log\('\[dsh-observer\] click:/u, 'the click is logged')
+  assert.match(summon, /console\.log\('\[dsh-observer\] location:'/u, 'the resolved location is logged')
+  assert.match(summon, /console\.log\('\[dsh-observer\] create result:'/u, 'the create result is logged')
+  assert.match(summon, /console\.log\('\[dsh-observer\] mark result:'/u, 'the mark result is logged')
+  assert.match(summon, /console\.log\('\[dsh-observer\] opened:'/u, 'the open result is logged')
+  assert.match(summon, /catch \(error\) \{/u, 'a throw is caught')
+  assert.match(summon, /console\.error\('\[dsh-observer\] summon threw:'/u, 'and logged with its detail')
+  assert.match(summon, /setNote\(`召唤失败：\$\{detail\}`\)/u, 'and shown on the chip')
+})
+
+test('client: a failed mount is reported, never silent', () => {
+  assert.match(code, /MOUNT FAILED/u, 'a throwing apply() names itself in the console')
+  assert.match(code, /registration failed:/u, 'each seat reports its own failure')
 })
 
 /**
@@ -156,10 +181,27 @@ test('client: the marking call is a plain rename and its failure is reported', (
   assert.match(mark, /namespace\.rename\(/u, 'it renames through the Remote namespace')
   assert.doesNotMatch(mark, /commands\.execute/u, 'never through the broadcast command channel')
   assert.equal((mark.match(/rename\(/gu) ?? []).length, 1, 'exactly one rename per click')
-  assert.match(mark, /副脑未被标记/u, 'a failure names what did not happen')
+  assert.match(mark, /remote\.session\.rename 不可用/u, 'a failure names what did not happen')
+  assert.match(mark, /remote namespaces:/u, 'and lists what the remote object actually exposes')
 
   assert.match(code, /但未被标记/u, 'and the chip states it instead of pretending success')
-  assert.match(code, /console\.error\('\[dsh-observer\] mark failed:'/u, 'the detail is logged')
+  assert.match(code, /console\.error\('\[dsh-observer\] rename failed:'/u, 'the detail is logged')
+})
+
+/**
+ * v1.0.7 — `remote.session` MUST BE INJECTED.
+ *
+ * Without the key, touching `remote.session` throws
+ * `cannot get property "remote.session" without inject` — the failure dsh-graft-slice documents —
+ * and the marking call can never succeed.
+ */
+test('client: remote.session is declared in the inject list', () => {
+  const matches = [...bundle.matchAll(/inject:\s*\[([^\]]*)\]/gu)]
+  const keys = matches[matches.length - 1][1]
+    .split(',')
+    .map((part) => part.trim().replace(/^['"]|['"]$/gu, ''))
+    .filter(Boolean)
+  assert.ok(keys.includes('remote.session'), `inject must include remote.session, found: ${keys.join(', ')}`)
 })
 
 test('client: a seat without a session id renders nothing', () => {

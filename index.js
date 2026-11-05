@@ -27,7 +27,7 @@ export const name = 'dsh-observer'
  * Client half is cached separately, and "did my build reach the app?" must be answerable
  * without guessing.
  */
-export const VERSION = '1.0.6'
+export const VERSION = '1.0.7'
 console.log(`[dsh-observer] host version ${VERSION}`)
 
 /**
@@ -188,7 +188,24 @@ export function apply(ctx                   , config                          = 
       // `session/event` is scoped: (session, event). Read defensively so a shape change cannot
       // throw inside a post-commit feed.
       const event = args.length >= 2 ? args[1] : args[0]
-      if (!isRecord(event) || event.type !== 'session/title') return
+      if (!isRecord(event)) return
+      /**
+       * v1.0.7 — PROVE THE FEED IS ALIVE.
+       *
+       * The whole event-derived binding rests on this listener actually receiving events. A silent
+       * listener makes a broken binding indistinguishable from a broken client, so every title
+       * that arrives is logged with its text and both candidate session ids. If the user renames a
+       * companion and this line never appears, the feed is the problem — not the parser.
+       */
+      if (event.type === 'session/title') {
+        const seenTitle = typeof event.data?.title === 'string' ? event.data.title : ''
+        ctx.logger?.info?.(
+          `[dsh-observer] 宿主捕获到 title 事件: ${JSON.stringify(seenTitle)} ` +
+            `(scope.id=${JSON.stringify(args[0]?.id ?? args[0]?.sessionId ?? null)} ` +
+            `data.sessionId=${JSON.stringify(event.data?.sessionId ?? null)})`,
+        )
+      }
+      if (event.type !== 'session/title') return
       const title = typeof event.data?.title === 'string' ? event.data.title : ''
       const matched = COMPANION_TITLE.exec(title)
       if (matched === null) return
@@ -198,8 +215,16 @@ export function apply(ctx                   , config                          = 
           ? event.data.sessionId
           : typeof args[0]?.id === 'string'
             ? args[0].id
-            : ''
-      if (observerSessionId.length === 0 || mainSessionId === observerSessionId) return
+            : typeof args[0]?.sessionId === 'string'
+              ? args[0].sessionId
+              : ''
+      if (observerSessionId.length === 0 || mainSessionId === observerSessionId) {
+        ctx.logger?.warn?.(
+          `[dsh-observer] 副脑标题已到手但拿不到观察者 sessionId（main=${mainSessionId}）；` +
+            '绑定与设定注入被跳过',
+        )
+        return
+      }
       // Already bound to the same pair: a repeated title event must not re-inject the setting.
       if (observerOf(mainSessionId) === observerSessionId) return
 
@@ -211,7 +236,13 @@ export function apply(ctx                   , config                          = 
         return
       }
       ctx.logger?.info?.(`[dsh-observer] bound ${mainSessionId} -> ${observerSessionId} from its title`)
-      void injectSetting(observerSessionId, missionText(mainSessionId))
+      void injectSetting(observerSessionId, missionText(mainSessionId)).then((injected) => {
+        ctx.logger?.info?.(
+          injected.ok
+            ? `[dsh-observer] setting injected via ${injected.via}`
+            : `[dsh-observer] setting injection FAILED: ${injected.detail}`,
+        )
+      })
     } catch (error) {
       ctx.logger?.warn?.(`[dsh-observer] title-derived bind failed: ${String((error       )?.message ?? error)}`)
     }
