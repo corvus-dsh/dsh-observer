@@ -20,8 +20,8 @@
  * `Promise<SessionId>`, which is exactly what a caller needs in order to open and then bind.
  */
 
-window.__OBSERVER_LOADED__ = '1.0.1'
-console.log('%c[dsh-observer] FUCK CACHE 1.0.1 — minimal client loaded', 'color:#16a34a;font-weight:bold')
+window.__OBSERVER_LOADED__ = '1.0.2'
+console.log('%c[dsh-observer] FUCK CACHE 1.0.2 — minimal client loaded', 'color:#16a34a;font-weight:bold')
 
 window.__ModuleLoader__.load({
   id: 'dsh-observer',
@@ -37,6 +37,37 @@ window.__ModuleLoader__.load({
       font: 'inherit',
     }
 
+    /**
+     * v1.0.2 — COMPANIONS CREATED IN THIS PAGE, AND THE PAGE-LIFETIME LOCK.
+     *
+     * `companions` answers "am I looking at a companion?" without any host round trip: the id is
+     * remembered the moment it is created, and persisted so a reload does not bring the summon
+     * button back inside a companion (which is how the nesting button reappeared).
+     *
+     * `summoning` is a MODULE-level latch rather than component state: three seats render this
+     * chip, so a per-component `busy` flag still let the other two seats fire — that is the
+     * "无限多开" the screenshots showed.
+     */
+    const COMPANION_STORE = 'dsh-observer:companions'
+    const readCompanions = () => {
+      try {
+        const raw = window.localStorage ? window.localStorage.getItem(COMPANION_STORE) : null
+        const parsed = raw === null ? [] : JSON.parse(raw)
+        return new Set(Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string') : [])
+      } catch {
+        return new Set()
+      }
+    }
+    const writeCompanions = (ids) => {
+      try {
+        if (window.localStorage) window.localStorage.setItem(COMPANION_STORE, JSON.stringify([...ids]))
+      } catch {
+        // A blocked storage is not a reason to lose the in-memory set.
+      }
+    }
+    const companions = readCompanions()
+    let summoning = false
+
     const makeBridge = (ctx) => {
       const get = (key) => {
         try {
@@ -47,14 +78,35 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * The main session's working directory, read from the LOCAL list snapshot.
+       *
+       * `SessionSummary.cwd` is already in the client store, so this is a synchronous snapshot
+       * read — no RPC, therefore no transcript row. A companion created without it lands in
+       * "未分组" instead of the project the user is actually working in.
+       */
+      const cwdOf = (sessionId) => {
+        try {
+          const sessions = get('sessions')
+          const list = sessions && sessions.list
+          const snapshot = list && typeof list.getSnapshot === 'function' ? list.getSnapshot() : undefined
+          const summary = snapshot && snapshot.byId ? snapshot.byId[sessionId] : undefined
+          const cwd = summary && typeof summary.cwd === 'string' ? summary.cwd : ''
+          return cwd
+        } catch (error) {
+          console.error('[dsh-observer] cwd lookup failed:', String((error && error.message) || error))
+          return ''
+        }
+      }
+
       /** Create an ordinary session; `sessions.create` resolves to its `SessionId`. */
-      const createSession = async () => {
+      const createSession = async (cwd) => {
         const sessions = get('sessions')
         if (!sessions || typeof sessions.create !== 'function') {
           return { ok: false, sessionId: '', text: 'sessions.create 不可用（inject 未生效）' }
         }
         try {
-          const sessionId = await sessions.create({})
+          const sessionId = await sessions.create(cwd.length > 0 ? { cwd } : {})
           if (typeof sessionId !== 'string' || sessionId.length === 0) {
             return { ok: false, sessionId: '', text: `sessions.create 返回了空 id：${JSON.stringify(sessionId)}` }
           }
@@ -101,7 +153,7 @@ window.__ModuleLoader__.load({
         }
       }
 
-      return { get, createSession, openSession, bind }
+      return { get, cwdOf, createSession, openSession, bind }
     }
 
     function ObserverChip({ sessionId, bridge }) {
@@ -109,30 +161,42 @@ window.__ModuleLoader__.load({
       const [note, setNote] = React.useState('')
 
       /**
-       * ONE click → create → open → bind.
+       * ONE click → create (in the main session's cwd) → open → bind.
        *
        * Open before binding so the user lands in the companion even if the bind fails; report
        * the failure in the chip instead of pretending the summon succeeded.
+       *
+       * `summoning` is the module latch, not `busy`: three seats share this component, so the
+       * state flag alone still allowed the other seats to fire and produce several companions.
        */
       const summon = async () => {
+        if (summoning) return
+        summoning = true
         setBusy(true)
         setNote('')
-        const created = await bridge.createSession()
-        if (!created.ok) {
+        try {
+          const cwd = bridge.cwdOf(sessionId)
+          const created = await bridge.createSession(cwd)
+          if (!created.ok) {
+            setNote(`创建会话失败：${created.text}`)
+            return
+          }
+          const observerSessionId = created.sessionId
+          // Remember it BEFORE opening, so the chip inside the companion already knows to hide.
+          companions.add(observerSessionId)
+          writeCompanions(companions)
+          const opened = bridge.openSession(observerSessionId)
+          const bound = await bridge.bind(sessionId, observerSessionId)
+          if (!bound.ok) {
+            console.error('[dsh-observer] bind failed:', bound.text)
+            setNote(`副脑 ${observerSessionId} 已打开，但指针未写入：${bound.text}`)
+            return
+          }
+          if (!opened) setNote(`副脑 ${observerSessionId} 已创建并绑定；请在左侧会话列表中选择它`)
+        } finally {
+          summoning = false
           setBusy(false)
-          setNote(`创建会话失败：${created.text}`)
-          return
         }
-        const observerSessionId = created.sessionId
-        const opened = bridge.openSession(observerSessionId)
-        const bound = await bridge.bind(sessionId, observerSessionId)
-        setBusy(false)
-        if (!bound.ok) {
-          console.error('[dsh-observer] bind failed:', bound.text)
-          setNote(`副脑 ${observerSessionId} 已打开，但指针未写入：${bound.text}`)
-          return
-        }
-        if (!opened) setNote(`副脑 ${observerSessionId} 已创建并绑定；请在左侧会话列表中选择它`)
       }
 
       return h(
@@ -157,14 +221,18 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Renders nothing without a session id: a seat with no id cannot create a BOUND companion
-     * (there would be nothing to observe), and an empty-id call is what produced
-     * `gateway/internal` before.
+     * Renders nothing when there is no session id, and nothing inside a COMPANION.
+     *
+     * The first rule keeps an empty-id call (which produced `gateway/internal`) impossible. The
+     * second is the no-nesting rule the Host also enforces: a companion that summons a companion
+     * chains forever. It is answered locally from the id set — no host round trip, so the
+     * transcript stays clean.
      */
     const makeEntry = (bridge) => (props) => {
       try {
         const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
         if (sessionId.length === 0) return null
+        if (companions.has(sessionId)) return null
         return h(ObserverChip, { sessionId, bridge })
       } catch (error) {
         const message = String((error && error.message) || error)

@@ -21,6 +21,7 @@ import { apply, debugObserverState } from '../index.js'
 function boot(bindingsPath) {
   const tools = new Map()
   const commands = new Map()
+  const listeners = new Map()
   const prompts = []
   let created = 0
   const ctx = {
@@ -41,12 +42,14 @@ function boot(bindingsPath) {
       return undefined
     },
     logger: { info() {}, warn() {} },
-    on() {},
+    on(event, listener) {
+      listeners.set(event, listener)
+    },
     tools: { register: (definition) => tools.set(definition.name, definition) },
   }
   const path = bindingsPath ?? join(mkdtempSync(join(tmpdir(), 'dsh-observer-')), 'observer-bindings.json')
   apply(ctx, { bindingsPath: path })
-  return { tools, commands, prompts, path }
+  return { tools, commands, listeners, prompts, path }
 }
 
 test('create command: no `input` key (it silently prevented registration)', () => {
@@ -99,14 +102,18 @@ test('create command: an unwritable bindings path is reported, never claimed as 
   assert.match(payload.text, /绑定表写入失败/u)
 })
 
-test('consult command: opens a companion with NO pointer and the pre-discussion mission', async () => {
-  const { commands, prompts } = boot()
+test('consult command: opens a companion with NO pointer and a STAGED pre-discussion mission', async () => {
+  const { commands, prompts, listeners } = boot()
   const reply = await commands.get('observer-consult').handler({})
   assert.equal(reply.kind, 'success')
   const payload = JSON.parse(reply.text)
   assert.equal(payload.ok, true)
   assert.equal(payload.observerSessionId, 'obs-1')
   assert.deepEqual(debugObserverState().bindings, {}, 'a consultation companion is not bound to anything')
-  assert.match(prompts[0].content[0].text, /前置需求分析副脑/u)
-  assert.match(prompts[0].content[0].text, /最终 Prompt/u)
+  assert.equal(prompts.length, 0, 'nothing is pushed — the consultation opens blank')
+
+  const decision = await listeners.get('agent/pre-step')({ agent: { id: 'obs-1' } }, async () => ({ messages: [] }))
+  assert.equal(decision.messages.length, 1, 'and it still receives its role on the first step')
+  assert.match(decision.messages[0].content[0].text, /前置需求分析副脑/u)
+  assert.match(decision.messages[0].content[0].text, /最终 Prompt/u)
 })

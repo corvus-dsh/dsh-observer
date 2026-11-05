@@ -60,28 +60,30 @@ test('client: the plugin object injects exactly the services the minimal flow ne
 })
 
 /**
- * v1.0.1 — NO STATE READ, NO POLL, NO CREATE COMMAND.
+ * v1.0.2 — NO STATE READ, NO POLL, NO CREATE COMMAND, NO RPC ENUMERATION.
  *
- * The three seats re-render constantly and every command call prints a row into the conversation;
- * that is the transcript flood. Only the single bind line is fired, and only on a click.
+ * `sessions.list.getSnapshot()` IS allowed: a synchronous read of the LOCAL store that yields the
+ * main session's `cwd`, so it performs no request and prints no transcript row. An actual list
+ * CALL, or the `remote.session` namespace, is not.
  */
-test('client: no state read, no polling, no create command, no session enumeration', () => {
+test('client: no state read, no polling, no create command, no RPC enumeration', () => {
   assert.doesNotMatch(code, /observer-state/u, 'the state command is gone entirely')
   assert.doesNotMatch(code, /observer-create/u, 'the create command is gone (it lost the session id)')
   assert.doesNotMatch(code, /setInterval|setTimeout/u, 'no timers')
-  assert.doesNotMatch(code, /session\.list\(|sessions\.list/u, 'no session enumeration')
+  assert.doesNotMatch(code, /sessions\.list\(|remote\.session/u, 'no list RPC — only the local snapshot')
   assert.doesNotMatch(code, /readSessions/u, 'the read-once guard is gone with the read it guarded')
   assert.doesNotMatch(code, /tools\.execute/u, 'there is no client tools service on this host')
 })
 
 /**
- * v1.0.1 — THE CLICK PATH.
+ * v1.0.2 — THE CLICK PATH, INCLUDING WORKSPACE INHERITANCE.
  *
- * `sessions.create` is the only client API that RETURNS an id (`uiWorkspace.startSession` returns
- * void), the jump passes the BARE id (`SessionTarget = SessionId | SubagentAddress`), and the
- * pointer is written by ONE fire-and-forget command line whose reply is never read.
+ * `cwdOf` reads the main session's working directory from the local snapshot so the companion
+ * lands in the SAME project instead of 未分组; `sessions.create` then receives it. The jump passes
+ * the BARE id (`SessionTarget = SessionId | SubagentAddress`), and the pointer is written by ONE
+ * fire-and-forget command line whose reply is never read.
  */
-test('client: one click creates with sessions.create, opens the bare id, then binds', () => {
+test('client: one click inherits cwd, creates, opens the bare id, then binds', () => {
   assert.match(code, /sessions\.create\(/u, 'creation goes through sessions.create (it returns SessionId)')
   assert.doesNotMatch(code, /startSession\(/u, 'startSession returns void — it cannot supply the id to bind')
   assert.match(code, /openSession\(observerSessionId\)/u, 'the jump passes the bare SessionTarget id')
@@ -89,9 +91,24 @@ test('client: one click creates with sessions.create, opens the bare id, then bi
   assert.match(code, /observer-bind/u, 'the pointer is written by the observer-bind line')
 
   const summon = code.slice(code.indexOf('const summon ='), code.indexOf('return h('))
-  const order = ['createSession()', 'openSession(', 'bridge.bind('].map((step) => summon.indexOf(step))
-  assert.ok(order.every((at) => at >= 0), 'the flow is create → open → bind')
-  assert.deepEqual([...order].sort((a, b) => a - b), order, 'the three steps must run in that order')
+  const order = ['cwdOf(', 'createSession(', 'openSession(', 'bridge.bind('].map((step) => summon.indexOf(step))
+  assert.ok(order.every((at) => at >= 0), 'the flow is cwd → create → open → bind')
+  assert.deepEqual([...order].sort((a, b) => a - b), order, 'the steps must run in that order')
+})
+
+/**
+ * v1.0.2 — NO NESTING AND NO RE-ENTRY.
+ *
+ * The chip hides itself inside a companion using a locally remembered id set (no host round trip),
+ * and a MODULE-level latch makes the three seats share one in-flight summon — a per-component
+ * `busy` flag still let the other two seats fire, which is the 无限多开 in the screenshots.
+ */
+test('client: the chip hides inside a companion and the summon is exclusive', () => {
+  assert.match(code, /const companions = readCompanions\(\)/u, 'remembered ids survive a reload')
+  assert.match(code, /if \(companions\.has\(sessionId\)\) return null/u, 'a companion renders no chip')
+  assert.match(code, /companions\.add\(observerSessionId\)/u, 'the new id is remembered before opening')
+  assert.match(code, /^\s*let summoning = false$/mu, 'the latch is module-scoped, not per component')
+  assert.match(code, /if \(summoning\) return/u, 'a second click while one is running is ignored')
 })
 
 test('client: the bind line is fired once and its reply is never read', () => {

@@ -61,19 +61,54 @@ test('observer: summoning without a session is refused, never guessed', async ()
   assert.match(result.text, /没有可绑定的主会话 id/u)
 })
 
-test('observer: a follower gets its pointer and a mission prompt', async () => {
+/**
+ * v1.0.2 — THE MISSION IS STAGED, NOT PUSHED.
+ *
+ * v1.0.1 sent `[副脑启动]` with `sessionController.prompt` the moment the pointer was written,
+ * so a companion opened on a message the user never wrote and could not answer. The mission is
+ * now held in the bindings document and released by the companion's FIRST `agent/pre-step`.
+ */
+test('observer: a follower gets its pointer, and the mission is STAGED (not pushed)', async () => {
   const { tools, prompts, bindingsPath } = boot()
   const created = await tools.get('observer_create').execute({}, { agent: { id: 'main-1' } })
   assert.equal(created.ok, true)
   assert.deepEqual(debugObserverState().bindings, { 'main-1': 'obs-1' })
-  assert.equal(prompts.length, 1, 'the follower is told its role exactly once')
-  assert.match(prompts[0].content[0].text, /副脑启动/u)
+  assert.equal(prompts.length, 0, 'nothing is pushed into the companion — it must open blank')
+  assert.ok(readFileSync(bindingsPath, 'utf8').includes('副脑启动'), 'the mission is held in the document')
 
   const again = await tools.get('observer_create').execute({}, { agent: { id: 'main-1' } })
   assert.equal(again.ok, true)
   assert.match(again.text, /未重复创建/u)
-  assert.equal(prompts.length, 1, 'a second summon does not spawn a second session')
-  assert.ok(readFileSync(bindingsPath, 'utf8').includes('obs-1'))
+})
+
+test('observer: the first real step releases the mission exactly once', async () => {
+  const { tools, listeners, prompts } = boot()
+  await tools.get('observer_create').execute({}, { agent: { id: 'main-1' } })
+  const preStep = listeners.get('agent/pre-step')
+  assert.ok(preStep !== undefined, 'the pre-step listener is registered at mount')
+
+  const first = await preStep({ agent: { id: 'obs-1' } }, async () => ({ messages: [] }))
+  assert.equal(first.messages.length, 1, 'the companion receives its role on the first step')
+  assert.match(first.messages[0].content[0].text, /副脑启动/u)
+
+  const second = await preStep({ agent: { id: 'obs-1' } }, async () => ({ messages: [] }))
+  assert.equal(second.messages.length, 0, 'and never again')
+  assert.equal(prompts.length, 0, 'this channel never pushes a turn of its own')
+})
+
+test('observer: an unrelated session receives nothing', async () => {
+  const { listeners } = boot()
+  const preStep = listeners.get('agent/pre-step')
+  const decision = await preStep({ agent: { id: 'someone-else' } }, async () => ({ messages: [] }))
+  assert.deepEqual(decision.messages, [])
+})
+
+test('observer: a rejected step is passed through untouched', async () => {
+  const { tools, listeners } = boot()
+  await tools.get('observer_create').execute({}, { agent: { id: 'main-1' } })
+  const preStep = listeners.get('agent/pre-step')
+  const rejected = await preStep({ agent: { id: 'obs-1' } }, async () => ({ kind: 'reject' }))
+  assert.equal(rejected.kind, 'reject', 'a rejection is never decorated with a mission')
 })
 
 test('observer: a follower cannot be given a follower of its own', async () => {
@@ -129,8 +164,8 @@ test('observer: an unknown transfer changes nothing', () => {
  * pair: `observer_bind` writes and VERIFIES the pointer, and it refuses the two dishonest cases
  * (missing ids, a companion binding a companion).
  */
-test('observer_bind: writes the pointer, verifies it on disk, and sends the mission', async () => {
-  const { tools, prompts, bindingsPath } = boot()
+test('observer_bind: writes the pointer, verifies it on disk, and STAGES the mission', async () => {
+  const { tools, prompts, bindingsPath, listeners } = boot()
   const bind = tools.get('observer_bind')
   assert.ok(bind !== undefined, 'observer_bind is registered')
 
@@ -138,9 +173,15 @@ test('observer_bind: writes the pointer, verifies it on disk, and sends the miss
   assert.equal(result.ok, true)
   assert.deepEqual(debugObserverState().bindings, { 'main-9': 'obs-9' })
   assert.equal(debugObserverState().reverse['obs-9'], 'main-9')
-  assert.match(readFileSync(bindingsPath, 'utf8'), /main-9/u, 'the pointer reached the file')
-  const mission = prompts[prompts.length - 1]
-  assert.match(mission.content[0].text, /副脑启动/u, 'the companion is told its role')
+  const document = readFileSync(bindingsPath, 'utf8')
+  assert.match(document, /main-9/u, 'the pointer reached the file')
+  assert.match(document, /副脑启动/u, 'and so did the staged mission (one durable fact)')
+  assert.equal(prompts.length, 0, 'nothing is pushed: the companion must open blank')
+
+  const preStep = listeners.get('agent/pre-step')
+  const decision = await preStep({ agent: { id: 'obs-9' } }, async () => ({ messages: [] }))
+  assert.equal(decision.messages.length, 1, 'the role arrives on the first real step')
+  assert.match(decision.messages[0].content[0].text, /副脑启动/u)
 })
 
 test('observer_bind: refuses missing ids and a companion that would bind another', async () => {
@@ -157,16 +198,16 @@ test('observer_bind: refuses missing ids and a companion that would bind another
   assert.equal(chained.ok, false)
   assert.match(chained.text, /副脑会话/u)
 })
-test('observer: the three UI commands are registered and the create one works', async () => {
-  const { commands, prompts } = boot()
-  for (const name of ['observer-state', 'observer-create', 'observer-focus-ack']) {
+test('observer: the five UI commands are registered, and create stages instead of pushing', async () => {
+  const { commands, prompts, tools, listeners } = boot()
+  for (const name of ['observer-bind', 'observer-state', 'observer-create', 'observer-consult', 'observer-focus-ack']) {
     assert.ok(commands.has(name), `${name} is registered`)
   }
 
   const created = await commands.get('observer-create').handler({ rawInput: 'main-cmd', agent: { id: 'main-cmd' } })
   assert.equal(created.kind, 'success')
   assert.match(created.text, /已召唤副脑 obs-1/u)
-  assert.equal(prompts.length, 1)
+  assert.equal(prompts.length, 0, 'the command does not push a turn into the new companion')
 
   const state = JSON.parse((await commands.get('observer-state').handler({})).text)
   assert.deepEqual(state.bindings, { 'main-cmd': 'obs-1' })
@@ -182,4 +223,11 @@ test('observer: the three UI commands are registered and the create one works', 
   assert.equal(acked.kind, 'success')
   const cleared = JSON.parse((await commands.get('observer-state').handler({})).text)
   assert.equal(cleared.focus, null)
+
+  // The client-side plan: the Client creates the session, the Host only records the pointer.
+  const bound = await commands.get('observer-bind').handler({ rawInput: 'main-bind obs-bind' })
+  assert.equal(bound.kind, 'success')
+  assert.ok(tools.get('observer_bind') !== undefined, 'the same logic is reachable as a tool')
+  const mission = await listeners.get('agent/pre-step')({ agent: { id: 'obs-bind' } }, async () => ({ messages: [] }))
+  assert.equal(mission.messages.length, 1, 'the bound companion gets its role on its first step')
 })

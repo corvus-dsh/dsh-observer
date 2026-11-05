@@ -27,7 +27,7 @@ export const name = 'dsh-observer'
  * Client half is cached separately, and "did my build reach the app?" must be answerable
  * without guessing.
  */
-export const VERSION = '1.0.1'
+export const VERSION = '1.0.2'
 console.log(`[dsh-observer] host version ${VERSION}`)
 
 /**
@@ -46,6 +46,18 @@ export const inject = ['tools', 'sessionController']
                                                                                   
      
                                                  
+     
+                                              
+    
+                                                                                       
+                                                                                             
+                                                                                      
+                                                                                             
+                                                                                  
+     
+                                  
+                                                                                      
+                                    
  
 
                              
@@ -55,10 +67,10 @@ export const inject = ['tools', 'sessionController']
                                                     
  
 
-const EMPTY                   = { bindings: {}, reverse: {}, focus: null }
+const EMPTY                   = { bindings: {}, reverse: {}, focus: null, missions: {}, missionsSent: {} }
 
 let bindingsPath = ''
-let state                   = { bindings: {}, reverse: {}, focus: null }
+let state                   = { bindings: {}, reverse: {}, focus: null, missions: {}, missionsSent: {} }
 
 function isRecord(value         )                               {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -71,15 +83,23 @@ function writeAtomic(path        , value         )       {
   renameSync(temp, path)
 }
 
+const EMPTY_STATE = ()                   => ({
+  bindings: {},
+  reverse: {},
+  focus: null,
+  missions: {},
+  missionsSent: {},
+})
+
 function load()       {
   // Start from empty on EVERY load: the module-level state must describe THIS file, and a
   // mount that reuses a previous process-level copy would leak bindings across profiles
   // (and across tests).
-  state = { bindings: {}, reverse: {}, focus: null }
+  state = EMPTY_STATE()
   try {
     const parsed = JSON.parse(readFileSync(bindingsPath, 'utf8'))
     if (!isRecord(parsed)) return
-    const next                   = { bindings: {}, reverse: {}, focus: null }
+    const next = EMPTY_STATE()
     if (isRecord(parsed.bindings)) {
       for (const [main, observer] of Object.entries(parsed.bindings)) {
         if (typeof observer === 'string' && observer.length > 0) next.bindings[main] = observer
@@ -92,6 +112,14 @@ function load()       {
     }
     if (isRecord(parsed.focus) && typeof parsed.focus.sessionId === 'string') {
       next.focus = { sessionId: parsed.focus.sessionId, at: Number(parsed.focus.at) || 0 }
+    }
+    if (isRecord(parsed.missions)) {
+      for (const [observer, text] of Object.entries(parsed.missions)) {
+        if (typeof text === 'string' && text.length > 0) next.missions[observer] = text
+      }
+    }
+    if (isRecord(parsed.missionsSent)) {
+      for (const observer of Object.keys(parsed.missionsSent)) next.missionsSent[observer] = true
     }
     state = next
   } catch {
@@ -252,21 +280,16 @@ export function apply(ctx                   , config                          = 
         : '[副脑启动] 你是一个前置需求分析副脑（尚未绑定任何主会话）。' +
           '职责：帮用户理清需求、指出遗漏与风险，必要时给出 2~3 个方案对比。' +
           '确认方案后，请输出一段可直接粘贴到主会话的最终 Prompt，并在末尾提示用户「复制到主会话开始执行」。'
-    try {
-      await controller.prompt(
-        {
-          requestId: `observer-mission-${Date.now()}`,
-          sessionId: observerSessionId,
-          mode: 'queue',
-          content: [{ type: 'text', text: mission }],
-        },
-        new AbortController().signal,
-      )
-    } catch (error) {
-      // The session exists and (for bind) the pointer is durable: a missing mission message
-      // is cosmetic, so it must not turn a success into a failure.
-      ctx.logger?.warn?.(`[dsh-observer] mission prompt failed: ${String((error       )?.message ?? error)}`)
-    }
+
+    /**
+     * v1.0.2 — STAGE, DO NOT PUSH.
+     *
+     * v1.0.1 called `sessionController.prompt` here, so the companion opened on a `[副脑启动]`
+     * message the user never wrote and could not answer — there was nothing to discuss yet. The
+     * mission is now stored and released by this session's FIRST `agent/pre-step` (see the
+     * listener below), which keeps the new companion a clean blank page until the user speaks.
+     */
+    stageMission(observerSessionId, mission)
 
     return {
       ok: true,
@@ -277,6 +300,58 @@ export function apply(ctx                   , config                          = 
           : `已开启前置磋商副脑 ${observerSessionId}（未绑定主会话）。`,
     }
   }
+
+  /**
+   * Hold the mission for a companion until its first real step.
+   *
+   * Storing it in the same document as the pointer means one durable fact: a companion either
+   * has a pending mission or it does not, and a restart cannot deliver it twice.
+   */
+  function stageMission(observerSessionId        , mission        )       {
+    state.missions[observerSessionId] = mission
+    delete state.missionsSent[observerSessionId]
+    save()
+  }
+
+  /**
+   * Release the mission as the companion's first `agent/pre-step` context, exactly once.
+   *
+   * WHY THIS CHANNEL: writing a log event would collide with the agent loop's step numbering
+   * (the same reason dsh-graft-slice injects through `messages`), and `messages` only shapes the
+   * upcoming request — it does not fabricate a turn the user never started.
+   */
+  const PRE_STEP_EVENT = 'agent/pre-step'
+  ctx.on?.(PRE_STEP_EVENT, async (payload     , next     ) => {
+    const decision = await next()
+    try {
+      const agentId = payload?.agent?.id
+      if (typeof agentId !== 'string' || agentId.length === 0) return decision
+      const mission = state.missions[agentId]
+      if (mission === undefined || state.missionsSent[agentId] === true) return decision
+      if (!isRecord(decision) || decision.kind === 'reject') return decision
+      state.missionsSent[agentId] = true
+      save()
+      ctx.logger?.info?.(`[dsh-observer] releasing the mission for ${agentId}`)
+      const base = Array.isArray(decision.messages) ? decision.messages : []
+      return {
+        ...decision,
+        messages: [
+          ...base,
+          {
+            id: `observer-mission-${agentId}`       ,
+            // Pre-step messages are projected as user/message; the explicit header is what a
+            // pre-step listener can legitimately deliver (matching dsh-graft-slice).
+            role: 'user',
+            content: [{ type: 'text', text: mission }],
+          },
+        ],
+      }
+    } catch (error) {
+      // A listener must never break the step it observes.
+      ctx.logger?.warn?.(`[dsh-observer] mission release failed: ${String((error       )?.message ?? error)}`)
+      return decision
+    }
+  })
 
   /**
    * v1.0.1 — BIND-ONLY ENTRY (the "B plan" for the client).
@@ -313,30 +388,16 @@ export function apply(ctx                   , config                          = 
     if (observerOf(mainSessionId) !== observerSessionId) {
       return { ok: false, observerSessionId, text: `回读校验失败：${written.path} 中没有该绑定` }
     }
-    try {
-      const controller = ctx.get?.('sessionController')
-      if (isRecord(controller) && typeof controller.prompt === 'function') {
-        await controller.prompt(
-          {
-            requestId: `observer-mission-${Date.now()}`,
-            sessionId: observerSessionId,
-            mode: 'queue',
-            content: [
-              {
-                type: 'text',
-                text:
-                  `[副脑启动] 你被绑定为会话 ${mainSessionId} 的观察者（跟随者）。` +
-                  '职责：读主会话日志、澄清需求、以确认卡形式提出方案；不直接改代码。' +
-                  '主会话转生后你会收到新的绑定目标，身份不变。',
-              },
-            ],
-          },
-          new AbortController().signal,
-        )
-      }
-    } catch (error) {
-      ctx.logger?.warn?.(`[dsh-observer] mission prompt failed: ${String((error       )?.message ?? error)}`)
-    }
+    /**
+     * v1.0.2: stage the mission instead of pushing it. The companion opens as a clean blank
+     * page and receives its role the moment the user actually speaks in it.
+     */
+    stageMission(
+      observerSessionId,
+      `[副脑启动] 你被绑定为会话 ${mainSessionId} 的观察者（跟随者）。` +
+        '职责：读主会话日志、澄清需求、以确认卡形式提出方案；不直接改代码。' +
+        '主会话转生后你会收到新的绑定目标，身份不变。',
+    )
     return { ok: true, observerSessionId, text: `已绑定 ${mainSessionId} → ${observerSessionId}。` }
   }
 
