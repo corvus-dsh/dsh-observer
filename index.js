@@ -682,7 +682,9 @@ export function apply(ctx                   , config                          = 
   ctx.tools?.register({
     name: 'observer_create',
     description:
-      'Summon a companion observer for a session: creates an ordinary session and records the follower pointer. ' +
+      'Summon a companion observer (副脑) for the CURRENT session. The Host resolves the session\'s own ' +
+      'working directory, creates the companion THERE, gives it a [系统设定] background, titles it ' +
+      '[副脑] … and records the follower pointer. Returns the new session id so the caller can open it. ' +
       'The observer is never retired and never sliced — a transfer only rewrites its pointer.',
     parameters: {
       type: 'object',
@@ -698,6 +700,7 @@ export function apply(ctx                   , config                          = 
         type: 'object',
         properties: {
           ok: { type: 'boolean' },
+          sessionId: { type: 'string' },
           observerSessionId: { type: 'string' },
           text: { type: 'string' },
         },
@@ -706,10 +709,29 @@ export function apply(ctx                   , config                          = 
       },
       render: (_args         , value     ) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
+    /**
+     * v1.1.0 — PLAN B: THE TOOL IS THE ENTRY POINT.
+     *
+     * The UI chip is gone (the gateway makes every command broadcast, so a button could never be
+     * silent and a client-side create could never place the session). The MODEL calls this tool
+     * instead: a tool result travels straight back to the model, so the new id is readable — which
+     * is exactly the property the command channel lacks.
+     *
+     * `spawnCompanion` does the real work: resolve the main session's own cwd, create the companion
+     * there, title it, write the setting as a `developer/message` (context, so the agent stays
+     * asleep) and record the pointer. The id is answered under BOTH `sessionId` and
+     * `observerSessionId` so either name is usable by the caller.
+     */
     execute: async (args                             , exec     ) => {
       const explicit = typeof args?.mainSessionId === 'string' ? args.mainSessionId.trim() : ''
       const mainSessionId = explicit.length > 0 ? explicit : typeof exec?.agent?.id === 'string' ? exec.agent.id : ''
-      return createObserver(mainSessionId, 'bind')
+      const spawned = await spawnCompanion(mainSessionId)
+      return {
+        ok: spawned.ok,
+        sessionId: spawned.sessionId,
+        observerSessionId: spawned.sessionId,
+        text: spawned.text,
+      }
     },
   })
 

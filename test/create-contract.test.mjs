@@ -31,7 +31,9 @@ function boot(bindingsPath) {
       if (name === 'commands') return { register: (definition) => commands.set(definition.name, definition) }
       if (name === 'sessions') {
         return {
+          /** A live session: the header carries the cwd Plan B resolves, append captures the setting. */
           get: (id) => ({
+            header: { cwd: 'D:/test/project' },
             append: (type, data) => {
               appends.push({ id, type, data })
             },
@@ -128,7 +130,14 @@ test('observer_create: a failed rename and an unwritable log are both reported',
   const ctx = {
     get(name) {
       if (name === 'commands') return { register: () => {} }
-      // No `sessions` service and no `sessionPersistence`: both write channels are unavailable.
+      /**
+       * The MAIN session carries a header, so Plan B can resolve its cwd. The CREATED companion has
+       * neither a live `append` nor a `sessionPersistence`, so the setting cannot be written and the
+       * reply has to say so.
+       */
+      if (name === 'sessions') {
+        return { get: (id) => (id === 'main-broken' ? { header: { cwd: 'D:/test/project' } } : {}) }
+      }
       if (name === 'sessionController') {
         return {
           async create() {
@@ -149,6 +158,7 @@ test('observer_create: a failed rename and an unwritable log are both reported',
 
   const reply = await tools.get('observer_create').execute({}, { agent: { id: 'main-broken' } })
   assert.equal(reply.ok, true, 'the pointer IS durable, so the summon itself succeeded')
+  assert.equal(reply.sessionId, 'obs-broken', 'and the id is still answered to the model')
   assert.match(reply.text, /部分步骤未完成/u, 'but the partial failure is stated, not hidden')
   assert.match(reply.text, /rename refused/u)
   assert.match(reply.text, /设定写入失败/u)

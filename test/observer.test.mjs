@@ -30,7 +30,9 @@ function boot() {
       }
       if (name === 'sessions') {
         return {
+          /** A live session: the header carries the cwd Plan B resolves, append captures the setting. */
           get: (id) => ({
+            header: { cwd: 'D:/test/project' },
             append: (type, data) => {
               appends.push({ id, type, data })
             },
@@ -148,7 +150,8 @@ test('observer: a follower gets its pointer, a title, and a PHYSICALLY written s
 
   const again = await tools.get('observer_create').execute({}, { agent: { id: 'main-1' } })
   assert.equal(again.ok, true)
-  assert.match(again.text, /未重复创建/u)
+  assert.equal(again.sessionId, 'obs-1', 'the existing companion id is answered, so the caller can open it')
+  assert.match(again.text, /已有副脑/u)
   assert.equal(appends.length, 1, 'a second summon does not write the setting twice')
 })
 

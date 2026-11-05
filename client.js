@@ -1,397 +1,101 @@
 /**
- * dsh-observer — the Client half. DELIBERATELY MINIMAL (v1.0.5).
+ * dsh-observer — the Client half. ASSIST-ONLY (v1.1.0, Plan B).
  *
- * WHAT THIS FILE DOES, IN ORDER:
- *   1. prints a cache probe (first statement);
- *   2. registers one chip in three seats;
- *   3. on click: read the main session's cwd → `sessions.create` → `uiWorkspace.openSession` →
- *      ONE bind line whose success reply is EMPTY (so it renders no row).
- *   4. listens for `graft/session-transferred` and opens the new main session from the event.
+ * WHY THERE IS NO BUTTON ANY MORE
  *
- * THE ONLY HOST CALL IN THIS FILE IS THE BIND LINE, AND IT EXISTS FOR ONE CLICK.
- * The chip keeps no view of the binding table: a companion is recognised from its own `[副脑]`
- * title in the local session snapshot, so there is no state read, no timer, no enumeration and no
- * waiting loop anywhere in this file.
+ * Every UI-driven creation path failed for a structural reason, documented in
+ * 副脑插件架构复盘与底层缺陷报告-2026-11-05.md:
  *
- * WHY `sessions.create` AND NOT `uiWorkspace.startSession`: `startSession()` returns void — it
- * opens a blank session but hands back no id. `sessions.create(opts)` returns
- * `Promise<SessionId>`, which is exactly what a caller needs in order to open and then bind.
+ *   D1 — a third-party Client half has NO plugin-owned Remote: it cannot ask THIS plugin to do
+ *        anything. The only generic client→host channel is `commands.execute`.
+ *   D2 — `commands.execute` is BROADCAST: every invocation renders a row in the conversation, and
+ *        the reply is wrapped unpredictably. A button therefore cannot be silent, and cannot read
+ *        the id it needs.
+ *   D3 — session PLACEMENT (workspace/cwd) is only authoritatively known to the Host, and the
+ *        Host does not know what the user intended. A client-side create lands in no workspace —
+ *        the "选择工作区" empty draft.
+ *
+ * The companion is therefore summoned by the MODEL through the `observer_create` TOOL. A tool
+ * result travels straight back to the model, so the id is readable — the exact property the
+ * command channel lacks. The Host does the work: it resolves the main session's own cwd, creates
+ * the companion there, titles it `[副脑] 跟随 …`, and writes the setting as a `developer/message`
+ * (context, so the agent stays asleep).
+ *
+ * WHAT THIS FILE STILL DOES — one thing, and it does not create anything:
+ *   it listens for `graft/session-transferred` and opens the new main session, so a handoff moves
+ *   the window without the user hunting for the successor in the sidebar.
+ *
+ * HONEST LIMIT: that listener only fires if the harness bridges Host plugin events to the Client.
+ * If it does not, this module is inert and navigation stays manual. Nothing else depends on it.
  */
 
-window.__OBSERVER_LOADED__ = '1.0.9'
-console.log('%c[dsh-observer] FUCK CACHE 1.0.9 — host creates, client only asks', 'color:#16a34a;font-weight:bold')
+window.__OBSERVER_LOADED__ = '1.1.0'
+console.log('%c[dsh-observer] FUCK CACHE 1.1.0 — no button; the model summons, the host creates', 'color:#16a34a;font-weight:bold')
 
 window.__ModuleLoader__.load({
   id: 'dsh-observer',
   factory(require, styles, host) {
-    const React = require('react')
-    const h = React.createElement
-
-    const CHIP = {
-      border: '1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.35))',
-      background: 'transparent',
-      borderRadius: '999px',
-      padding: '3px 10px',
-      font: 'inherit',
-    }
-
     /**
-     * v1.0.4 — HOW THIS PAGE KNOWS IT IS LOOKING AT A COMPANION.
+     * Services used:
+     *   `uiWorkspace.openSession`  — the jump after a transfer
+     *   `slots`                    — still declared so the half mounts even with no seats
+     *   `remote`                   — the namespace probe below
      *
-     * Two sources, neither of which sends a request:
-     *
-     *   1. THE TITLE, read from the LOCAL session snapshot. The Host renames every companion to
-     *      `[副脑] 跟随 …`, so the marker is durable session metadata rather than page state. The
-     *      scan is deliberately structural (walk the summary's strings) because the field that
-     *      holds a title is a projection the app owns, not this plugin.
-     *   2. THE IN-MEMORY SET of ids created in this page. The rename lands slightly AFTER the
-     *      jump, so for a moment the fresh companion has no title yet; the set covers exactly that
-     *      window. It is deliberately NOT localStorage — a stale entry there could hide the button
-     *      in a session that is not a companion at all.
-     *
-     * `summoning` is a MODULE-level latch rather than component state: three seats render this
-     * chip, so a per-component `busy` flag still let the other two fire — that is the 无限多开 the
-     * screenshots showed.
+     * `remote.session` and `remote.commands` are NOT needed any more: this file sends nothing and
+     * renames nothing. Declaring a key that is unused is how the earlier `cannot get property
+     * "remote.session" without inject` happened, so the list is kept honest instead.
      */
-    const companions = new Set()
-    let summoning = false
-
-    /** Every string reachable inside a value, so a title is found wherever the app keeps it. */
-    const containsMarker = (value, depth = 0) => {
-      if (depth > 3 || value === null || value === undefined) return false
-      if (typeof value === 'string') return value.includes('[副脑]')
-      if (Array.isArray(value)) return value.some((item) => containsMarker(item, depth + 1))
-      if (typeof value === 'object') return Object.values(value).some((item) => containsMarker(item, depth + 1))
-      return false
-    }
-
-    const makeBridge = (ctx) => {
-      const get = (key) => {
-        try {
-          return ctx.get ? ctx.get(key) : undefined
-        } catch (error) {
-          console.error(`[dsh-observer] service ${key} unavailable:`, String((error && error.message) || error))
-          return undefined
-        }
-      }
-
-      /**
-       * The local session snapshot — read synchronously, never requested.
-       *
-       * Used for two facts that are already in the client store: the main session's `cwd` (so a
-       * companion lands in the same project instead of 未分组) and the companion marker in a
-       * session's title (so the chip hides itself without asking the Host anything).
-       */
-      const snapshotOf = (sessionId) => {
-        try {
-          const sessions = get('sessions')
-          const list = sessions && sessions.list
-          const snapshot = list && typeof list.getSnapshot === 'function' ? list.getSnapshot() : undefined
-          return snapshot && snapshot.byId ? snapshot.byId[sessionId] : undefined
-        } catch (error) {
-          console.error('[dsh-observer] session snapshot read failed:', String((error && error.message) || error))
-          return undefined
-        }
-      }
-
-      /**
-       * v1.0.9 — NO LOCATION LOGIC LIVES HERE ANY MORE.
-       *
-       * The path-guessing chain (`PATH_SHAPED` / `firstPathIn` / `locationOf`) is DELETED. It existed
-       * only because the client was creating the session itself, and every variant of it failed on
-       * this build: the local summary carries no `cwd`, so the create went out bare and the user
-       * landed on the "选择工作区" empty draft.
-       *
-       * The Host owns placement now: it reads the MAIN session's own header (`session.header.cwd`,
-       * or the `workingDirectory` service) and creates the companion there. The client only asks.
-       */
-
-      /** v1.0.4: the Host titles every companion `[副脑] 跟随 …`; that title is the marker. */
-      const isCompanion = (sessionId) => {
-        if (sessionId.length === 0) return false
-        if (companions.has(sessionId)) return true
-        const summary = snapshotOf(sessionId)
-        return summary !== undefined && containsMarker(summary)
-      }
-
-      /** Every visible session id, from the LOCAL snapshot (one read per explicit action). */
-      const idsOf = () => {
-        try {
-          const sessions = get('sessions')
-          const list = sessions && sessions.list
-          const snapshot = list && typeof list.getSnapshot === 'function' ? list.getSnapshot() : undefined
-          return Array.isArray(snapshot?.ids) ? [...snapshot.ids] : []
-        } catch {
-          return []
-        }
-      }
-
-      /**
-       * v1.0.9 — THE HOST CREATES THE COMPANION. THE CLIENT ONLY ASKS.
-       *
-       * `sessions.create` is GONE from this file. On this build the client cannot place a session in
-       * a workspace (the local summary carries no `cwd`), so the create went out bare and the user
-       * landed on the "选择工作区" empty draft. The HOST can do it properly: it reads the main
-       * session's own header for the authoritative `cwd`, creates the companion there, titles it,
-       * writes the setting physically and records the pointer.
-       *
-       * The request travels over the ONE generic client→host channel this Host offers a third-party
-       * half — a command, which IS broadcast (one row per summon; the user accepted that cost). The
-       * new id comes back two ways: the command's text, and, if the gateway wraps it, a single
-       * before/after diff of the local session list after one settle.
-       */
-      const spawnOnHost = async (mainSessionId) => {
-        const remote = get('remote')
-        const commands = remote && remote.commands
-        if (!commands || typeof commands.execute !== 'function') {
-          return { ok: false, sessionId: '', text: 'remote.commands 不可用（inject 未生效）' }
-        }
-        const before = idsOf()
-        let replyText = ''
-        try {
-          const settled = await commands.execute(mainSessionId, `/observer-spawn ${mainSessionId}`, [], undefined)
-          const node = settled && settled.result !== undefined ? settled.result : settled
-          if (node && typeof node.text === 'string') replyText = node.text.trim()
-          console.log('[dsh-observer] spawn reply:', JSON.stringify(settled))
-        } catch (error) {
-          return { ok: false, sessionId: '', text: `请求宿主创建失败：${String((error && error.message) || error)}` }
-        }
-
-        // The host answers with the bare id; a wrapped reply leaves it unreadable, so the list diff
-        // is the reliable second source. One settle, then ONE read — not a poll.
-        const looksLikeId = /^session-[0-9a-f-]{6,}$/u.test(replyText)
-        if (looksLikeId) return { ok: true, sessionId: replyText, text: '' }
-
-        await new Promise((resolve) => setTimeout(resolve, 400))
-        const fresh = idsOf().filter((id) => before.indexOf(id) < 0)
-        if (fresh.length === 0) {
-          return { ok: false, sessionId: '', text: replyText.length > 0 ? replyText : '宿主没有创建出新的会话' }
-        }
-        console.log(`[dsh-observer] host created ${fresh.join(', ')}`)
-        return { ok: true, sessionId: fresh[0], text: '' }
-      }
-
-      /** `openSession(target: SessionTarget)` — SessionTarget is a BARE id string. */
-      const openSession = (id) => {
-        const workspaceUi = get('uiWorkspace')
-        if (!workspaceUi || typeof workspaceUi.openSession !== 'function') return false
-        try {
-          workspaceUi.openSession(id)
-          return true
-        } catch (error) {
-          console.error('[dsh-observer] openSession failed:', String((error && error.message) || error))
-          return false
-        }
-      }
-
-      /**
-       * Mark the companion by RENAMING it — a plain Remote call, never a command.
-       *
-       * WHY A RENAME AND NOT A COMMAND: `commands.execute` is BROADCAST, so every invocation is
-       * rendered as a row in the conversation whatever the handler returns. An empty reply removes
-       * the text but not the row, which is exactly the `observer-bind:` bubble the user kept
-       * seeing. A Remote call prints nothing.
-       *
-       * WHY `remote.session` IS IN `inject`: without that key the access throws
-       * `cannot get property "remote.session" without inject` — the same failure
-       * dsh-graft-slice hit. It is declared in the plugin's inject list for this reason.
-       */
-      const markCompanion = async (mainSessionId, observerSessionId) => {
-        const title = `[副脑] 跟随 ${mainSessionId}`
-        const remote = get('remote')
-        if (!remote) return { ok: false, text: 'remote 服务不可用（inject 未生效）' }
-        const namespace = remote.session || remote.sessionController
-        if (!namespace || typeof namespace.rename !== 'function') {
-          const keys = remote && typeof remote === 'object' ? Object.keys(remote).join(',') : '(none)'
-          console.error('[dsh-observer] remote namespaces:', keys)
-          return { ok: false, text: `remote.session.rename 不可用（remote 上有：${keys}）` }
-        }
-        try {
-          await namespace.rename({ sessionId: observerSessionId, title })
-          console.log(`[dsh-observer] marked ${observerSessionId} as "${title}"`)
-          return { ok: true, text: '' }
-        } catch (error) {
-          const detail = String((error && error.message) || error)
-          console.error('[dsh-observer] rename failed:', detail)
-          return { ok: false, text: `重命名失败：${detail}` }
-        }
-      }
-
-      return { get, isCompanion, openSession, spawnOnHost }
-    }
-
-    function ObserverChip({ sessionId, bridge }) {
-      const [busy, setBusy] = React.useState(false)
-      const [note, setNote] = React.useState('')
-
-      /**
-       * ONE click → create (in the main session's cwd) → open → bind.
-       *
-       * Open before binding so the user lands in the companion even if the bind fails; report
-       * the failure in the chip instead of pretending the summon succeeded.
-       *
-       * `summoning` is the module latch, not `busy`: three seats share this component, so the
-       * state flag alone still allowed the other seats to fire and produce several companions.
-       */
-      const summon = async () => {
-        console.log('[dsh-observer] click: summoning=%s session=%s', summoning, sessionId)
-        if (summoning) {
-          setNote('上一次召唤还在进行中，请稍候')
-          return
-        }
-        summoning = true
-        setBusy(true)
-        setNote('')
-        try {
-          const spawned = await bridge.spawnOnHost(sessionId)
-          console.log('[dsh-observer] spawn result:', JSON.stringify(spawned))
-          if (!spawned.ok) {
-            setNote(`召唤失败：${spawned.text}`)
-            return
-          }
-          const observerSessionId = spawned.sessionId
-          // Remember it before opening: the chip inside the fresh companion must not appear in the
-          // moment between the jump and the title landing.
-          companions.add(observerSessionId)
-          const opened = bridge.openSession(observerSessionId)
-          console.log('[dsh-observer] opened:', opened)
-          if (!opened) setNote(`副脑 ${observerSessionId} 已创建；请在左侧会话列表中选择它`)
-        } catch (error) {
-          /**
-           * v1.0.7 — NOTHING FAILS SILENTLY.
-           *
-           * An exception here used to leave the chip unchanged: no note, no log, no reaction —
-           * the worst possible symptom, because the user cannot tell it apart from a dead button.
-           * The catch names the step that threw, and the message is shown AND logged.
-           */
-          const detail = String((error && error.message) || error)
-          console.error('[dsh-observer] summon threw:', detail, error)
-          setNote(`召唤失败：${detail}`)
-        } finally {
-          summoning = false
-          setBusy(false)
-        }
-      }
-
-      return h(
-        'div',
-        { style: { display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 2px', fontSize: '12px', opacity: 0.85 } },
-        [
-          h(
-            'button',
-            {
-              key: 'b',
-              type: 'button',
-              disabled: busy,
-              style: { ...CHIP, cursor: busy ? 'default' : 'pointer' },
-              title: `为主会话 ${sessionId} 召唤副脑`,
-              onClick: summon,
-            },
-            busy ? '🧠 召唤中…' : '🧠 召唤副脑',
-          ),
-          note.length > 0 ? h('span', { key: 'n', style: { color: '#b91c1c' } }, note) : null,
-        ],
-      )
-    }
-
-    /**
-     * Renders nothing when there is no session id, and nothing inside a COMPANION.
-     *
-     * The first rule keeps an empty-id call (which produced `gateway/internal`) impossible. The
-     * second is the no-nesting rule the Host also enforces: a companion that summons a companion
-     * chains forever. It is answered from local data only — the session's own `[副脑]` title plus
-     * the ids this page created — so no request is made and the transcript stays clean.
-     */
-    const makeEntry = (bridge) => (props) => {
-      try {
-        const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
-        if (sessionId.length === 0) return null
-        if (bridge.isCompanion(sessionId)) return null
-        return h(ObserverChip, { sessionId, bridge })
-      } catch (error) {
-        const message = String((error && error.message) || error)
-        console.error('[dsh-observer] entry crashed:', message)
-        return h('span', { style: { color: '#b91c1c', fontSize: '12px' } }, `[Observer Error] ${message}`)
-      }
-    }
-
     return {
-      /**
-       * Service keys actually available on this Client half.
-       *
-       * `remote.session` IS one of them: it is the namespace the marking rename travels through,
-       * and without the key in this array the access throws `cannot get property "remote.session"
-       * without inject` — the failure dsh-graft-slice documents. `remote.commands` is kept only so
-       * the contract stays explicit; no command is ever sent.
-       */
-      inject: ['slots', 'sessions', 'uiWorkspace', 'remote', 'remote.commands', 'remote.session'],
-      apply(ctx) {
-        /**
-         * v1.0.7 — MOUNTING FAILS LOUDLY.
-         *
-         * If this throws, the seats are never registered and the user sees a dead button with no
-         * explanation. The catch prints the reason and re-throws after logging, so a broken mount
-         * is visible in the console instead of being inferred from silence.
-         */
-        try {
-          return mount(ctx)
-        } catch (error) {
-          console.error('[dsh-observer] MOUNT FAILED:', String((error && error.message) || error), error)
-          throw error
-        }
+      inject: ['slots', 'uiWorkspace', 'remote'],
 
-        function mount(ctx) {
-        const bridge = makeBridge(ctx)
-        const seats = [
-          { name: 'conversation.chat.turnTail', id: 'observer-turntail', order: 60 },
-          { name: 'conversation.input.left', id: 'observer-composer', order: 60 },
-          { name: 'sidebar.footer.action', id: 'observer-sidebar', order: 60 },
-        ]
-        for (const seat of seats) {
+      apply(ctx) {
+        const get = (key) => {
           try {
-            ctx.slots.inject(seat.name, () => {
-              ctx.slots.register({ name: seat.name, id: seat.id, order: seat.order, label: () => '副脑' }, makeEntry(bridge))
-              return () => {}
-            })
+            return ctx.get ? ctx.get(key) : undefined
           } catch (error) {
-            console.error(`[dsh-observer] ${seat.name} registration failed:`, String((error && error.message) || error))
+            console.error(`[dsh-observer] service ${key} unavailable:`, String((error && error.message) || error))
+            return undefined
           }
         }
-        console.log('[dsh-observer] client seats registered (turntail, composer, sidebar)')
 
-        /**
-         * v1.0.4 — FOCUS PULL, EVENT DRIVEN.
-         *
-         * A handoff announces `graft/session-transferred { sourceSessionId, newSessionId }`. When
-         * that event reaches this half, open the new main session directly — no poll, no state
-         * read, no lookup.
-         *
-         * HONEST LIMIT: this listener only fires if the harness bridges Host plugin events to the
-         * Client. If it does not, the listener is inert and the user navigates by hand; nothing
-         * else depends on it, and `ctx.on` is probed so a host without an event bus cannot break
-         * registration.
-         */
+        /** `openSession(target: SessionTarget)` — SessionTarget is a BARE id string. */
+        const openSession = (id) => {
+          const workspaceUi = get('uiWorkspace')
+          if (!workspaceUi || typeof workspaceUi.openSession !== 'function') {
+            console.error('[dsh-observer] uiWorkspace.openSession 不可用')
+            return false
+          }
+          try {
+            workspaceUi.openSession(id)
+            return true
+          } catch (error) {
+            console.error('[dsh-observer] openSession failed:', String((error && error.message) || error))
+            return false
+          }
+        }
+
         try {
+          /**
+           * FOCUS PULL, EVENT DRIVEN. A handoff announces `graft/session-transferred`; when that
+           * reaches this half, open the new main session — no poll, no state read, no lookup.
+           */
           if (typeof ctx.on === 'function') {
             ctx.on('graft/session-transferred', (payload) => {
               try {
                 const newSessionId = typeof payload?.newSessionId === 'string' ? payload.newSessionId : ''
                 if (newSessionId.length === 0) return
-                bridge.openSession(newSessionId)
+                openSession(newSessionId)
                 console.log(`[dsh-observer] transfer seen; opened ${newSessionId}`)
               } catch (error) {
                 console.error('[dsh-observer] transfer handler failed:', String((error && error.message) || error))
               }
             })
-            console.log('[dsh-observer] listening for graft/session-transferred')
+            console.log('[dsh-observer] listening for graft/session-transferred (no UI seats: Plan B)')
           }
         } catch (error) {
           console.error('[dsh-observer] could not subscribe to the transfer event:', String((error && error.message) || error))
         }
-        }
       },
-      __makeEntryForTest: makeEntry,
-      __makeBridgeForTest: makeBridge,
     }
   },
 })
