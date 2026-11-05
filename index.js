@@ -27,7 +27,7 @@ export const name = 'dsh-observer'
  * Client half is cached separately, and "did my build reach the app?" must be answerable
  * without guessing.
  */
-export const VERSION = '1.2.0'
+export const VERSION = '1.2.1'
 console.log(`[dsh-observer] host version ${VERSION}`)
 
 /**
@@ -582,6 +582,75 @@ export function apply(ctx                   , config                          = 
   }
 
   /**
+   * v1.2.1 — THE ARSENAL: ASK dsh-memory FOR THE SKILLS THAT FIT THIS PLAN.
+   *
+   * An incubated main should not start from zero experience. Before the plan is handed over, the
+   * observer asks `dsh-memory` what it already knows about this kind of work and packs the answer
+   * into the same `developer/message`. That turns the injected context into "the plan" plus "the
+   * weapons and the known traps".
+   *
+   * HOW IT ASKS: `tools.execute` with `memory_search`. That is the same registry the model calls,
+   * so no private API is invented, and a profile WITHOUT dsh-memory simply reports `UNKNOWN_TOOL`
+   * — which is treated as "nothing remembered", not as a failure of the incubation.
+   *
+   * WHY `semantic:false`: the semantic pass needs an LLM round trip inside a tool call that is
+   * already creating a session. Lexical recall is instant and deterministic; a missing skill is a
+   * smaller cost than a stalled incubation. It is also the mode that works when the adjudicator's
+   * model is rate-limited, which is exactly when a handoff is most likely to be attempted.
+   *
+   * The whole call is bounded and best-effort: any failure logs and returns empty, because losing
+   * the arsenal must never cost the user their main session.
+   */
+  const findArsenal = async (
+    query        ,
+    workspace        ,
+  )                                                         => {
+    const tools = ctx.get?.('tools')
+    if (!isRecord(tools) || typeof tools.execute !== 'function') {
+      return { ok: false, text: '', detail: 'tools 服务不可用' }
+    }
+    const trimmed = query.trim()
+    if (trimmed.length === 0) return { ok: false, text: '', detail: '方案为空，跳过检索' }
+    try {
+      const result = await tools.execute({
+        callId: `observer-memory-${Date.now()}`       ,
+        name: 'memory_search',
+        arguments: {
+          // The plan is long; the first 400 chars carry the intent that matters for recall.
+          query: trimmed.slice(0, 400),
+          semantic: false,
+          ...(workspace.length > 0 ? { workspace } : {}),
+        },
+        signal: new AbortController().signal,
+      })
+      if (!isRecord(result) || result.isError === true) {
+        const detail = isRecord(result) && isRecord(result.error) ? String(result.error.message ?? '') : '检索返回错误'
+        return { ok: false, text: '', detail }
+      }
+      const value = result.value
+      if (!isRecord(value)) return { ok: false, text: '', detail: '检索结果为空' }
+      const hint = typeof value.hint === 'string' ? value.hint.trim() : ''
+      if (hint.length === 0) return { ok: false, text: '', detail: '没有命中任何技能或负知识' }
+      return { ok: true, text: hint, detail: '' }
+    } catch (error) {
+      // UNKNOWN_TOOL lands here on a profile without dsh-memory: absence, not failure.
+      return { ok: false, text: '', detail: String((error       )?.message ?? error) }
+    }
+  }
+
+  /** Compose the context an incubated main wakes up with: the plan, then the arsenal. */
+  const composeMainBriefing = (plan        , arsenal        )         => {
+    if (arsenal.length === 0) return plan
+    return (
+      `${plan}\n\n` +
+      '---\n' +
+      '[记忆调度] 以下来自 dsh-memory 的既有经验，按本方案的意图自动检索所得：\n' +
+      '作用有两层 —— 复用已验证的做法，避开记录在案的坑。若某条与当前代码库不符，以实际代码为准。\n\n' +
+      arsenal
+    )
+  }
+
+  /**
    * The role text. `[系统设定]` is the header a developer message carries so the model reads it as
    * standing context rather than as an instruction the user typed.
    */
@@ -834,8 +903,17 @@ export function apply(ctx                   , config                          = 
       return { ok: false, sessionId: mainSessionId, text: `绑定表写入失败：${written.error}` }
     }
 
-    // The plan becomes standing context for the new main.
-    const injected = await injectSetting(mainSessionId, plan)
+    // v1.2.1 — ask dsh-memory what this plan already has answers for, BEFORE handing it over.
+    const arsenal = await findArsenal(plan, located.cwd)
+    ctx.logger?.info?.(
+      arsenal.ok
+        ? `[dsh-observer] arsenal for the incubated main: ${arsenal.text.length} chars of skills/negatives`
+        : `[dsh-observer] no arsenal: ${arsenal.detail}`,
+    )
+    const briefing = composeMainBriefing(plan, arsenal.ok ? arsenal.text : '')
+
+    // The briefing becomes standing context for the new main: the plan, plus the weapons.
+    const injected = await injectSetting(mainSessionId, briefing)
     if (!injected.ok) problems.push(`方案注入失败（${injected.detail}）`)
 
     // Title both halves so the sidebar says which is which, and so the client's `[副脑]` marker
