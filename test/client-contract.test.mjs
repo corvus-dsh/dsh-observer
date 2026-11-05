@@ -1,6 +1,10 @@
 /**
  * dsh-observer — the Client half is plain ESM, so these assertions are the only guard
  * `node --test` can offer. Every rule below is written from a specific failure.
+ *
+ * v1.0.9 ARCHITECTURE: the CLIENT NO LONGER CREATES SESSIONS AT ALL. It asks the Host over the one
+ * generic client→host channel this Host offers a third-party half (a command, which is broadcast —
+ * one row per summon), then opens the id it is given.
  */
 
 import test from 'node:test'
@@ -15,13 +19,6 @@ const bundle = readFileSync(join(here, '..', 'client.js'), 'utf8')
 /** Comments are stripped for the "must not appear" assertions: this file documents the bans. */
 const code = bundle.replace(/\/\*[\s\S]*?\*\//gu, '').replace(/(^|[^:])\/\/[^\n]*/gu, '$1')
 
-/**
- * THE CACHE PROBE MUST BE THE FIRST STATEMENT.
- *
- * Three restarts changed nothing on screen at one point. A marker every later diagnostic depends
- * on has to be unconditional and first: if the page does not print it, the file being served is
- * not this file.
- */
 test('client: the cache probe is the first statement and sets a window marker', () => {
   const firstStatement = code.split('\n').find((line) => line.trim().length > 0 && !line.trim().startsWith('*'))
   assert.match(firstStatement, /window\.__OBSERVER_LOADED__/u, `the probe must run first, found: ${firstStatement}`)
@@ -31,123 +28,64 @@ test('client: the cache probe is the first statement and sets a window marker', 
 
 test('client: registered through __ModuleLoader__.load with a factory and the PLAIN id', () => {
   assert.match(bundle, /window\.__ModuleLoader__\.load\(/u, 'the module registers itself with the loader')
-  /**
-   * v0.1.14 renamed the id to `dsh-observer-v14` (and served a versioned file) to defeat a cache;
-   * the next start died with `desktop welcome: Web authentication failed`.
-   */
   assert.match(bundle, /^\s*id:\s*'dsh-observer',$/mu, 'the module id is the plain package name')
   assert.doesNotMatch(bundle, /id:\s*'dsh-observer-v\d+/u, 'a versioned id broke Web authentication')
   assert.match(bundle, /factory\s*\(\s*require\s*,\s*styles\s*,\s*host\s*\)/u, 'the factory form is mandatory')
 })
 
-/**
- * v1.0.1 — THE SERVICE SET FOLLOWS THE NEW PLAN.
- *
- * `sessions` creates (and returns an id), `uiWorkspace` opens, `remote.commands` fires the
- * fire-and-forget bind line. There is NO `tools` service on the Client half of this host.
- */
-test('client: the plugin object injects exactly the services the minimal flow needs', () => {
+test('client: the plugin object injects every service the flow needs', () => {
   const matches = [...bundle.matchAll(/inject:\s*\[([^\]]*)\]/gu)]
   assert.ok(matches.length > 0, 'the plugin object declares inject')
   const keys = matches[matches.length - 1][1]
     .split(',')
     .map((part) => part.trim().replace(/^['"]|['"]$/gu, ''))
     .filter(Boolean)
-  for (const required of ['slots', 'sessions', 'uiWorkspace', 'remote', 'remote.commands']) {
+  for (const required of ['slots', 'sessions', 'uiWorkspace', 'remote', 'remote.commands', 'remote.session']) {
     assert.ok(keys.includes(required), `inject must include the SERVICE key '${required}'`)
   }
   assert.equal(keys.some((key) => key.startsWith('@')), false, 'package names do not grant service access')
 })
 
 /**
- * v1.0.6 — NO STATE READ, NO POLL, NO COMMAND CHANNEL, NO ENUMERATION.
+ * v1.0.9 — THE CLIENT NEVER CREATES A SESSION.
  *
- * `sessions.list.getSnapshot()` IS allowed: a synchronous read of the LOCAL store. An actual list
- * CALL is not. `remote.session.rename` IS allowed — a plain Remote call, not a command, so it
- * prints no transcript row (that is the whole point of v1.0.6).
+ * Every client-side way of creating one failed to place it in a workspace on this build (`cwd` is
+ * absent from the local summary), which is exactly the "选择工作区" empty draft the user kept
+ * landing on. Creation belongs to the Host, which reads the MAIN session's own header.
  */
-test('client: no state read, no polling, no command channel, no enumeration', () => {
-  assert.doesNotMatch(code, /observer-state|observer-create/u, 'the polling commands are gone entirely')
-  assert.doesNotMatch(code, /setInterval/u, 'no repeating timer — polling is what flooded the transcript')
-  assert.doesNotMatch(code, /sessions\.list\(/u, 'no local list CALL is used for state')
-  assert.doesNotMatch(code, /readSessions/u, 'the read-once guard is gone with the read it guarded')
-  assert.doesNotMatch(code, /tools\.execute/u, 'there is no client tools service on this host')
-  /**
-   * THE BROADCAST CHANNEL IS GONE. `commands.execute` renders a row in the conversation whatever
-   * the handler returns, so it cannot be used for silent bookkeeping.
-   */
-  assert.doesNotMatch(code, /commands\.execute|observer-bind/u, 'nothing is sent over the command channel')
+test('client: no session creation of any kind', () => {
+  assert.doesNotMatch(code, /sessions\.create\(/u, 'the client does not create sessions')
+  assert.doesNotMatch(code, /startSession\(/u, 'nor through the workspace blank API')
+  assert.doesNotMatch(code, /locationOf|firstPathIn/u, 'and no longer guesses a path at all')
 })
 
 /**
- * v1.0.8 — ONE BOUNDED WAIT, AND ONLY AFTER A CLICK.
+ * v1.0.9 — ONE COMMAND, AND IT IS THE REQUEST.
  *
- * `uiWorkspace.startSession()` returns void, so the last-resort path reads the session list once
- * after a short settle. That is a single `setTimeout`, not a poll loop, and it only runs when the
- * location could not be resolved from the host — the case that otherwise refuses the summon.
+ * A command is the only generic channel to the Host, and it IS broadcast, so this costs one row per
+ * summon. That cost is accepted deliberately: correctness of placement outranks a silent row.
  */
-test('client: the last-resort wait is a single settle, not a poll', () => {
-  const fallback = code.slice(code.indexOf('const createInCurrentWorkspace ='), code.indexOf('const openSession ='))
-  assert.match(fallback, /startSession\(\)/u, 'it uses the client-side startSession')
-  assert.equal((fallback.match(/setTimeout\(/gu) ?? []).length, 1, 'exactly one settle, no loop')
-  assert.equal((fallback.match(/await new Promise/gu) ?? []).length, 1, 'awaited once')
-  assert.doesNotMatch(fallback, /setInterval|while \(/u, 'no polling')
-  assert.match(fallback, /没有出现新会话/u, 'and it refuses rather than guessing an id')
+test('client: exactly one command is sent, and it asks the host to spawn', () => {
+  const spawn = code.slice(code.indexOf('const spawnOnHost ='), code.indexOf('return { get,'))
+  assert.match(spawn, /commands\.execute\(/u, 'it goes through the command channel')
+  assert.equal((spawn.match(/commands\.execute\(/gu) ?? []).length, 1, 'exactly one command per click')
+  assert.match(spawn, /\/observer-spawn /u, 'and it is the spawn request')
+  assert.doesNotMatch(code, /observer-bind|observer-state|observer-create/u, 'the old commands are gone')
+})
+
+test('client: the new id is taken from the reply, else from one settle and one read', () => {
+  const spawn = code.slice(code.indexOf('const spawnOnHost ='), code.indexOf('return { get,'))
+  assert.match(spawn, /looksLikeId/u, 'the bare id in the reply is used when present')
+  assert.equal((spawn.match(/setTimeout\(/gu) ?? []).length, 1, 'exactly one settle, never a loop')
+  assert.doesNotMatch(spawn, /setInterval|while \(/u, 'no polling')
+  assert.match(spawn, /宿主没有创建出新的会话/u, 'and a missing session is refused, not guessed')
 })
 
 /**
- * v1.0.6 — THE CLICK PATH, INCLUDING WORKSPACE INHERITANCE.
+ * v1.0.4 — NO NESTING, FROM SESSION METADATA ONLY.
  *
- * `locationOf` finds the main session's PATH or WORKSPACE from the local snapshot so the companion
- * lands in the same project instead of a "选择工作区" empty page — and a session with no location is
- * refused rather than created and abandoned. The jump passes the BARE id
- * (`SessionTarget = SessionId | SubagentAddress`). The binding is not requested: the companion is
- * MARKED with a title, and the Host derives the pointer from its own event feed.
- */
-test('client: one click inherits the location, creates, marks, then opens', () => {
-  assert.match(code, /sessions\.create\(/u, 'creation goes through sessions.create (it returns SessionId)')
-  // `startSession` is the LAST RESORT only: it returns void, so its id must be read back.
-  assert.match(code, /const createInCurrentWorkspace =/u, 'the fallback exists for a missing location')
-  assert.match(code, /openSession\(observerSessionId\)/u, 'the jump passes the bare SessionTarget id')
-  assert.doesNotMatch(code, /openSession\(\{\s*kind/u, 'a { kind, sessionId } wrapper is silently ignored')
-  assert.match(code, /markCompanion/u, 'the companion is marked, not bound through a command')
-  assert.match(code, /remote\.session\.rename|namespace\.rename/u, 'the mark is a plain Remote rename')
-  assert.match(code, /\[副脑\] 跟随/u, 'and the title is the marker the Host parses')
-  assert.match(code, /拿不到主会话的工作区或路径/u, 'a locationless create is refused, not attempted')
-
-  const summon = code.slice(code.indexOf('const summon ='), code.indexOf('return h('))
-  // The location is fetched from the HOST list (await) and handed to the create call.
-  assert.match(summon, /const location = await bridge\.locationOf\(sessionId\)/u, 'the location is fetched')
-  assert.match(summon, /bridge\.createSession\(location\)/u, 'and feeds the create call')
-  const order = ['createSession(', 'markCompanion(', 'openSession('].map((step) => summon.indexOf(step))
-  assert.ok(order.every((at) => at >= 0), 'the flow is create → mark → open')
-  assert.deepEqual([...order].sort((a, b) => a - b), order, 'the steps must run in that order')
-})
-
-/**
- * v1.0.8 — THE LOCATION COMES FROM THE HOST, NOT FROM A GUESS.
- *
- * The local snapshot did not carry `cwd` on this build, so `sessions.create({})` produced a session
- * with no workspace and the user landed on the "选择工作区" empty draft. `remote.session.list()` is
- * the host's own summary read (a plain Remote call — no command, so no conversation row) and is now
- * the primary source, with the local snapshot as a fallback.
- */
-test('client: the location is read from the host list, with the local snapshot as fallback', () => {
-  const locate = code.slice(code.indexOf('const locationOf ='), code.indexOf('const isCompanion ='))
-  assert.match(locate, /namespace\.list\(/u, 'it asks the host through the session list Remote')
-  assert.match(locate, /row\.cwd/u, 'and reads cwd from the host summary')
-  assert.match(locate, /row\.workspaceId/u, 'and workspaceId when the host provides one')
-  assert.match(locate, /firstPathIn\(summary\)/u, 'the local snapshot stays as a fallback')
-  assert.doesNotMatch(locate, /commands\.execute/u, 'never through the broadcast command channel')
-})
-
-/**
- * v1.0.4 — NO NESTING (from session metadata) AND NO RE-ENTRY (from a module latch).
- *
- * The chip hides itself inside a companion using TWO local sources: the `[副脑]` title the Host
- * writes into the session, read from the client's own snapshot, and the ids this page created
- * (covering the moment between the jump and the rename). localStorage is deliberately NOT used —
- * a stale entry there could hide the button in a session that is not a companion at all.
+ * The companion carries a `[副脑]` title, read from the client's own snapshot: no request, and
+ * deliberately no page storage (a stale entry there could hide the button in an innocent session).
  */
 test('client: a companion is recognised from its own title, with no request and no storage', () => {
   assert.match(code, /const isCompanion = \(sessionId\)/u, 'one place answers "is this a companion?"')
@@ -166,18 +104,30 @@ test('client: the summon is exclusive across all three seats', () => {
 })
 
 /**
+ * v1.0.4 — FOCUS PULL, EVENT DRIVEN.
+ *
+ * A handoff announces `graft/session-transferred`; the Client opens the new main session straight
+ * from the event. No poll, no state read, no lookup.
+ */
+test('client: the transfer event opens the new session directly', () => {
+  assert.match(code, /ctx\.on\('graft\/session-transferred'/u, 'the transfer event is subscribed')
+  const handler = code.slice(code.indexOf("ctx.on('graft/session-transferred'"), code.indexOf('transfer seen'))
+  assert.match(handler, /payload\?\.newSessionId/u, 'the new session id comes from the event payload')
+  assert.match(handler, /bridge\.openSession\(newSessionId\)/u, 'and it is opened immediately')
+  assert.doesNotMatch(handler, /setInterval|await|setTimeout/u, 'the handler is synchronous')
+})
+
+/**
  * v1.0.7 — NOTHING FAILS SILENTLY.
  *
  * "Click does nothing" was indistinguishable from a dead button, because an exception left the chip
- * exactly as it was. Every await now logs its result, and the whole click is wrapped so a throw
- * becomes a visible note plus a console error.
+ * exactly as it was. Every step logs its result, and the whole click is wrapped so a throw becomes a
+ * visible note plus a console error.
  */
 test('client: every step of a click is logged and a throw becomes a visible note', () => {
   const summon = code.slice(code.indexOf('const summon ='), code.indexOf('return h('))
   assert.match(summon, /console\.log\('\[dsh-observer\] click:/u, 'the click is logged')
-  assert.match(summon, /console\.log\('\[dsh-observer\] location:'/u, 'the resolved location is logged')
-  assert.match(summon, /console\.log\('\[dsh-observer\] create result:'/u, 'the create result is logged')
-  assert.match(summon, /console\.log\('\[dsh-observer\] mark result:'/u, 'the mark result is logged')
+  assert.match(summon, /console\.log\('\[dsh-observer\] spawn result:'/u, 'the spawn result is logged')
   assert.match(summon, /console\.log\('\[dsh-observer\] opened:'/u, 'the open result is logged')
   assert.match(summon, /catch \(error\) \{/u, 'a throw is caught')
   assert.match(summon, /console\.error\('\[dsh-observer\] summon threw:'/u, 'and logged with its detail')
@@ -189,53 +139,9 @@ test('client: a failed mount is reported, never silent', () => {
   assert.match(code, /registration failed:/u, 'each seat reports its own failure')
 })
 
-/**
- * v1.0.4 — FOCUS PULL, EVENT DRIVEN.
- *
- * A handoff announces `graft/session-transferred`; the Client opens the new main session straight
- * from the event. No poll, no state read, no lookup.
- */
-test('client: the transfer event opens the new session directly', () => {
-  assert.match(code, /ctx\.on\('graft\/session-transferred'/u, 'the transfer event is subscribed')
-  const handler = code.slice(code.indexOf("ctx.on('graft/session-transferred'"), code.indexOf('console.log(`[dsh-observer] transfer seen'))
-  assert.match(handler, /payload\?\.newSessionId/u, 'the new session id comes from the event payload')
-  assert.match(handler, /bridge\.openSession\(newSessionId\)/u, 'and it is opened immediately')
-  assert.doesNotMatch(handler, /setInterval|await|setTimeout/u, 'the handler is synchronous — nothing to poll')
-})
-
-/**
- * v1.0.6 — THE MARKING CALL IS A PLAIN REMOTE, AND ITS FAILURE IS VISIBLE.
- *
- * `remote.session.rename` is used instead of a command precisely because a command is broadcast
- * into the conversation. If the rename fails the chip says the companion was created but NOT
- * marked, because an unmarked companion would keep showing the summon button inside itself.
- */
-test('client: the marking call is a plain rename and its failure is reported', () => {
-  const mark = code.slice(code.indexOf('const markCompanion ='), code.indexOf('return { get,'))
-  assert.match(mark, /namespace\.rename\(/u, 'it renames through the Remote namespace')
-  assert.doesNotMatch(mark, /commands\.execute/u, 'never through the broadcast command channel')
-  assert.equal((mark.match(/rename\(/gu) ?? []).length, 1, 'exactly one rename per click')
-  assert.match(mark, /remote\.session\.rename 不可用/u, 'a failure names what did not happen')
-  assert.match(mark, /remote namespaces:/u, 'and lists what the remote object actually exposes')
-
-  assert.match(code, /但未被标记/u, 'and the chip states it instead of pretending success')
-  assert.match(code, /console\.error\('\[dsh-observer\] rename failed:'/u, 'the detail is logged')
-})
-
-/**
- * v1.0.7 — `remote.session` MUST BE INJECTED.
- *
- * Without the key, touching `remote.session` throws
- * `cannot get property "remote.session" without inject` — the failure dsh-graft-slice documents —
- * and the marking call can never succeed.
- */
-test('client: remote.session is declared in the inject list', () => {
-  const matches = [...bundle.matchAll(/inject:\s*\[([^\]]*)\]/gu)]
-  const keys = matches[matches.length - 1][1]
-    .split(',')
-    .map((part) => part.trim().replace(/^['"]|['"]$/gu, ''))
-    .filter(Boolean)
-  assert.ok(keys.includes('remote.session'), `inject must include remote.session, found: ${keys.join(', ')}`)
+test('client: the jump passes the bare SessionTarget id', () => {
+  assert.match(code, /openSession\(id\)/u, 'the documented SessionTarget (bare id) is passed')
+  assert.doesNotMatch(code, /openSession\(\{\s*kind/u, 'a { kind, sessionId } wrapper is silently ignored')
 })
 
 test('client: a seat without a session id renders nothing', () => {

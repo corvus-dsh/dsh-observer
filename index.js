@@ -27,7 +27,7 @@ export const name = 'dsh-observer'
  * Client half is cached separately, and "did my build reach the app?" must be answerable
  * without guessing.
  */
-export const VERSION = '1.0.8'
+export const VERSION = '1.0.9'
 console.log(`[dsh-observer] host version ${VERSION}`)
 
 /**
@@ -558,18 +558,125 @@ export function apply(ctx                   , config                          = 
   })
 
   /**
-   * v1.0.6 — NO COMMANDS AT ALL.
+   * v1.0.9 — THE HOST CREATES THE COMPANION. THIS IS THE ONE COMMAND, AND IT IS ON PURPOSE.
    *
-   * `commands.execute` is BROADCAST: every invocation is rendered as a row in the conversation,
-   * regardless of what the handler returns. An empty reply removes the text but not the row, so
-   * the channel cannot be used for silent bookkeeping. The binding now arrives through the
-   * `session/event` title feed above, and every former command has an equivalent TOOL for the
-   * model (`observer_status`, `observer_create`, `observer_consult`, `observer_bind`).
+   * The Client's `sessions.create` cannot place a session in a workspace on this build (the local
+   * summary carries no `cwd`, so the create went out bare and the UI fell into the
+   * "选择工作区" empty draft). The Host can do it properly because it can read the MAIN session's own
+   * header — the authoritative `cwd` — and hand it to its own create call.
+   *
+   * A command is the only generic client→host channel this Host offers a third-party client half,
+   * and `commands.execute` IS broadcast: this costs ONE row per summon, which the user explicitly
+   * accepted. Everything else about the companion (placement, title, setting, pointer) happens on
+   * the Host; the Client only asks and then opens the id it is given.
    */
+  const resolveMainCwd = (mainSessionId        )                                  => {
+    try {
+      const sessions = ctx.get?.('sessions')
+      const live = isRecord(sessions) && typeof sessions.get === 'function' ? sessions.get(mainSessionId) : undefined
+      const candidates                           = [
+        ['session.header.cwd', (live       )?.header?.cwd],
+        ['session.cwd', (live       )?.cwd],
+      ]
+      for (const [source, value] of candidates) {
+        if (typeof value === 'string' && value.length > 0) return { cwd: value, source }
+      }
+      // The working-directory service is the owner of a Session's effective directory.
+      const workingDirectory = ctx.get?.('workingDirectory')
+      if (isRecord(workingDirectory) && typeof workingDirectory.get === 'function' && live !== undefined) {
+        const path = workingDirectory.get(live       )
+        if (typeof path === 'string' && path.length > 0) return { cwd: path, source: 'workingDirectory.get' }
+      }
+      return { cwd: '', source: 'unavailable' }
+    } catch (error) {
+      return { cwd: '', source: `error: ${String((error       )?.message ?? error)}` }
+    }
+  }
+
+  const spawnCompanion = async (
+    mainSessionId        ,
+  )                                                            => {
+    if (mainSessionId.length === 0) {
+      return { ok: false, sessionId: '', text: '没有可绑定的主会话 id' }
+    }
+    if (mainOfObserver(mainSessionId).length > 0) {
+      return { ok: false, sessionId: '', text: '这是一个副脑会话：它不能再召唤副脑' }
+    }
+    const existing = observerOf(mainSessionId)
+    if (existing.length > 0) {
+      return { ok: true, sessionId: existing, text: `该会话已有副脑 ${existing}` }
+    }
+
+    const located = resolveMainCwd(mainSessionId)
+    ctx.logger?.info?.(`[dsh-observer] main cwd for ${mainSessionId}: ${JSON.stringify(located.cwd)} (${located.source})`)
+    if (located.cwd.length === 0) {
+      return { ok: false, sessionId: '', text: `拿不到主会话的工作目录（${located.source}），拒绝创建没有归属的会话` }
+    }
+
+    const controller = ctx.get?.('sessionController')
+    if (!isRecord(controller) || typeof controller.create !== 'function') {
+      return { ok: false, sessionId: '', text: 'sessionController.create 不可用' }
+    }
+
+    let observerSessionId = ''
+    try {
+      const created = await controller.create({ cwd: located.cwd })
+      observerSessionId = typeof created?.sessionId === 'string' ? created.sessionId : ''
+    } catch (error) {
+      return { ok: false, sessionId: '', text: `创建副脑会话失败：${String((error       )?.message ?? error)}` }
+    }
+    if (observerSessionId.length === 0) {
+      return { ok: false, sessionId: '', text: 'sessionController.create 返回了空 id' }
+    }
+
+    state.bindings[mainSessionId] = observerSessionId
+    state.reverse[observerSessionId] = mainSessionId
+    const written = save()
+    if (!written.ok) {
+      delete state.bindings[mainSessionId]
+      delete state.reverse[observerSessionId]
+      return { ok: false, sessionId: observerSessionId, text: `绑定表写入失败：${written.error}` }
+    }
+
+    const marked = await markCompanion(mainSessionId, observerSessionId, missionText(mainSessionId))
+    return {
+      ok: true,
+      sessionId: observerSessionId,
+      text:
+        `已创建副脑 ${observerSessionId}（cwd=${located.cwd}）` +
+        (marked.detail.length > 0 ? `（部分步骤未完成：${marked.detail}）` : ''),
+    }
+  }
+
   const commands = ctx.get?.('commands')
   if (isRecord(commands) && typeof commands.register === 'function') {
-    // Intentionally empty: registering anything here puts a visible row in the user's transcript.
-    ctx.logger?.info?.('[dsh-observer] no commands registered — binding arrives via session/event')
+    commands.register({
+      name: 'observer-spawn',
+      description: '由宿主创建副脑：/observer-spawn <mainSessionId>',
+      handler: async (invocation     ) => {
+        try {
+          const raw =
+            invocation?.rawInput ?? invocation?.line ?? invocation?.args?.rawInput ?? invocation?.text ?? ''
+          const mainSessionId = String(raw).replace(/^\/\S+\s*/u, '').trim()
+          const result = await spawnCompanion(mainSessionId)
+          /**
+           * Success answers with the BARE ID (the client uses it to open the session); a failure
+           * answers with the REASON. Returning the id unconditionally — which the first version
+           * did — threw every error message away and left the client with an empty string and no
+           * way to say what went wrong.
+           */
+          return {
+            kind: result.ok ? ('success'         ) : ('error'         ),
+            text: result.ok ? result.sessionId : result.text,
+          }
+        } catch (error) {
+          const detail = String((error       )?.message ?? error)
+          ctx.logger?.warn?.(`[dsh-observer] observer-spawn threw: ${detail}`)
+          return { kind: 'error'         , text: `副脑创建失败：${detail}` }
+        }
+      },
+    })
+    ctx.logger?.info?.('[dsh-observer] one command registered: observer-spawn (host-side creation)')
   }
 
   ctx.tools?.register({

@@ -18,8 +18,8 @@
  * `Promise<SessionId>`, which is exactly what a caller needs in order to open and then bind.
  */
 
-window.__OBSERVER_LOADED__ = '1.0.8'
-console.log('%c[dsh-observer] FUCK CACHE 1.0.8 — location from the host list', 'color:#16a34a;font-weight:bold')
+window.__OBSERVER_LOADED__ = '1.0.9'
+console.log('%c[dsh-observer] FUCK CACHE 1.0.9 — host creates, client only asks', 'color:#16a34a;font-weight:bold')
 
 window.__ModuleLoader__.load({
   id: 'dsh-observer',
@@ -95,79 +95,16 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * THE MAIN SESSION'S WORKING DIRECTORY — and why the first attempt landed the user on a
-       * "选择工作区" page.
+       * v1.0.9 — NO LOCATION LOGIC LIVES HERE ANY MORE.
        *
-       * `sessions.create({})` with no location creates a session with NO workspace, and the UI
-       * then shows the choose-a-workspace empty state. So the location must be supplied, and it
-       * must be found defensively:
-       *   1. `SessionSummary.cwd` — the documented field;
-       *   2. a structural scan of the same summary for a path-shaped string, because the app owns
-       *      which projection carries it and `cwd` may be absent on some builds;
-       *   3. a workspace id, taken from the snapshot's own maps if one is reachable.
+       * The path-guessing chain (`PATH_SHAPED` / `firstPathIn` / `locationOf`) is DELETED. It existed
+       * only because the client was creating the session itself, and every variant of it failed on
+       * this build: the local summary carries no `cwd`, so the create went out bare and the user
+       * landed on the "选择工作区" empty draft.
+       *
+       * The Host owns placement now: it reads the MAIN session's own header (`session.header.cwd`,
+       * or the `workingDirectory` service) and creates the companion there. The client only asks.
        */
-      const PATH_SHAPED = /^(?:[A-Za-z]:[\\/]|\\\\|\/)/u
-
-      const firstPathIn = (value, depth = 0) => {
-        if (depth > 3 || value === null || value === undefined) return ''
-        if (typeof value === 'string') return PATH_SHAPED.test(value) ? value : ''
-        if (Array.isArray(value)) {
-          for (const item of value) {
-            const found = firstPathIn(item, depth + 1)
-            if (found.length > 0) return found
-          }
-          return ''
-        }
-        if (typeof value === 'object') {
-          for (const item of Object.values(value)) {
-            const found = firstPathIn(item, depth + 1)
-            if (found.length > 0) return found
-          }
-          return ''
-        }
-        return ''
-      }
-
-      /**
-       * v1.0.8 — THE LOCATION IS TAKEN FROM THE HOST, NOT GUESSED.
-       *
-       * The local snapshot's summary did not carry `cwd` on this build, so the earlier version fell
-       * through to "no location" and `sessions.create({})` produced a session with NO workspace —
-       * the page the user saw was the "选择工作区" empty draft.
-       *
-       * `remote.session.list()` is the HOST's own summary read (`SessionSummary.cwd` is populated
-       * there), and it is a plain Remote call: no command, so no row in the conversation. That is
-       * the authoritative source; the local snapshot and a structural scan stay as fallbacks for a
-       * build where the list omits the field.
-       */
-      const locationOf = async (sessionId) => {
-        const summary = snapshotOf(sessionId)
-        let cwd = typeof summary?.cwd === 'string' ? summary.cwd : ''
-        let workspaceId = typeof summary?.workspaceId === 'string' ? summary.workspaceId : ''
-
-        try {
-          const remote = get('remote')
-          const namespace = remote && (remote.session || remote.sessionController)
-          if (namespace && typeof namespace.list === 'function') {
-            const reply = await namespace.list({}, undefined)
-            const items = reply && Array.isArray(reply.items) ? reply.items : []
-            const row = items.find((item) => item && item.sessionId === sessionId)
-            if (row !== undefined) {
-              if (typeof row.cwd === 'string' && row.cwd.length > 0) cwd = row.cwd
-              if (typeof row.workspaceId === 'string' && row.workspaceId.length > 0) workspaceId = row.workspaceId
-            }
-            console.log(
-              `[dsh-observer] host list: ${items.length} session(s); ` +
-                `this one -> cwd=${JSON.stringify(row?.cwd ?? null)} workspaceId=${JSON.stringify(row?.workspaceId ?? null)}`,
-            )
-          }
-        } catch (error) {
-          console.error('[dsh-observer] host list failed:', String((error && error.message) || error))
-        }
-
-        if (cwd.length === 0 && summary !== undefined) cwd = firstPathIn(summary)
-        return { cwd, workspaceId }
-      }
 
       /** v1.0.4: the Host titles every companion `[副脑] 跟随 …`; that title is the marker. */
       const isCompanion = (sessionId) => {
@@ -177,82 +114,60 @@ window.__ModuleLoader__.load({
         return summary !== undefined && containsMarker(summary)
       }
 
-      /**
-       * Create an ordinary session IN THE SAME PLACE as the main one — and NEVER WITHOUT ONE.
-       *
-       * A locationless create is what produced the "选择工作区" empty draft, so when the location
-       * cannot be resolved this REFUSES with a reason rather than creating an orphan.
-       *
-       * v1.0.8 — LAST RESORT BEFORE REFUSING: `uiWorkspace.startSession()`.
-       *
-       * That client API opens the Workspace blank `connectWorkspace` resolves, and with no argument
-       * it inherits the CURRENT workspace — the exact placement we want, with no path guessing at
-       * all. It returns void, so the new id is recovered from the session list (one read, right
-       * after an explicit click; this is not polling).
-       */
-      const createSession = async ({ cwd, workspaceId }) => {
-        const sessions = get('sessions')
-        if (!sessions || typeof sessions.create !== 'function') {
-          return { ok: false, sessionId: '', text: 'sessions.create 不可用（inject 未生效）' }
-        }
-        const location = {}
-        if (cwd.length > 0) location.cwd = cwd
-        if (workspaceId.length > 0) location.workspaceId = workspaceId
-
-        if (cwd.length === 0 && workspaceId.length === 0) {
-          const viaWorkspace = await createInCurrentWorkspace()
-          if (viaWorkspace.ok) return viaWorkspace
-          return {
-            ok: false,
-            sessionId: '',
-            text:
-              `拿不到主会话的工作区或路径，且 uiWorkspace.startSession 也不可用（${viaWorkspace.text}）；` +
-              '拒绝创建一个没有归属的会话（否则会跳到“选择工作区”空页面）',
-          }
-        }
+      /** Every visible session id, from the LOCAL snapshot (one read per explicit action). */
+      const idsOf = () => {
         try {
-          const sessionId = await sessions.create(location)
-          if (typeof sessionId !== 'string' || sessionId.length === 0) {
-            return { ok: false, sessionId: '', text: `sessions.create 返回了空 id：${JSON.stringify(sessionId)}` }
-          }
-          return { ok: true, sessionId, text: '' }
-        } catch (error) {
-          return { ok: false, sessionId: '', text: String((error && error.message) || error) }
+          const sessions = get('sessions')
+          const list = sessions && sessions.list
+          const snapshot = list && typeof list.getSnapshot === 'function' ? list.getSnapshot() : undefined
+          return Array.isArray(snapshot?.ids) ? [...snapshot.ids] : []
+        } catch {
+          return []
         }
       }
 
       /**
-       * LAST RESORT: let the CLIENT open a blank in the CURRENT workspace.
+       * v1.0.9 — THE HOST CREATES THE COMPANION. THE CLIENT ONLY ASKS.
        *
-       * `uiWorkspace.startSession()` takes no location and inherits the workspace the user is
-       * already in — no path is guessed. It returns void, so the new id is read back from the
-       * session list: one read immediately after an explicit click, which is not polling.
+       * `sessions.create` is GONE from this file. On this build the client cannot place a session in
+       * a workspace (the local summary carries no `cwd`), so the create went out bare and the user
+       * landed on the "选择工作区" empty draft. The HOST can do it properly: it reads the main
+       * session's own header for the authoritative `cwd`, creates the companion there, titles it,
+       * writes the setting physically and records the pointer.
+       *
+       * The request travels over the ONE generic client→host channel this Host offers a third-party
+       * half — a command, which IS broadcast (one row per summon; the user accepted that cost). The
+       * new id comes back two ways: the command's text, and, if the gateway wraps it, a single
+       * before/after diff of the local session list after one settle.
        */
-      const createInCurrentWorkspace = async () => {
-        const workspaceUi = get('uiWorkspace')
-        if (!workspaceUi || typeof workspaceUi.startSession !== 'function') {
-          return { ok: false, sessionId: '', text: 'uiWorkspace.startSession 不可用' }
-        }
-        const sessions = get('sessions')
-        const idsOf = () => {
-          try {
-            const snapshot = sessions && sessions.list && typeof sessions.list.getSnapshot === 'function' ? sessions.list.getSnapshot() : undefined
-            return Array.isArray(snapshot?.ids) ? [...snapshot.ids] : []
-          } catch {
-            return []
-          }
+      const spawnOnHost = async (mainSessionId) => {
+        const remote = get('remote')
+        const commands = remote && remote.commands
+        if (!commands || typeof commands.execute !== 'function') {
+          return { ok: false, sessionId: '', text: 'remote.commands 不可用（inject 未生效）' }
         }
         const before = idsOf()
+        let replyText = ''
         try {
-          workspaceUi.startSession()
+          const settled = await commands.execute(mainSessionId, `/observer-spawn ${mainSessionId}`, [], undefined)
+          const node = settled && settled.result !== undefined ? settled.result : settled
+          if (node && typeof node.text === 'string') replyText = node.text.trim()
+          console.log('[dsh-observer] spawn reply:', JSON.stringify(settled))
         } catch (error) {
-          return { ok: false, sessionId: '', text: String((error && error.message) || error) }
+          return { ok: false, sessionId: '', text: `请求宿主创建失败：${String((error && error.message) || error)}` }
         }
-        // The store needs one tick to publish the new session.
-        await new Promise((resolve) => setTimeout(resolve, 250))
+
+        // The host answers with the bare id; a wrapped reply leaves it unreadable, so the list diff
+        // is the reliable second source. One settle, then ONE read — not a poll.
+        const looksLikeId = /^session-[0-9a-f-]{6,}$/u.test(replyText)
+        if (looksLikeId) return { ok: true, sessionId: replyText, text: '' }
+
+        await new Promise((resolve) => setTimeout(resolve, 400))
         const fresh = idsOf().filter((id) => before.indexOf(id) < 0)
-        if (fresh.length === 0) return { ok: false, sessionId: '', text: 'startSession 之后没有出现新会话' }
-        console.log(`[dsh-observer] startSession created ${fresh[0]}`)
+        if (fresh.length === 0) {
+          return { ok: false, sessionId: '', text: replyText.length > 0 ? replyText : '宿主没有创建出新的会话' }
+        }
+        console.log(`[dsh-observer] host created ${fresh.join(', ')}`)
         return { ok: true, sessionId: fresh[0], text: '' }
       }
 
@@ -302,7 +217,7 @@ window.__ModuleLoader__.load({
         }
       }
 
-      return { get, locationOf, isCompanion, createSession, openSession, markCompanion }
+      return { get, isCompanion, openSession, spawnOnHost }
     }
 
     function ObserverChip({ sessionId, bridge }) {
@@ -328,27 +243,19 @@ window.__ModuleLoader__.load({
         setBusy(true)
         setNote('')
         try {
-          const location = await bridge.locationOf(sessionId)
-          console.log('[dsh-observer] location:', JSON.stringify(location))
-          const created = await bridge.createSession(location)
-          console.log('[dsh-observer] create result:', JSON.stringify(created))
-          if (!created.ok) {
-            setNote(`创建会话失败：${created.text}`)
+          const spawned = await bridge.spawnOnHost(sessionId)
+          console.log('[dsh-observer] spawn result:', JSON.stringify(spawned))
+          if (!spawned.ok) {
+            setNote(`召唤失败：${spawned.text}`)
             return
           }
-          const observerSessionId = created.sessionId
-          // Remember it BEFORE opening: the rename lands a moment after the jump, and the chip
-          // inside the fresh companion must not appear in that gap.
+          const observerSessionId = spawned.sessionId
+          // Remember it before opening: the chip inside the fresh companion must not appear in the
+          // moment between the jump and the title landing.
           companions.add(observerSessionId)
-          const marked = await bridge.markCompanion(sessionId, observerSessionId)
-          console.log('[dsh-observer] mark result:', JSON.stringify(marked))
-          if (!marked.ok) {
-            setNote(`副脑 ${observerSessionId} 已创建，但未被标记：${marked.text}`)
-            return
-          }
           const opened = bridge.openSession(observerSessionId)
           console.log('[dsh-observer] opened:', opened)
-          if (!opened) setNote(`副脑 ${observerSessionId} 已创建并标记；请在左侧会话列表中选择它`)
+          if (!opened) setNote(`副脑 ${observerSessionId} 已创建；请在左侧会话列表中选择它`)
         } catch (error) {
           /**
            * v1.0.7 — NOTHING FAILS SILENTLY.

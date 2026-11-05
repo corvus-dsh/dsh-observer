@@ -196,15 +196,16 @@ test('observer: an unknown transfer changes nothing', () => {
 })
 
 /**
- * v1.0.6 — NO COMMANDS AT ALL.
+ * v1.0.9 — EXACTLY ONE COMMAND, AND IT IS THE SPAWN REQUEST.
  *
  * Every command invocation is rendered as a row in the conversation no matter what the handler
- * returns (an empty reply removes the text, not the row), so the channel is unusable for silent
- * bookkeeping. The capability stays available to the MODEL as tools.
+ * returns, so broadcast commands stay at the minimum: the one generic client→host channel this Host
+ * offers a third-party half is used for exactly one thing — "create the companion for this session".
+ * Bookkeeping (bind, status, consult) stays on TOOLS, which the model calls.
  */
-test('observer: no command is registered, and the tools keep the capability', async () => {
+test('observer: one command (spawn), and the tools keep the rest', async () => {
   const { commands, tools, prompts, appends, renames } = boot()
-  assert.deepEqual([...commands.keys()], [], 'nothing is registered on the broadcast channel')
+  assert.deepEqual([...commands.keys()], ['observer-spawn'], 'only the spawn request is broadcast')
   for (const name of ['observer_bind', 'observer_create', 'observer_consult', 'observer_status']) {
     assert.ok(tools.has(name), `${name} stays available as a tool`)
   }
