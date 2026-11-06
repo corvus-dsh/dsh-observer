@@ -93,6 +93,34 @@ interface ParadiseLayerLike {
 }
 
 /**
+ * AN INJECTED ADAPTER PROVIDER — how this plugin runs where there is no host.
+ *
+ * WHY THIS IS NOT A FEATURE FLAG: the name of the thing this plugin depends on is "two verbs" (`create`
+ * and `trigger`), not "the host's service container". A deployment that already HAS those verbs — a bare
+ * machine running the layer's raw adapters — should be able to say so, and the plugin should then behave
+ * exactly as it does inside a host. That is the whole of "host-independent": not a second code path, but
+ * the same path fed from somewhere else.
+ *
+ * WHAT IT DOES NOT CHANGE: with no provider installed, resolution goes to `ensureParadise()` and the
+ * host's own factory, exactly as before. Every existing test keeps exercising that path.
+ */
+export type WriteAdapterProvider = (ctx: any) =>
+  | { ok: boolean; reason?: string; session?: SessionAdapterLike; deletes?: ParadiseLayerLike['deleteSession']; layerName?: string }
+  | null
+
+let provider: WriteAdapterProvider | undefined
+
+/** Install (or clear) the provider. `null` from it means "no opinion, resolve as usual". */
+export function setWriteAdapterProvider(next: WriteAdapterProvider | undefined): void {
+  provider = next
+}
+
+/** Is a provider installed? Diagnostics print this so "why is it not using the host" is answerable. */
+export function hasWriteAdapterProvider(): boolean {
+  return provider !== undefined
+}
+
+/**
  * Resolve the layer's write surface.
  *
  * Returns `undefined` with a stated reason when the layer is missing or does not expose the write
@@ -106,6 +134,26 @@ export async function ensureWriteAdapter(ctx: any): Promise<{
   deletes?: ParadiseLayerLike['deleteSession']
   layerName?: string
 }> {
+  /**
+   * THE PROVIDER IS CHECKED FIRST, and a `null` answer falls through rather than being treated as a
+   * failure: a caller may own only SOME contexts (a test owns its own `{}`, production owns the real
+   * one), and forcing it to fabricate an answer for the rest would push a stub into a live path.
+   */
+  if (provider !== undefined) {
+    const injected = provider(ctx)
+    if (injected !== null) {
+      if (injected.ok !== true) return { ok: false, reason: injected.reason ?? '注入的适配器不可用' }
+      if (injected.session === undefined) return { ok: false, reason: '注入的适配器没有提供 session' }
+      return {
+        ok: true,
+        reason: '',
+        session: injected.session,
+        ...(injected.deletes === undefined ? {} : { deletes: injected.deletes }),
+        ...(injected.layerName === undefined ? {} : { layerName: injected.layerName }),
+      }
+    }
+  }
+
   const binding: ParadiseBinding = await ensureParadise()
   if (!binding.available) {
     return { ok: false, reason: binding.reason }

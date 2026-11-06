@@ -284,7 +284,128 @@ function emptyReport(pathSource: string, notes: string[]): DiskLogReport {
  * Never throws. A missing layer produces `readable: false` with a note that NAMES the package and
  * says what still holds — which is the honest degradation the draft asks for (§9 item C).
  */
+/**
+ * A REPLACEABLE LOG READER — the seam that lets this monitor run where there is no host.
+ *
+ * THE PROBLEM, STATED AS IT ACTUALLY BIT
+ *
+ * `inspectSessionLog` reached the durable log through `readDiskEvents`, which is a FILE-SHAPED API: it
+ * takes a session id and a cwd, derives a directory layout, opens a compressed frame file, and decodes it.
+ * Every one of those steps is a fact about ONE host. A bare machine has none of them — it has `.jsonl`
+ * files and a `SessionAdapter` that already knows how to read them.
+ *
+ * WHAT THIS INTERFACE IS: one question — "what does this session's log contain, as EVENTS?" — because
+ * that is the only thing the monitor consumes. The briefing summary is derived HERE from the events, so a
+ * reader does not have to know what a briefing is.
+ *
+ * WHY THE DERIVATION MOVED INTO THE READER: with a provider installed there are no paths to derive, no
+ * frames to decode, and no cwd to escape into a directory name. Asking a JSONL reader for those would
+ * force it to fabricate answers.
+ */
+export interface SessionLogReader {
+  /** A short name for diagnostics — "which reader answered?". */
+  readonly name: string
+  /**
+   * Read one session's events.
+   *
+   * MUST NOT throw: an absent session is `readable: false` with a note. A monitor that throws because a
+   * session is missing cannot report on the sessions that are present.
+   */
+  read(sessionId: string): Promise<{
+    readable: boolean
+    path: string
+    pathSource: string
+    events: ReadonlyArray<{ seq?: number; type: string; data?: unknown }>
+    notes: readonly string[]
+  }>
+}
+
+let readerProvider: SessionLogReader | undefined
+
+/** Install (or clear) the reader. With none installed, resolution goes to the layer, exactly as shipped. */
+export function setSessionLogReader(next: SessionLogReader | undefined): void {
+  readerProvider = next
+}
+
+/** Is a reader installed? Diagnostics print this so "why is it not reading the host log" is answerable. */
+export function hasSessionLogReader(): boolean {
+  return readerProvider !== undefined
+}
+
+/**
+ * DERIVE THE BRIEFING FROM EVENTS.
+ *
+ * This is the piece that used to come out of the frame decoder for free. It is deliberately the SAME rule
+ * the host reader applies — first message-shaped event, its first non-empty line — because the observer's
+ * receipt prints this text and a bare machine must not produce a different-looking report.
+ */
+function briefingOf(events: ReadonlyArray<{ seq?: number; type: string; data?: unknown }>): DiskLogReport['briefing'] {
+  const MESSAGE_TYPES = ['user/message', 'assistant/message', 'developer/message', 'system/message']
+  for (const event of events) {
+    if (!MESSAGE_TYPES.includes(event.type)) continue
+    const data = (event.data ?? {}) as Record<string, unknown>
+    const message = (data.message ?? data) as Record<string, unknown>
+    const content = Array.isArray(message.content) ? message.content : []
+    const text = content
+      .filter((block: any) => block?.type === 'text' && typeof block.text === 'string')
+      .map((block: any) => String(block.text))
+      .join('\n')
+      .trim()
+    if (text.length === 0) continue
+    const source = (message.source ?? data.source ?? {}) as Record<string, unknown>
+    return {
+      seq: Number(event.seq ?? 0),
+      type: event.type,
+      role: String(message.role ?? (event.type === 'user/message' ? 'user' : 'assistant')),
+      sourceKind: String(source.kind ?? ''),
+      surfaceOp: undefined,
+      textLength: text.length,
+      textHead: text.split(/\r?\n/u).map((line) => line.trim()).find((line) => line.length > 0)?.slice(0, 200) ?? '',
+      carriesTurnStep: false,
+    }
+  }
+  return null
+}
+
 export async function inspectSessionLog(ctx: any, sessionId: string, cwd?: string): Promise<DiskLogReport> {
+  /**
+   * THE INJECTED READER WINS. This is the whole of "monitoring works without a host".
+   *
+   * It is checked BEFORE `ensureParadise()`, and that order is deliberate: on a bare machine the layer is
+   * importable but its HOST ADAPTER is the wrong tool — resolving it first would load a reader that cannot
+   * open a `.jsonl` and then report the session as unreadable.
+   */
+  if (readerProvider !== undefined) {
+    let answer: Awaited<ReturnType<SessionLogReader['read']>>
+    try {
+      answer = await readerProvider.read(sessionId)
+    } catch (error) {
+      return emptyReport('reader-error', [
+        `注入的读取器（${readerProvider.name}）抛错：${String((error as any)?.message ?? error)}`,
+      ])
+    }
+    const events = Array.isArray(answer.events) ? answer.events : []
+    const types = [...new Set(events.map((event) => String(event.type)))]
+    return {
+      readable: answer.readable,
+      path: answer.path,
+      pathSource: answer.pathSource,
+      bytes: 0,
+      frameCount: events.length,
+      framesDecoded: events.length,
+      eventTypes: types,
+      eventCount: events.length,
+      briefing: briefingOf(events),
+      /**
+       * RENDERABILITY IS NOT KNOWABLE HERE, and saying `false` is the honest answer: a reader that reports
+       * events has no idea what a view would draw. The host path answers this properly; the bare path says
+       * it does not know.
+       */
+      renderedByConversation: false,
+      notes: [...answer.notes, `读取器：${readerProvider.name}`],
+    }
+  }
+
   const binding = await ensureParadise()
   if (!binding.available || binding.reader === undefined) {
     const report = emptyReport('paradise-unavailable', [

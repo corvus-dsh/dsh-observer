@@ -1588,7 +1588,128 @@ function emptyReport(pathSource        , notes          )                {
  * Never throws. A missing layer produces `readable: false` with a note that NAMES the package and
  * says what still holds — which is the honest degradation the draft asks for (§9 item C).
  */
+/**
+ * A REPLACEABLE LOG READER — the seam that lets this monitor run where there is no host.
+ *
+ * THE PROBLEM, STATED AS IT ACTUALLY BIT
+ *
+ * `inspectSessionLog` reached the durable log through `readDiskEvents`, which is a FILE-SHAPED API: it
+ * takes a session id and a cwd, derives a directory layout, opens a compressed frame file, and decodes it.
+ * Every one of those steps is a fact about ONE host. A bare machine has none of them — it has `.jsonl`
+ * files and a `SessionAdapter` that already knows how to read them.
+ *
+ * WHAT THIS INTERFACE IS: one question — "what does this session's log contain, as EVENTS?" — because
+ * that is the only thing the monitor consumes. The briefing summary is derived HERE from the events, so a
+ * reader does not have to know what a briefing is.
+ *
+ * WHY THE DERIVATION MOVED INTO THE READER: with a provider installed there are no paths to derive, no
+ * frames to decode, and no cwd to escape into a directory name. Asking a JSONL reader for those would
+ * force it to fabricate answers.
+ */
+                                   
+                                                                 
+                       
+     
+                               
+    
+                                                                                                        
+                                                                       
+     
+                                    
+                     
+                
+                      
+                                                                         
+                            
+    
+ 
+
+let readerProvider                              
+
+/** Install (or clear) the reader. With none installed, resolution goes to the layer, exactly as shipped. */
+function setSessionLogReader(next                              )       {
+  readerProvider = next
+}
+
+/** Is a reader installed? Diagnostics print this so "why is it not reading the host log" is answerable. */
+function hasSessionLogReader()          {
+  return readerProvider !== undefined
+}
+
+/**
+ * DERIVE THE BRIEFING FROM EVENTS.
+ *
+ * This is the piece that used to come out of the frame decoder for free. It is deliberately the SAME rule
+ * the host reader applies — first message-shaped event, its first non-empty line — because the observer's
+ * receipt prints this text and a bare machine must not produce a different-looking report.
+ */
+function briefingOf(events                                                               )                            {
+  const MESSAGE_TYPES = ['user/message', 'assistant/message', 'developer/message', 'system/message']
+  for (const event of events) {
+    if (!MESSAGE_TYPES.includes(event.type)) continue
+    const data = (event.data ?? {})                           
+    const message = (data.message ?? data)                           
+    const content = Array.isArray(message.content) ? message.content : []
+    const text = content
+      .filter((block     ) => block?.type === 'text' && typeof block.text === 'string')
+      .map((block     ) => String(block.text))
+      .join('\n')
+      .trim()
+    if (text.length === 0) continue
+    const source = (message.source ?? data.source ?? {})                           
+    return {
+      seq: Number(event.seq ?? 0),
+      type: event.type,
+      role: String(message.role ?? (event.type === 'user/message' ? 'user' : 'assistant')),
+      sourceKind: String(source.kind ?? ''),
+      surfaceOp: undefined,
+      textLength: text.length,
+      textHead: text.split(/\r?\n/u).map((line) => line.trim()).find((line) => line.length > 0)?.slice(0, 200) ?? '',
+      carriesTurnStep: false,
+    }
+  }
+  return null
+}
+
 async function inspectSessionLog(ctx     , sessionId        , cwd         )                         {
+  /**
+   * THE INJECTED READER WINS. This is the whole of "monitoring works without a host".
+   *
+   * It is checked BEFORE `ensureParadise()`, and that order is deliberate: on a bare machine the layer is
+   * importable but its HOST ADAPTER is the wrong tool — resolving it first would load a reader that cannot
+   * open a `.jsonl` and then report the session as unreadable.
+   */
+  if (readerProvider !== undefined) {
+    let answer                                               
+    try {
+      answer = await readerProvider.read(sessionId)
+    } catch (error) {
+      return emptyReport('reader-error', [
+        `注入的读取器（${readerProvider.name}）抛错：${String((error       )?.message ?? error)}`,
+      ])
+    }
+    const events = Array.isArray(answer.events) ? answer.events : []
+    const types = [...new Set(events.map((event) => String(event.type)))]
+    return {
+      readable: answer.readable,
+      path: answer.path,
+      pathSource: answer.pathSource,
+      bytes: 0,
+      frameCount: events.length,
+      framesDecoded: events.length,
+      eventTypes: types,
+      eventCount: events.length,
+      briefing: briefingOf(events),
+      /**
+       * RENDERABILITY IS NOT KNOWABLE HERE, and saying `false` is the honest answer: a reader that reports
+       * events has no idea what a view would draw. The host path answers this properly; the bare path says
+       * it does not know.
+       */
+      renderedByConversation: false,
+      notes: [...answer.notes, `读取器：${readerProvider.name}`],
+    }
+  }
+
   const binding = await ensureParadise()
   if (!binding.available || binding.reader === undefined) {
     const report = emptyReport('paradise-unavailable', [
@@ -1772,6 +1893,34 @@ function paradiseStatus()
  
 
 /**
+ * AN INJECTED ADAPTER PROVIDER — how this plugin runs where there is no host.
+ *
+ * WHY THIS IS NOT A FEATURE FLAG: the name of the thing this plugin depends on is "two verbs" (`create`
+ * and `trigger`), not "the host's service container". A deployment that already HAS those verbs — a bare
+ * machine running the layer's raw adapters — should be able to say so, and the plugin should then behave
+ * exactly as it does inside a host. That is the whole of "host-independent": not a second code path, but
+ * the same path fed from somewhere else.
+ *
+ * WHAT IT DOES NOT CHANGE: with no provider installed, resolution goes to `ensureParadise()` and the
+ * host's own factory, exactly as before. Every existing test keeps exercising that path.
+ */
+                                                
+                                                                                                                                    
+        
+
+let provider                                  
+
+/** Install (or clear) the provider. `null` from it means "no opinion, resolve as usual". */
+function setWriteAdapterProvider(next                                  )       {
+  provider = next
+}
+
+/** Is a provider installed? Diagnostics print this so "why is it not using the host" is answerable. */
+function hasWriteAdapterProvider()          {
+  return provider !== undefined
+}
+
+/**
  * Resolve the layer's write surface.
  *
  * Returns `undefined` with a stated reason when the layer is missing or does not expose the write
@@ -1785,6 +1934,26 @@ async function ensureWriteAdapter(ctx     )
                                               
                     
    {
+  /**
+   * THE PROVIDER IS CHECKED FIRST, and a `null` answer falls through rather than being treated as a
+   * failure: a caller may own only SOME contexts (a test owns its own `{}`, production owns the real
+   * one), and forcing it to fabricate an answer for the rest would push a stub into a live path.
+   */
+  if (provider !== undefined) {
+    const injected = provider(ctx)
+    if (injected !== null) {
+      if (injected.ok !== true) return { ok: false, reason: injected.reason ?? '注入的适配器不可用' }
+      if (injected.session === undefined) return { ok: false, reason: '注入的适配器没有提供 session' }
+      return {
+        ok: true,
+        reason: '',
+        session: injected.session,
+        ...(injected.deletes === undefined ? {} : { deletes: injected.deletes }),
+        ...(injected.layerName === undefined ? {} : { layerName: injected.layerName }),
+      }
+    }
+  }
+
   const binding                  = await ensureParadise()
   if (!binding.available) {
     return { ok: false, reason: binding.reason }
@@ -5239,6 +5408,15 @@ export const injectionInternals = {
   resolveInheritedCwdAsync,
   ensureWriteAdapter,
   writePathStatus,
+  /**
+   * THE HOST-INDEPENDENCE SEAM.
+   *
+   * `setWriteAdapterProvider` is how a deployment says "here are the two verbs, do not go looking for a
+   * host". It is exported at this level (not only from `core/paradise-write.ts`) because the consumer that
+   * needs it — a bare-machine runner — imports the PLUGIN, not its internals.
+   */
+  setWriteAdapterProvider,
+  hasWriteAdapterProvider,
 }
 
 /**
@@ -5262,6 +5440,15 @@ export const diskLogInternals = {
   resetParadiseCache,
   unavailableBinding,
   PARADISE_MISSING_CONSEQUENCE,
+  /**
+   * THE READ-PATH SEAM — the counterpart of `setWriteAdapterProvider`.
+   *
+   * Without it this plugin could WATCH sessions on a bare machine (its write path was already injectable)
+   * but could not READ them, which is the part a monitor actually does. Exported here for the same reason
+   * the write seam is: the consumer imports the plugin, not its internals.
+   */
+  setSessionLogReader,
+  hasSessionLogReader,
 }
 
 /**

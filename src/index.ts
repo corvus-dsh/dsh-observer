@@ -73,9 +73,11 @@ import {
   PARADISE_MISSING_CONSEQUENCE,
   ensureParadise,
   escapeSessionDirName,
+  hasSessionLogReader,
   inspectSessionLog,
   paradiseStatus,
   resetParadiseCache,
+  setSessionLogReader,
   unavailableBinding,
 } from './core/paradise-bridge.js'
 /**
@@ -85,7 +87,7 @@ import {
  * "the layer is missing / too old / refuses" into a STATED reason the incubation reports, instead of
  * a crash deep inside a half-built artifact.
  */
-import { ensureWriteAdapter, writePathStatus } from './core/paradise-write.js'
+import { ensureWriteAdapter, hasWriteAdapterProvider, setWriteAdapterProvider, writePathStatus } from './core/paradise-write.js'
 import { ASK_TOOL_NAME, checkConfirmation, confirmationRefusal, findAskEvidence } from './core/confirmation.js'
 /**
  * v1.9.0 — ONLY THE PROMPT TEXT AND THE MARKER COME FROM THE ARCHIVED IGNITION MODULE.
@@ -2125,6 +2127,15 @@ export const injectionInternals = {
   resolveInheritedCwdAsync,
   ensureWriteAdapter,
   writePathStatus,
+  /**
+   * THE HOST-INDEPENDENCE SEAM.
+   *
+   * `setWriteAdapterProvider` is how a deployment says "here are the two verbs, do not go looking for a
+   * host". It is exported at this level (not only from `core/paradise-write.ts`) because the consumer that
+   * needs it — a bare-machine runner — imports the PLUGIN, not its internals.
+   */
+  setWriteAdapterProvider,
+  hasWriteAdapterProvider,
 }
 
 /**
@@ -2148,6 +2159,15 @@ export const diskLogInternals = {
   resetParadiseCache,
   unavailableBinding,
   PARADISE_MISSING_CONSEQUENCE,
+  /**
+   * THE READ-PATH SEAM — the counterpart of `setWriteAdapterProvider`.
+   *
+   * Without it this plugin could WATCH sessions on a bare machine (its write path was already injectable)
+   * but could not READ them, which is the part a monitor actually does. Exported here for the same reason
+   * the write seam is: the consumer imports the plugin, not its internals.
+   */
+  setSessionLogReader,
+  hasSessionLogReader,
 }
 
 /**
