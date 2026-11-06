@@ -1,10 +1,10 @@
 # dsh-observer v1.3.0 修复报告 — 孵化落不到原目录 / 方案没注入
 
 > 日期：2026-11-05
-> 工作区：`D:\持久层能力架构\dsh-observer`
+> 工作区：`D:\workspace\dsh-observer`
 > 结论先行：**两条病因都已定位到具体代码行，并按 dsh-graft-slice 的物理注入路径重写。**
 > `dsh-observer` 测试 **65 → 101 全绿**，构建**字节可复现**，`dsh-graft-slice` 542/542 未受影响。
-> **需要重启宿主**（profile 以 `link:D:/持久层能力架构/dsh-observer` 装载，重启即读到新的 `index.js`）。
+> **需要重启宿主**（profile 以 `link:D:/workspace/dsh-observer` 装载，重启即读到新的 `index.js`）。
 
 ---
 
@@ -201,7 +201,7 @@ dsh-memory        : 248 / 248        （未改动；有 1 条并发写用例偶�
 ### 6.2 物理证据（`_scratch/observer-evidence.mjs`）
 
 ```
-prepare call      : [{ id: "session-395b82e7-…", options: { meta: { cwd: "D:\\持久层能力架构" } } }]
+prepare call      : [{ id: "session-395b82e7-…", options: { meta: { cwd: "D:\\workspace" } } }]
 persistence order : create → append → flush → close
 inheritedEventCount: 0
 seq=0  turn/start          turn=1
@@ -272,5 +272,5 @@ turn/end  real: {"turn":1,"reason":{"kind":"completed"}}
 5. 核对 §7.1 的三件事
 ```
 
-若第 3 步仍显示 `1.2.1`，说明装载的是 `node_modules` 旧副本而非 `D:\持久层能力架构\dsh-observer` ——
-profile 的 `dependencies` 里是 `link:D:/持久层能力架构/dsh-observer`，正常应直接读到新 `index.js`。
+若第 3 步仍显示 `1.2.1`，说明装载的是 `node_modules` 旧副本而非 `D:\workspace\dsh-observer` ——
+profile 的 `dependencies` 里是 `link:D:/workspace/dsh-observer`，正常应直接读到新 `index.js`。

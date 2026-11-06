@@ -69,7 +69,7 @@ test('bridge: the layer resolves from a SIBLING directory in this workspace', as
 
 test('bridge: the reader returns the SAME report shape the observer always printed', async () => {
   resetParadiseCache()
-  const report = await inspectSessionLog({}, 'session-nope', 'D:\\持久层能力架构')
+  const report = await inspectSessionLog({}, 'session-nope', 'D:\\workspace')
   // Every field the tool result and its tests read must exist, even on a miss.
   for (const key of [
     'readable',
@@ -96,7 +96,7 @@ test('bridge: a HOST-NAMED path outranks the derived one', async () => {
   // Whichever wins is visible in `path`.
   const named = join(dir, 'named-by-host.v4.jsonl.zstd')
   const ctx = { sessionPersistence: { pathOf: () => named } }
-  const report = await inspectSessionLog(ctx, 'session-x', 'D:\\持久层能力架构')
+  const report = await inspectSessionLog(ctx, 'session-x', 'D:\\workspace')
   assert.equal(report.path, named, 'the backend that wrote the file is the only authority')
   assert.match(report.pathSource, /sessionPersistence\.pathOf/u, 'and the receipt says where it came from')
 })
