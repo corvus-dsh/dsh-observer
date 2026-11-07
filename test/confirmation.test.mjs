@@ -115,10 +115,22 @@ test('gate: no reader at all is unverifiable too', async () => {
   assert.equal(verdict.evidence, 'unverifiable')
 })
 
-test('gate: the user-authorised skip is allowed and flagged', async () => {
-  const verdict = await checkConfirmation({ claimed: false, skipped: true, sessionId: 's' })
-  assert.equal(verdict.ok, true)
-  assert.match(verdict.warning, /用户显式要求跳过/u)
+/**
+ * v2.1.0: THE "USER-AUTHORISED SKIP" IS GONE, AND THIS TEST PINS ITS ABSENCE.
+ *
+ * The old case asserted that `skipped: true` produced `ok: true` with a warning. It could not be
+ * otherwise: the parameter was a claim ONLY the model could make, about a conversation only the
+ * model was producing, with no artifact to check. A tool whose purpose is "prove the user was asked"
+ * cannot also accept "trust me, they said not to ask" — that is the bypass, not an escape from it.
+ *
+ * The parameter is removed from the signature AND the schema, so this test asserts the refusal that
+ * now happens instead. If someone reintroduces the hatch, this fails.
+ */
+test('gate: there is no way to skip the confirmation — the claim alone is refused', async () => {
+  const verdict = await checkConfirmation({ claimed: false, sessionId: 's' })
+  assert.equal(verdict.ok, false)
+  assert.equal(verdict.evidence, 'not-asked')
+  assert.match(verdict.detail, /userConfirmed/u)
 })
 
 /* ── through the tool: refusals must leave nothing behind ────────────────── */
@@ -154,13 +166,22 @@ test('tool: asserted AND asked goes through, and the receipt cites the evidence'
   assert.equal(tapeOf(harness.persistence, reply.sessionId).length, 8)
 })
 
-test('tool: the user-authorised skip works and is reported as such', async () => {
+/**
+ * v2.1.0: passing `skipConfirmation` now creates NOTHING.
+ *
+ * The old case asserted the skip worked. Now the handler ignores the key and the gate refuses —
+ * which is the behaviour an operator needs: an attempt to bypass must leave no session, no prepared
+ * id, no ignition behind. A refusal that still reserved a session would be a bypass with extra steps.
+ */
+test('tool: a stray skipConfirmation creates nothing and is refused', async () => {
   const harness = boot({ askedUser: false })
   const reply = await spawn(harness, { skipConfirmation: true })
 
-  assert.equal(reply.ok, true, reply.text)
-  assert.equal(reply.confirmation.evidence, 'unverifiable')
-  assert.match(reply.text, /未核实/u)
+  assert.equal(reply.ok, false, 'the removed hatch must not grant anything')
+  assert.match(reply.text, /拒绝孵化/u)
+  assert.equal(harness.persistence.createCalls.length, 0, 'nothing was reserved')
+  assert.equal(harness.sessions.prepareCalls.length, 0, 'nothing was prepared')
+  assert.equal(harness.prompts.length, 0, 'nothing was ignited')
 })
 
 test('tool: `userConfirmed: false` is not an assertion', async () => {
@@ -182,6 +203,8 @@ test('refusal: it instructs the model to go and ASK, and forbids forging the fla
 })
 
 test('refusal: an allowed verdict produces no text', async () => {
-  const verdict = await checkConfirmation({ claimed: true, sessionId: 's', skip: true, skipped: true })
+  /** v2.1.0: `skip`/`skipped` are gone from the signature; an allowed verdict is the evidence path. */
+  const verdict = await checkConfirmation({ claimed: true, sessionId: 's' })
+  assert.equal(verdict.ok, true)
   assert.equal(confirmationRefusal(verdict), '')
 })

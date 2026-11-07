@@ -1,6 +1,6 @@
 {
-  "name": "dsh-observer",
-  "version": "1.9.0",
+  "name": "@corvus-dsh/dsh-observer",
+  "version": "2.1.0",
   "description": "Companion session (副脑) for DSH: a follower session bound to a main session, co-transferring by pointer, never sliced. Supervises the main it hatches.",
   "entry": "index.js",
   "activate": "activate(ctx, config)",

@@ -60,19 +60,32 @@ export function findAskEvidence(events: readonly any[]): number | null {
  * Decide whether the incubation may proceed.
  *
  * @param options.claimed   what the caller asserted (`userConfirmed: true`)
- * @param options.skipped   the caller passed `skipConfirmation: true` (user said "just hatch")
  * @param options.readLog   reads the CALLING session's log; undefined when unavailable
+ * @param options.sessionId the calling session, for the evidence lookup
+ *
+ * ── v2.1.0: `skipConfirmation` WAS REMOVED, AND THAT IS THE POINT ────────────────────────────
+ *
+ * It used to accept a boolean that returned `ok: true` outright, bypassing every other check. The
+ * claim it encoded was "the user said to skip confirmation" — a statement the MODEL makes about a
+ * conversation the model is also producing. There is no fact to verify, no log to read, no approval
+ * to compare against: it was a self-signed permission slip.
+ *
+ * That is precisely the bypass this module exists to close. A tool whose job is "prove the user was
+ * asked" cannot also accept "trust me, they said not to ask".
+ *
+ * The parameter is gone from the tool SCHEMA too, not merely ignored here: the schema declares
+ * `additionalProperties: false`, so a model that passes it now gets a schema rejection instead of a
+ * silent grant.
  */
 export async function checkConfirmation(options: {
   claimed: boolean
-  skipped?: boolean
   readLog?: (sessionId: string) => Promise<any>
   sessionId: string
 }): Promise<ConfirmationVerdict> {
-  const { claimed, skipped, readLog, sessionId } = options
+  const { claimed, readLog, sessionId } = options
 
   // 1. The explicit assertion. Without it, nothing else matters — do not even read the log.
-  if (claimed !== true && skipped !== true) {
+  if (claimed !== true) {
     return {
       ok: false,
       evidence: 'not-asked',
@@ -81,18 +94,7 @@ export async function checkConfirmation(options: {
     }
   }
 
-  // 2. The escape hatch the USER can authorise: 「不用确认，直接孵化」.
-  if (skipped === true) {
-    return {
-      ok: true,
-      evidence: 'unverifiable',
-      askedAtSeq: null,
-      detail: '调用方声明用户已明确要求跳过确认（skipConfirmation）',
-      warning: '用户显式要求跳过确认环节；请确认这是用户原话，而不是你的推断',
-    }
-  }
-
-  // 3. The evidence check.
+  // 2. The evidence check.
   if (typeof readLog !== 'function') {
     return {
       ok: true,

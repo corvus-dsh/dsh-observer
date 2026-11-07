@@ -148,22 +148,51 @@ test('mission text: the observer is told it is NOT the executor', () => {
   assert.match(text, /session-main-1/u)
 })
 
-test('permitsExecution: an observer may not execute; an unpaired session may', () => {
-  assert.equal(permitsExecution('observer'), false)
-  assert.equal(permitsExecution('main'), true)
-  assert.equal(permitsExecution(''), true)
+/**
+ * v2.1.0: `permitsExecution` WAS DELETED, so its test is replaced by the fact that replaced it.
+ *
+ * The function was exported, tested, and never called by production code. The plugin subscribes to
+ * `session/event` and `graft/session-transferred` — both NOTIFICATIONS, neither able to veto a tool
+ * call — so there is nowhere to enforce "an observer must not execute". The rule survives as the
+ * mission text asserted just above (`不是执行者`), which is a prompt-level expectation, not a gate.
+ *
+ * Keeping a test for a function nobody calls would have preserved the illusion of enforcement. This
+ * test pins the honest state: the rule is documented, and there is no mechanism pretending otherwise.
+ */
+test('no execution guard is exported, because none is enforced', () => {
+  assert.equal(
+    typeof policyInternals.permitsExecution,
+    'undefined',
+    'a guard with no call site must not be exported — it reads as enforcement in a review',
+  )
+  /** The expectation still travels, as prose the model reads. */
+  assert.match(policyInternals.OBSERVER_MISSION_TEXT('session-main-1'), /不是执行者/u)
 })
 
 /* ── 6. the tool schema carries the gate ────────────────────────────────── */
 
-test('schema: userConfirmed and skipConfirmation exist, and are documented as gates', () => {
+test('schema: userConfirmed exists, and skipConfirmation is GONE', () => {
   const harness = boot()
   const definition = harness.tools.get('observer_spawn_main')
   const props = definition.parameters.properties
   assert.ok('userConfirmed' in props, 'the gate must be a declared parameter')
-  assert.ok('skipConfirmation' in props, 'the user-authorised escape hatch must be declared')
   assert.match(props.userConfirmed.description, /ask_user_question/u)
   assert.match(props.userConfirmed.description, /REFUSED/u)
+  /**
+   * v2.1.0: `skipConfirmation` WAS REMOVED FROM THE SCHEMA TOO.
+   *
+   * Ignoring it in the handler would leave a model able to pass it and believe it worked — it would
+   * get a silent grant of nothing and no error. Because the schema is `additionalProperties: false`,
+   * removing the key makes the attempt a SCHEMA ERROR, which is loud and immediate.
+   *
+   * This test exists so it cannot come back by accident.
+   */
+  assert.equal('skipConfirmation' in props, false, 'the self-signed bypass must not be declared')
+  assert.equal(
+    definition.parameters.additionalProperties,
+    false,
+    'additionalProperties:false is what turns a stray skipConfirmation into a visible error',
+  )
   assert.deepEqual(
     definition.parameters.required,
     ['plan'],

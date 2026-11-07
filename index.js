@@ -2064,19 +2064,32 @@ function findAskEvidence(events                )                {
  * Decide whether the incubation may proceed.
  *
  * @param options.claimed   what the caller asserted (`userConfirmed: true`)
- * @param options.skipped   the caller passed `skipConfirmation: true` (user said "just hatch")
  * @param options.readLog   reads the CALLING session's log; undefined when unavailable
+ * @param options.sessionId the calling session, for the evidence lookup
+ *
+ * ── v2.1.0: `skipConfirmation` WAS REMOVED, AND THAT IS THE POINT ────────────────────────────
+ *
+ * It used to accept a boolean that returned `ok: true` outright, bypassing every other check. The
+ * claim it encoded was "the user said to skip confirmation" — a statement the MODEL makes about a
+ * conversation the model is also producing. There is no fact to verify, no log to read, no approval
+ * to compare against: it was a self-signed permission slip.
+ *
+ * That is precisely the bypass this module exists to close. A tool whose job is "prove the user was
+ * asked" cannot also accept "trust me, they said not to ask".
+ *
+ * The parameter is gone from the tool SCHEMA too, not merely ignored here: the schema declares
+ * `additionalProperties: false`, so a model that passes it now gets a schema rejection instead of a
+ * silent grant.
  */
 async function checkConfirmation(options   
                   
-                   
                                                
                    
  )                               {
-  const { claimed, skipped, readLog, sessionId } = options
+  const { claimed, readLog, sessionId } = options
 
   // 1. The explicit assertion. Without it, nothing else matters — do not even read the log.
-  if (claimed !== true && skipped !== true) {
+  if (claimed !== true) {
     return {
       ok: false,
       evidence: 'not-asked',
@@ -2085,18 +2098,7 @@ async function checkConfirmation(options
     }
   }
 
-  // 2. The escape hatch the USER can authorise: 「不用确认，直接孵化」.
-  if (skipped === true) {
-    return {
-      ok: true,
-      evidence: 'unverifiable',
-      askedAtSeq: null,
-      detail: '调用方声明用户已明确要求跳过确认（skipConfirmation）',
-      warning: '用户显式要求跳过确认环节；请确认这是用户原话，而不是你的推断',
-    }
-  }
-
-  // 3. The evidence check.
+  // 2. The evidence check.
   if (typeof readLog !== 'function') {
     return {
       ok: true,
@@ -2545,16 +2547,24 @@ const NOT_CONFIRMED_REFUSAL = [
 ].join('\n')
 
 /**
- * Whether a session that has hatched a main is still allowed to execute.
+ * ── v2.1.0: `permitsExecution` WAS DELETED ──────────────────────────────────────────────────────
  *
- * Exported as a decision function rather than a sentence so a test can pin the rule, and so the
- * same answer is available to any future guard. `role` is what the pair table stores.
+ * It answered "may this session still execute work, given its pair role?" and returned
+ * `role !== 'observer'`. It was exported, re-exported through `policyInternals`, and covered by
+ * tests — but NO PRODUCTION CODE EVER CALLED IT. It was a guard that guarded nothing.
+ *
+ * The honest options were to wire it or to remove it, and the second is the only possible one here:
+ * this plugin subscribes to `session/event` and `graft/session-transferred`, both of which are
+ * NOTIFICATIONS. Neither can veto a tool call. The host offers no pre-step or pre-tool intercept on
+ * this plugin's surface, so there is nowhere to put a refusal.
+ *
+ * Inventing a call site that only logs "refused" while the work continues anyway would be worse than
+ * having no guard: it would read as enforcement in a review while enforcing nothing.
+ *
+ * WHAT REPLACES IT: nothing, and that is stated. "An observer must not act as the executor" remains
+ * a documented expectation, not a mechanism. If a future host exposes an intercept, that is where
+ * this becomes real code again — with a call site, not just an export.
  */
-function permitsExecution(role                          )          {
-  // An observer must not act as the executor. A session with NO pair is an ordinary session and
-  // may do whatever the user asks.
-  return role !== 'observer'
-}
 
 /**
  * MONITOR — the observer as a SITE SUPERVISOR (监理), v1.7.0.
@@ -3426,7 +3436,7 @@ export const name = 'dsh-observer'
  * Client half is cached separately, and "did my build reach the app?" must be answerable
  * without guessing.
  */
-export const VERSION = '1.9.0'
+export const VERSION = '2.1.0'
 console.log(`[dsh-observer] host version ${VERSION}`)
 
 /**
@@ -4603,7 +4613,7 @@ export function apply(ctx                   , config                          = 
     observerSessionId        ,
     plan        ,
     /** v1.6.0: the caller's assertion that the user approved this plan. */
-    confirmation                                          = { claimed: false },
+    confirmation                       = { claimed: false },
               
                
                      
@@ -4659,7 +4669,6 @@ export function apply(ctx                   , config                          = 
       const queryForEvidence = resolveService(ctx, 'sessionQuery', 'readSession')
       const verdict = await checkConfirmation({
         claimed: confirmation.claimed === true,
-        skipped: confirmation.skipped === true,
         sessionId: observerSessionId,
         readLog:
           isRecord(queryForEvidence) && typeof queryForEvidence.readSession === 'function'
@@ -5229,12 +5238,16 @@ export function apply(ctx                   , config                          = 
             'verifies that ask_user_question was actually called in this session; without this ' +
             'argument, or without that evidence, the incubation is REFUSED.',
         },
-        skipConfirmation: {
-          type: 'boolean',
-          description:
-            'Set to true ONLY when the user explicitly said to skip confirmation for this handoff ' +
-            '(「不用确认」「跳过确认」「别问了直接孵化」). Words about hatching alone are NOT this.',
-        },
+        /**
+         * v2.1.0: `skipConfirmation` WAS DELETED.
+         *
+         * It let the caller bypass the evidence check by asserting "the user said not to confirm" —
+         * a claim only the model could make, about a conversation only the model was producing. A
+         * tool whose purpose is "prove the user was asked" cannot accept "trust me, don't ask".
+         *
+         * Removing it from the schema (this object is `additionalProperties: false`) means a model
+         * that still passes it gets a schema error, which is louder than being silently ignored.
+         */
       },
       required: ['plan'],
       additionalProperties: false,
@@ -5262,14 +5275,18 @@ export function apply(ctx                   , config                          = 
      * answered as `ok:false` with the stack verbatim. Both channels carry the same cause; neither
      * swallows it.
      */
-    execute: async (args                                                                                                      , exec     ) => {
+    execute: async (args                                                                          , exec     ) => {
       const plan = typeof args?.plan === 'string' ? args.plan : ''
       const explicit = typeof args?.observerSessionId === 'string' ? args.observerSessionId.trim() : ''
       const observerSessionId = explicit.length > 0 ? explicit : typeof exec?.agent?.id === 'string' ? exec.agent.id : ''
       try {
+        /**
+         * v2.1.0: `skipped` is no longer passed because the concept is gone. The only path to an
+         * incubation is `userConfirmed: true` PLUS evidence of an `ask_user_question` call — a fact
+         * the host can check, not a claim the model can make.
+         */
         const spawned = await spawnMainFromObserver(observerSessionId, plan, {
           claimed: args?.userConfirmed === true,
-          skipped: args?.skipConfirmation === true,
         })
         /**
          * v1.3.1 — THE SUCCESS PATH CARRIES THE SAME DIAGNOSTIC FIELD AS THE FAILURE PATH.
@@ -5463,7 +5480,6 @@ export const policyInternals = {
   SPAWN_MAIN_DESCRIPTION,
   TRIGGER_SECTION_NAME,
   TRIGGER_SECTION_TEXT,
-  permitsExecution,
 }
 
 /**

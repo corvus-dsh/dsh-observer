@@ -152,13 +152,21 @@ export const NOT_CONFIRMED_REFUSAL = [
 ].join('\n')
 
 /**
- * Whether a session that has hatched a main is still allowed to execute.
+ * ── v2.1.0: `permitsExecution` WAS DELETED ──────────────────────────────────────────────────────
  *
- * Exported as a decision function rather than a sentence so a test can pin the rule, and so the
- * same answer is available to any future guard. `role` is what the pair table stores.
+ * It answered "may this session still execute work, given its pair role?" and returned
+ * `role !== 'observer'`. It was exported, re-exported through `policyInternals`, and covered by
+ * tests — but NO PRODUCTION CODE EVER CALLED IT. It was a guard that guarded nothing.
+ *
+ * The honest options were to wire it or to remove it, and the second is the only possible one here:
+ * this plugin subscribes to `session/event` and `graft/session-transferred`, both of which are
+ * NOTIFICATIONS. Neither can veto a tool call. The host offers no pre-step or pre-tool intercept on
+ * this plugin's surface, so there is nowhere to put a refusal.
+ *
+ * Inventing a call site that only logs "refused" while the work continues anyway would be worse than
+ * having no guard: it would read as enforcement in a review while enforcing nothing.
+ *
+ * WHAT REPLACES IT: nothing, and that is stated. "An observer must not act as the executor" remains
+ * a documented expectation, not a mechanism. If a future host exposes an intercept, that is where
+ * this becomes real code again — with a call site, not just an export.
  */
-export function permitsExecution(role: 'main' | 'observer' | ''): boolean {
-  // An observer must not act as the executor. A session with NO pair is an ordinary session and
-  // may do whatever the user asks.
-  return role !== 'observer'
-}

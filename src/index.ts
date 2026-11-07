@@ -103,7 +103,6 @@ import {
   SPAWN_MAIN_DESCRIPTION,
   TRIGGER_SECTION_NAME,
   TRIGGER_SECTION_TEXT,
-  permitsExecution,
 } from './core/policy.js'
 /**
  * v1.7.0 — THE SUPERVISOR (监理).
@@ -145,7 +144,7 @@ export const name = 'dsh-observer'
  * Client half is cached separately, and "did my build reach the app?" must be answerable
  * without guessing.
  */
-export const VERSION = '1.9.0'
+export const VERSION = '2.1.0'
 console.log(`[dsh-observer] host version ${VERSION}`)
 
 /**
@@ -1322,7 +1321,7 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
     observerSessionId: string,
     plan: string,
     /** v1.6.0: the caller's assertion that the user approved this plan. */
-    confirmation: { claimed: boolean; skipped?: boolean } = { claimed: false },
+    confirmation: { claimed: boolean } = { claimed: false },
   ): Promise<{
     ok: boolean
     sessionId: string
@@ -1378,7 +1377,6 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       const queryForEvidence = resolveService(ctx, 'sessionQuery', 'readSession')
       const verdict = await checkConfirmation({
         claimed: confirmation.claimed === true,
-        skipped: confirmation.skipped === true,
         sessionId: observerSessionId,
         readLog:
           isRecord(queryForEvidence) && typeof queryForEvidence.readSession === 'function'
@@ -1948,12 +1946,16 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
             'verifies that ask_user_question was actually called in this session; without this ' +
             'argument, or without that evidence, the incubation is REFUSED.',
         },
-        skipConfirmation: {
-          type: 'boolean',
-          description:
-            'Set to true ONLY when the user explicitly said to skip confirmation for this handoff ' +
-            '(「不用确认」「跳过确认」「别问了直接孵化」). Words about hatching alone are NOT this.',
-        },
+        /**
+         * v2.1.0: `skipConfirmation` WAS DELETED.
+         *
+         * It let the caller bypass the evidence check by asserting "the user said not to confirm" —
+         * a claim only the model could make, about a conversation only the model was producing. A
+         * tool whose purpose is "prove the user was asked" cannot accept "trust me, don't ask".
+         *
+         * Removing it from the schema (this object is `additionalProperties: false`) means a model
+         * that still passes it gets a schema error, which is louder than being silently ignored.
+         */
       },
       required: ['plan'],
       additionalProperties: false,
@@ -1981,14 +1983,18 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
      * answered as `ok:false` with the stack verbatim. Both channels carry the same cause; neither
      * swallows it.
      */
-    execute: async (args: { plan?: unknown; observerSessionId?: unknown; userConfirmed?: unknown; skipConfirmation?: unknown }, exec: any) => {
+    execute: async (args: { plan?: unknown; observerSessionId?: unknown; userConfirmed?: unknown }, exec: any) => {
       const plan = typeof args?.plan === 'string' ? args.plan : ''
       const explicit = typeof args?.observerSessionId === 'string' ? args.observerSessionId.trim() : ''
       const observerSessionId = explicit.length > 0 ? explicit : typeof exec?.agent?.id === 'string' ? exec.agent.id : ''
       try {
+        /**
+         * v2.1.0: `skipped` is no longer passed because the concept is gone. The only path to an
+         * incubation is `userConfirmed: true` PLUS evidence of an `ask_user_question` call — a fact
+         * the host can check, not a claim the model can make.
+         */
         const spawned = await spawnMainFromObserver(observerSessionId, plan, {
           claimed: args?.userConfirmed === true,
-          skipped: args?.skipConfirmation === true,
         })
         /**
          * v1.3.1 — THE SUCCESS PATH CARRIES THE SAME DIAGNOSTIC FIELD AS THE FAILURE PATH.
@@ -2182,7 +2188,6 @@ export const policyInternals = {
   SPAWN_MAIN_DESCRIPTION,
   TRIGGER_SECTION_NAME,
   TRIGGER_SECTION_TEXT,
-  permitsExecution,
 }
 
 /**

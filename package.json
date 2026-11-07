@@ -1,7 +1,8 @@
 {
-  "name": "dsh-observer",
-  "version": "1.9.0",
-  "description": "Companion session (副脑) for DSH: a follower session bound to a main session, co-transferring by pointer, never sliced.",
+  "name": "@corvus-dsh/dsh-observer",
+  "version": "2.1.0",
+  "description": "星火 OS 副脑 (observer): a companion session bound to a main session, co-transferring by pointer, never sliced. Watches for stuck loops and can inject a corrective interruption.",
+  "private": false,
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -24,13 +25,13 @@
   },
   "engines": {
     "dsh": ">=0.2.1-rc.5",
-    "node": ">=20"
+    "node": ">=22.5.0"
   },
   "peerDependencies": {
-    "dsh-paradise": "*"
+    "@corvus-dsh/dsh-paradise": "*"
   },
   "peerDependenciesMeta": {
-    "dsh-paradise": {
+    "@corvus-dsh/dsh-paradise": {
       "optional": true
     }
   },
@@ -45,7 +46,24 @@
     "client.js",
     "manifest.json",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/corvus-dsh/dsh-observer.git"
+  },
+  "homepage": "https://github.com/corvus-dsh/dsh-observer#readme",
+  "bugs": {
+    "url": "https://github.com/corvus-dsh/dsh-observer/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "observer",
+    "companion-session",
+    "starfire"
+  ]
 }
