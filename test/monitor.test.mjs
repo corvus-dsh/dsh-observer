@@ -218,8 +218,90 @@ test('monitor: five closed turns without moving the TODO list produce one correc
   assert.match(late[0].text, /memory_search|换方案/u)
 })
 
-test('monitor: rewriting the SAME board is not progress, rewriting a MOVED board resets', () => {
+/**
+ * ── AUDIT F6: THE MAIN THAT NEVER BUILT A BOARD WAS NEVER CORRECTED ─────────────────────────────
+ *
+ * THE DEFECT. The stall trigger required `state.lastTodoSeq > 0`, and that counter is only set after
+ * a `todo_write` settles. A main that never called `todo_write` therefore had `lastTodoSeq === 0`
+ * forever and could never be nudged. Measured on the audit's reproduction: eight closed turns, no
+ * board, `stalledTurns = 8`, `nudges = 0`.
+ *
+ * WHY IT MATTERED MORE THAN ANY OTHER MISS: it is a REVERSE INCENTIVE. A main that maintained a
+ * board and got stuck was supervised; a main that ignored the board entirely was not. The one case
+ * the observer exists for — a main that has lost its shape — was the one case it could not see.
+ *
+ * WHY THE OLD SUITE MISSED IT: every stall test above `todoWrite(...)` first. The suite only asked
+ * "does a stalled main WITH a board get nudged", never "what about one WITHOUT".
+ */
+test('audit F6: a main that NEVER built a TODO board is still nudged after enough stall', () => {
   const clock = fakeClock()
+  const state = createMonitorState()
+  const options = OPTIONS(clock)
+  assert.equal(state.everUsedTodo, false, 'precondition: no board has been written')
+
+  /**
+   * Eight closed turns of ordinary work with NO `todo_write` anywhere — the audit's exact scenario.
+   * Under the old condition this produced `nudges = 0`, which is what made the supervisor blind.
+   */
+  const events = []
+  for (let i = 0; i < 8; i += 1) {
+    events.push(toolCall('read', `r${i}`), toolResult(`r${i}`), turnEnd())
+  }
+  const actions = run(state, events, options)
+
+  assert.ok(actions.length >= 1, 'a board-free main that stalls MUST be corrected — this was the defect')
+  const nudge = actions.find((a) => a.kind === 'nudge' && a.trigger === 'stall')
+  assert.ok(nudge, `expected a stall nudge, got: ${JSON.stringify(actions.map((a) => a.kind))}`)
+
+  /**
+   * AND IT MUST NOT CLAIM THERE IS A BOARD (audit F7). The generic sentence says "your list has not
+   * moved (last moved at seq=N)" — true for a main with a board, false for one that never built one.
+   * Saying it anyway would be a small lie at the exact moment the main is least able to check.
+   */
+  assert.match(nudge.text, /没有建立过 TODO 板|没有任何可见的进度/u, `must name the real situation: ${nudge.text}`)
+  assert.doesNotMatch(nudge.text, /清单最后一次移动在 seq=/u, 'must not cite a board that does not exist')
+  assert.match(nudge.text, /memory_search|换方案/u, 'the actionable half must still be there')
+})
+
+test('audit F6/F7: a main WITH a board still gets the board-specific sentence', () => {
+  /**
+   * The other side of the split, so the fix cannot regress into "say the generic sentence always".
+   * A main that built a board and stopped moving can be told exactly where it stopped, and that is
+   * strictly more useful than being told it has no visible progress.
+   */
+  const clock = fakeClock()
+  const state = createMonitorState()
+  const options = OPTIONS(clock)
+
+  run(state, [todoWrite('t0', [{ content: '阶段 1: 取证', status: 'in_progress' }]), toolResult('t0')], options)
+  assert.equal(state.everUsedTodo, true, 'a settled board must set the flag')
+
+  const events = []
+  for (let i = 0; i < STALL_TURNS_LIMIT; i += 1) {
+    events.push(toolCall('read', `q${i}`), toolResult(`q${i}`), turnEnd())
+  }
+  const actions = run(state, events, options)
+  const nudge = actions.find((a) => a.kind === 'nudge' && a.trigger === 'stall')
+  assert.ok(nudge, 'a stalled main with a board must be nudged')
+  assert.match(nudge.text, /清单最后一次移动在 seq=/u, 'the board-specific sentence must be used here')
+  assert.doesNotMatch(nudge.text, /没有建立过 TODO 板/u)
+  assert.match(String(nudge.detail), /未推进 TODO/u)
+})
+
+test('audit F7: everUsedTodo is set when the CALL is seen, even if it never settles', () => {
+  /**
+   * WHY "seen" AND NOT "settled". A `todo_write` whose result never came back still proves the main
+   * TRIED to show a plan. Deriving the fact from a settle would keep a blind spot for exactly the
+   * malformed case, and it is also the honest reading: the question is "did it attempt a board".
+   */
+  const clock = fakeClock()
+  const state = createMonitorState()
+  run(state, [todoWrite('t0', [{ content: 'x', status: 'pending' }])], OPTIONS(clock))
+  assert.equal(state.everUsedTodo, true, 'the call alone must record the attempt')
+  assert.equal(state.lastTodoSeq, 0, 'and the settled counter must still be 0 — hence the separate field')
+})
+
+test('monitor: rewriting the SAME board is not progress, rewriting a MOVED board resets', () => {  const clock = fakeClock()
   const state = createMonitorState()
   const options = OPTIONS(clock)
   const same = [{ content: '阶段 1: 取证', status: 'in_progress' }]

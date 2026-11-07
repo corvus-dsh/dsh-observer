@@ -2697,6 +2697,25 @@ const DEFAULT_MONITOR_OPTIONS                 = {
                                                                                                      
                       
                      
+     
+                                                                                                  
+    
+                                                                                     
+                                                                                                     
+                                                                                                 
+                                                                                                
+                                        
+    
+                                                                                              
+                                                                                                  
+                                                                                                    
+                        
+    
+                                                                                                   
+                                                                                                
+                                       
+     
+                       
                        
                    
                     
@@ -2722,6 +2741,7 @@ function createMonitorState()               {
     failure: null,
     stalledTurns: 0,
     lastTodoSeq: 0,
+    everUsedTodo: false,
     todoSignature: '',
     openTodos: 0,
     totalTodos: 0,
@@ -2809,6 +2829,27 @@ function stallNudgeText(stalledTurns        , todoSeq        , openTodos        
   ].join('\n')
 }
 
+/**
+ * ── AUDIT F6/F7: THE SENTENCE FOR A MAIN THAT NEVER BUILT A BOARD ───────────────────────────────
+ *
+ * A DIFFERENT complaint, because it is a different situation. `stallNudgeText` says "you have not
+ * MOVED your list" and cites `seq`/`openTodos`; for a main that never wrote a list those numbers are
+ * meaningless, and telling it "your list has not moved" would be simply false — there is no list to
+ * be behind on.
+ *
+ * What is actually wrong in that case is an absence of any visible progress at all. So the ask is to
+ * START one, and it stays an ask rather than an accusation: a single-turn task legitimately needs no
+ * board, which is why this only fires after `stalledTurns`, never immediately.
+ */
+function stallWithoutBoardText(stalledTurns        )         {
+  return [
+    `${NUDGE_MARKER} 已连续 ${stalledTurns} 轮没有任何可见的进度记录（这段会话里还没有建立过 TODO 板）。`,
+    '如果你在做多步任务，请用一次 `todo_write` 说明：已经完成了什么、当前卡在哪一项、下一步是什么；',
+    '如果任务本来就只需一两步，用一句结论说明现状即可 —— 这里要的是「可见的进度」，不是形式。',
+    '如果卡在同一处，用 `memory_search` 查经验，或换方案，而不是继续原样重试。',
+  ].join('\n')
+}
+
 function cooldownBlocks(state              , options                , seq        )         {
   if (state.nudges >= options.nudgeCap) return `已达上限 ${options.nudgeCap} 次`
   const since = options.now() - state.lastNudgeAt
@@ -2846,6 +2887,15 @@ function stepMonitor(
     if (callId.length === 0 || name.length === 0) return actions
     state.pending[callId] = name
     if (TODO_TOOL.test(name)) {
+      /**
+       * AUDIT F6/F7: RECORD THE ATTEMPT, not just the payload.
+       *
+       * Set HERE — when the call is SEEN — rather than after it settles, because the question the
+       * stall trigger has to answer is "did this main ever try to show its plan", and a call that
+       * failed still answers yes. Waiting for a settle would also keep the `lastTodoSeq > 0` blind
+       * spot for any main whose `todo_write` results never came back.
+       */
+      state.everUsedTodo = true
       const items = todoItemsFromArguments(event.data?.arguments)
       if (items !== undefined) state.pendingTodo[callId] = snapshotOf(items)
     }
@@ -2917,14 +2967,45 @@ function stepMonitor(
         reason: 'completed',
         detail: `清单 ${state.totalTodos} 项全部完成（seq=${state.lastTodoSeq}）`,
       })
-    } else if (state.lastTodoSeq > 0 && state.stalledTurns >= options.stallTurns) {
+    } else if (state.stalledTurns >= options.stallTurns) {
+      /**
+       * ── AUDIT F6: THE STALL TRIGGER USED TO REQUIRE A BOARD, SO AN ORDERLESS MAIN WAS NEVER SEEN ──
+       *
+       * WHAT WAS WRONG. The condition was:
+       *
+       *     state.lastTodoSeq > 0 && state.stalledTurns >= options.stallTurns
+       *     ^^^^^^^^^^^^^^^^^^^^^^^ excludes every main that never called todo_write
+       *
+       * Measured: a main that ran eight turns, never built a board and never reported progress
+       * received ZERO corrections (`stalledTurns=8 nudges=0`), while a main that built a board and
+       * then stopped moving was corrected. The supervisor was blind to precisely the disordered case
+       * it exists to catch — a reverse incentive that teaches a main that ignoring the board is safer
+       * than maintaining it.
+       *
+       * WHY THE CONDITION WAS THERE, and why it is now a separate word rather than a removed guard:
+       * a main on a single-turn task legitimately needs no board, so "no TODO" alone is not
+       * evidence of being lost. What distinguishes lost from legitimately board-free is STALL —
+       * `stalledTurns` — which is already required. So the gate becomes: stall is the evidence,
+       * and `everUsedTodo` only chooses WHICH SENTENCE to say.
+       *
+       * THE TWO SENTENCES ARE DIFFERENT ON PURPOSE (audit F7):
+       *   never built  -> "show your progress" — an invitation to begin, because there is no board
+       *                   to be behind on, and claiming there is one would be a lie.
+       *   built, stalled -> the existing nudge that names the seq and the open count, because that
+       *                   main can be told exactly where it stopped.
+       */
       const blocked = cooldownBlocks(state, options, seq)
       if (blocked.length === 0) {
+        const neverBuilt = state.everUsedTodo !== true
         actions.push({
           kind: 'nudge',
           trigger: 'stall',
-          text: stallNudgeText(state.stalledTurns, state.lastTodoSeq, state.openTodos),
-          detail: `连续 ${state.stalledTurns} 轮未推进 TODO（最后移动 seq=${state.lastTodoSeq}）`,
+          text: neverBuilt
+            ? stallWithoutBoardText(state.stalledTurns)
+            : stallNudgeText(state.stalledTurns, state.lastTodoSeq, state.openTodos),
+          detail: neverBuilt
+            ? `连续 ${state.stalledTurns} 轮没有任何进度记录（从未建立 TODO 板）`
+            : `连续 ${state.stalledTurns} 轮未推进 TODO（最后移动 seq=${state.lastTodoSeq}）`,
           seq,
         })
         state.nudges += 1
