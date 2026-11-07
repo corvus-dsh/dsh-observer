@@ -27,6 +27,31 @@ jobs:
       - name: Show the runtime we are actually testing on
         run: node --version && npm --version
 
+      - name: Check out the layer this plugin writes through
+        # ── WHY A SIBLING CHECKOUT AND NOT A SKIP ────────────────────────────────────────────
+        #
+        # This plugin's job is to write a session THROUGH `dsh-paradise`. Its async tests are not
+        # "nice to have": they are the only place the write path is exercised end to end. Skipping
+        # them when the layer is absent would leave CI green while never testing the one thing this
+        # package does — the failure mode that makes a green badge worthless.
+        #
+        # `dsh-paradise` lives in a sibling repository, so it is checked out BESIDE this one. That is
+        # the same layout the workspace uses locally, which means CI and a developer machine resolve
+        # the layer through the identical path.
+        uses: actions/checkout@v4
+        with:
+          repository: corvus-dsh/dsh-paradise
+          path: ../dsh-paradise-checkout
+
+      - name: Place the layer where the sibling probe expects it
+        # The bridge tries `@corvus-dsh/dsh-paradise` (package specifier) then `../dsh-paradise`
+        # (sibling directory). CI has no installed package, so the sibling probe must succeed — and
+        # it looks for the DIRECTORY NAME `dsh-paradise`, not the scoped package name.
+        run: |
+          set -e
+          mv ../dsh-paradise-checkout ../dsh-paradise
+          node -e "console.log('layer at', require('node:fs').realpathSync('../dsh-paradise/index.js'))"
+
       - name: Install (no dependencies expected)
         run: npm install --no-audit --no-fund
 
