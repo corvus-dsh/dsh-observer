@@ -33,7 +33,14 @@ window.__OBSERVER_LOADED__ = '1.1.0'
 console.log('%c[dsh-observer] FUCK CACHE 1.1.0 — no button; the model summons, the host creates', 'color:#16a34a;font-weight:bold')
 
 window.__ModuleLoader__.load({
-  id: 'dsh-observer',
+  /**
+   * THE REGISTRATION ID MUST BE THE PACKAGE NAME (`@corvus-dsh/dsh-observer`), NOT `dsh-observer`.
+   *
+   * The Host keys each boot-graph row by package.json `name`; a short id never matches, so the
+   * loader reports "loaded without registering", re-executes the bundle as a fallback, and the
+   * page dies on `duplicate factory registration`. See dsh-memory/client.js for the full trace.
+   */
+  id: '@corvus-dsh/dsh-observer',
   factory(require, styles, host) {
     /**
      * Services used:

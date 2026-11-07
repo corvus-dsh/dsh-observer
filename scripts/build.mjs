@@ -28,7 +28,22 @@ process.stdout.write(
  * sibling plugins keep them.
  */
 const client = readFileSync(join(root, 'client.js'), 'utf8')
-if (/id:\s*'dsh-observer-v/u.test(client)) {
-  throw new Error('client.js must register with the plain id `dsh-observer` — a versioned id broke Web auth')
+const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+/**
+ * v0.1.14 shipped a VERSIONED id (`dsh-observer-v14`) and the next start died with
+ * `Web authentication failed`. The rule is not "some plain-looking id" — it is THE PACKAGE NAME:
+ * the Host composes the web boot graph with `graphRow(packageName, …)` and the browser loader
+ * looks the row up by that id. After the `@corvus-dsh/*` rename, the short id `dsh-observer`
+ * produced `loaded without registering "@corvus-dsh/dsh-observer"` and a fallback re-execution
+ * that crashed the page on `duplicate factory registration`.
+ */
+const registered = /__ModuleLoader__\.load\(\{\s*id:\s*'([^']+)'/u.exec(
+  client.replace(/\/\*[\s\S]*?\*\//gu, '').replace(/\/\/[^\n]*/gu, ''),
+)
+if (registered === null) throw new Error('client.js must register via __ModuleLoader__.load({ id, factory })')
+if (registered[1] !== pkg.name) {
+  throw new Error(
+    `client.js must register the package name "${pkg.name}" (got "${registered[1]}") — the Host keys boot rows by package name`,
+  )
 }
-process.stdout.write(`client.js ${Buffer.byteLength(client)} bytes (plain id, no polling)\n`)
+process.stdout.write(`client.js ${Buffer.byteLength(client)} bytes (id ${registered[1]})\n`)

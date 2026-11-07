@@ -26,9 +26,19 @@ test('client: the cache probe is the first statement and sets a window marker', 
   assert.match(bundle, /__OBSERVER_LOADED__\s*=\s*'/u, 'it carries a version value, not just true')
 })
 
-test('client: registered through __ModuleLoader__.load with a factory and the PLAIN id', () => {
+test('client: registered through __ModuleLoader__.load with a factory and the PACKAGE id', () => {
   assert.match(bundle, /window\.__ModuleLoader__\.load\(/u, 'the module registers itself with the loader')
-  assert.match(bundle, /^\s*id:\s*'dsh-observer',$/mu, 'the module id is the plain package name')
+  /**
+   * THE ID IS THE PACKAGE NAME, NOT A SHORT ALIAS. The Host keys each web boot-graph row by
+   * `package.json` `name` (`graphRow(packageName, …)`), and the browser loader looks the row up by
+   * that exact id. The old `'dsh-observer'` survived the `@corvus-dsh/*` rename, so the page boot
+   * reported `loaded without registering "@corvus-dsh/dsh-observer"`, re-executed the bundle as a
+   * fallback, and died on `duplicate factory registration`.
+   */
+  const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8'))
+  const registered = /^\s*id:\s*'([^']+)',$/mu.exec(bundle)
+  assert.ok(registered !== null, 'the module must register an id')
+  assert.equal(registered[1], pkg.name, `the module id must be the package name (${pkg.name})`)
   assert.doesNotMatch(bundle, /id:\s*'dsh-observer-v\d+/u, 'a versioned id broke Web authentication')
   assert.match(bundle, /factory\s*\(\s*require\s*,\s*styles\s*,\s*host\s*\)/u, 'the factory form is mandatory')
 })
