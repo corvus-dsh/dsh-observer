@@ -1425,7 +1425,25 @@ async function rollbackInjectedSession(
              
  
 
-const PACKAGE_NAME = 'dsh-paradise'
+/**
+ * THE INSTALLED PACKAGE NAME. Scoped since v2.1.0: the registry rejects the bare `dsh-paradise`.
+ *
+ * Kept separate from `SIBLING_DIR` below because the two stopped being the same string when the
+ * package was scoped. Conflating them produced `../@corvus-dsh/dsh-paradise/index.js`, which is not
+ * a directory that exists — the scoped name is a package SPECIFIER, the directory on disk is still
+ * `dsh-paradise`.
+ */
+const PACKAGE_NAME = '@corvus-dsh/dsh-paradise'
+
+/**
+ * THE DIRECTORY NAME, which is NOT the package name.
+ *
+ * This workspace lays the repos side by side by REPO name (`dsh-paradise/`), not by scoped package
+ * name. In CI only one repo is checked out, so the sibling probe fails either way — but using the
+ * scoped name here would break the sibling probe in a full workspace too, which is the configuration
+ * where it is the ONLY way to resolve the layer.
+ */
+const SIBLING_DIR = 'dsh-paradise'
 
 /**
  * The consequence a caller must print when the layer is missing.
@@ -1435,7 +1453,7 @@ const PACKAGE_NAME = 'dsh-paradise'
  */
 const PARADISE_MISSING_CONSEQUENCE =
   '磁盘逐帧核对不可用（冷读结论仍然有效）。' +
-  `安装 ${PACKAGE_NAME} 后该项自动恢复：把 ${PACKAGE_NAME} 放在与 dsh-observer 同级的目录，` +
+  `安装 ${PACKAGE_NAME} 后该项自动恢复：把 ${SIBLING_DIR} 放在与 dsh-observer 同级的目录，` +
   '或在 profile 的依赖里加入它。'
 
 let cached                         = null
@@ -1443,7 +1461,7 @@ let inFlight                                  = null
 
 /** The specifiers tried, in order. Exported so a test can assert the resolution order. */
 function paradiseSpecifiers()           {
-  return [PACKAGE_NAME, `../${PACKAGE_NAME}/index.js`]
+  return [PACKAGE_NAME, `../${SIBLING_DIR}/index.js`]
 }
 
 function isReader(value         )                          {

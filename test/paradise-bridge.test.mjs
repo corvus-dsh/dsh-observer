@@ -258,7 +258,19 @@ test('status: the paradise dependency is reported, with its specifiers', async (
    * touched the layer before this status call is not a property of the DESIGN, but the ORDER of the fallback
    * chain is — a caller reading this receipt must see which names would be tried.
    */
-  assert.deepEqual(before.paradise.specifiers, ['dsh-paradise', '../dsh-paradise/index.js'])
+  /**
+   * v2.1.0: THE TWO ENTRIES ARE NO LONGER THE SAME STRING.
+   *
+   * The package was scoped (`@corvus-dsh/dsh-paradise`) because the registry rejects the bare name,
+   * but the DIRECTORY on disk is still `dsh-paradise` — this workspace lays repos side by side by
+   * repo name. Interpolating the package name into the sibling path produced
+   * `../@corvus-dsh/dsh-paradise/index.js`, a path that does not exist, which broke the sibling
+   * probe in a full workspace: the one configuration where it is the only way to resolve the layer.
+   *
+   * The contract this test guards is unchanged — the ORDER of the fallback chain is visible to a
+   * caller. Only the strings are new.
+   */
+  assert.deepEqual(before.paradise.specifiers, ['@corvus-dsh/dsh-paradise', '../dsh-paradise/index.js'])
   assert.match(before.paradise.consequence, /dsh-paradise/u)
 
   await ensureParadise()
