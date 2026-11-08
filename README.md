@@ -314,7 +314,7 @@ sessionQuery.readSession(id)                   ← 冷读校验：读回来的�
 node scripts/build.mjs && node --test test/*.test.mjs
 ```
 
-**当前：208 / 208。** 覆盖：
+**当前：204 / 204。** 覆盖：
 
 - **冷 tape 物理注入**（`incubation.test.mjs`）：cwd 来自发起会话 header、`persistence.create`
   带 `inheritedEventCount: 0`、事件序列与 `surfaceOp` 逐条断言、turn 必须闭合、
@@ -335,6 +335,17 @@ node scripts/build.mjs && node --test test/*.test.mjs
   本地 `disk-log.ts` 确实已删除且产物里没有 bare import；
 - **配对与转生**：任意一半被切片只改指针、一个会话只属一个配对、重新孵化会解散旧配对；
 - **包契约**：无 BOM、版本一致、每个工具的 `output` 契约完备、schema 词汇在 Loader 子集内。
+
+**测试专用出口（批次 3 第 1 组）：** 入口导出 16 个名字，其中 **9 个是 test seam**——
+`injectionInternals`、`diskLogInternals`、`policyInternals`、`ignitionInternals`、`confirmationInternals`、
+`monitorInternals`、`supervisorInternals`、`debugObserverState`、`debugFollowTransfer`。
+它们**不是公开 API**：形态、名字、是否存在都不保证跨版本，改它们不算破坏性变更。
+`test/test-seam-inventory.test.mjs` 把整个导出面钉成**字面量清单**，所以新增 seam 必须是有意动作——
+优先折进已有的 `*Internals` 对象（多一个函数不花新名字），其次才新增顶层名字并在 commit 里写明理由。
+
+其中 `injectionInternals` 与 `diskLogInternals` **同时是跨仓测试契约**：`dsh-paradise` 的测试套件在用，
+`scripts/preflight.mjs` 还会断言 `diskLogInternals` 存在。重命名或折叠它们不是本地改动，而是**两仓 CI 的耦合**——
+要做就得两边一次改完、一起推。本批次因此只做了「声明收敛 + 清单锁」，折叠作为**已计价项**记录（见源码里的 seam 边界块）。
 
 ## 配置
 

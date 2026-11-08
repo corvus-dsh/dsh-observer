@@ -2122,6 +2122,36 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
 }
 
 /** Test seam: the in-process state, so a test can assert without touching disk. */
+/* ── THE TEST-SEAM SURFACE ────────────────────────────────────────────────────────────────────────
+ *
+ * WHAT THIS IS: the `*Internals` objects and the two `debug*` functions below exist so the TEST SUITES
+ * can reach behaviour that has no production caller. They are exported from the entry because a
+ * single-file bundle offers no other way to reach them.
+ *
+ * THE NINE SEAMS: `injectionInternals`, `diskLogInternals`, `policyInternals`, `ignitionInternals`,
+ * `confirmationInternals`, `monitorInternals`, `supervisorInternals`, `debugObserverState`,
+ * `debugFollowTransfer`.
+ *
+ * THEY ARE NOT PUBLIC API. Nothing outside a test may depend on their shape, their names, or their
+ * existence across versions: a change here is not a breaking change, and none of them is documented as
+ * a feature.
+ *
+ * THE INVENTORY IS LOCKED BY A TEST (`test/test-seam-inventory.test.mjs`): these nine names, and the
+ * seven production exports beside them, are asserted against a literal list. A seam therefore cannot
+ * appear by accident, which is the only thing that stops "it is only for tests" from being a reason to
+ * grow the surface. THE RULE WHEN YOU NEED A NEW ONE:
+ *
+ *   1. PREFER FOLDING IT INTO AN OBJECT ALREADY LISTED ABOVE. One more function inside an object costs
+ *      no new name; one more top-level export costs a name forever.
+ *   2. A NEW TOP-LEVEL `debug*` / `*ForTest` EXPORT NEEDS ITS REASON IN THE COMMIT MESSAGE, and the
+ *      inventory test is updated in the same commit.
+ *   3. TWO OF THESE ARE A CROSS-REPOSITORY TEST CONTRACT — `injectionInternals` and `diskLogInternals`
+ *      are imported by `dsh-paradise`'s own suite, and `diskLogInternals` is asserted present by
+ *      `scripts/preflight.mjs`. Renaming or folding those two is therefore NOT a local edit: it
+ *      couples two repositories' CI, and the honest way is one coordinated change with both sides
+ *      updated and pushed together. (Measured 2026-11-08: 9 of this entry's 16 exports are seams, so
+ *      the proportion is real — the folding is deferred as a costed item, not overlooked.)
+ */
 export function debugObserverState(): ObserverBindings {
   return JSON.parse(JSON.stringify(state))
 }
