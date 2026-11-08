@@ -24,6 +24,8 @@
 
 import {
   DEFAULT_MONITOR_OPTIONS,
+  HARVEST_LIMIT,
+  IDLE_HARVEST_MS,
   type HarvestReason,
   type MonitorAction,
   type MonitorOptions,
@@ -38,11 +40,19 @@ import { ignitionDeadline, describePromptFailure } from './ignition.js'
 /**
  * How long a main must be SILENT before the idle harvest is attempted.
  *
- * 90s is chosen against the two failure modes: a shorter window fires between two steps of a long
- * tool call (and the main is not idle at all), a longer one never fires inside a conversation.
- * The gate in `harvestGate` is what stops it firing repeatedly, not this number.
+ * ── P1-4 (audit 2026-11-08): THIS WAS A SECOND COPY OF THE SAME NUMBER ────────────────────────
+ *
+ * It used to be its own literal `90_000`, and `harvest()` passed a bare `limit: 3` — while
+ * `monitor.ts` declared `IDLE_HARVEST_MS = 90_000` and `HARVEST_LIMIT = 3` for the same two
+ * decisions. Two copies of one constant is not a style problem: the first measurable behaviour of
+ * this pair was that `monitor.ts` was flagged as carrying dead exports, precisely BECAUSE the
+ * supervisor never read them. Whoever tuned one would have silently left the other behind, and the
+ * suite would stay green because nothing compared them.
+ *
+ * It is now ALIASED, not re-declared, so it stays exported (the package entry re-exports it and
+ * tests may import it) while there is exactly one number behind it.
  */
-export const DEFAULT_SUPERVISOR_IDLE_MS = 90_000
+export const DEFAULT_SUPERVISOR_IDLE_MS = IDLE_HARVEST_MS
 
 /** The mission text an observer carries once it has hatched a main. Lives here so it cannot drift. */
 export const SUPERVISOR_DUTY_TEXT = [
@@ -193,7 +203,7 @@ export function createSupervisor(
       const result = await deps.tools.execute({
         callId: `observer-harvest-${mainSessionId}-${Date.now()}`,
         name: 'memory_harvest',
-        arguments: { limit: 3 },
+        arguments: { limit: HARVEST_LIMIT },
         signal: new AbortController().signal,
       })
       if (result === null || typeof result !== 'object' || result.isError === true) {

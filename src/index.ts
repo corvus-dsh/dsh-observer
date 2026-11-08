@@ -58,6 +58,12 @@ import { dirname, join } from 'node:path'
  */
 import { InjectError, resolveInheritedCwdAsync, resolveService, shortSessionTag } from './core/observer-inject.js'
 /**
+ * P1-3 (audit 2026-11-08): the `api-session/added` wire-shape guard. Imported BARE and re-exported
+ * rather than `export … from`, for the bundling reason the marker contract below records: the
+ * single-file walker follows an import into the inline order.
+ */
+import { assertSessionSummary } from './core/announce.js'
+/**
  * v1.8.0 — THE DURABLE-LOG READER NOW LIVES IN `dsh-paradise` (彼岸层).
  *
  * `src/core/disk-log.ts` was deleted, not deprecated: two copies of "decode every zstd frame" is
@@ -2281,6 +2287,12 @@ export function debugFollowTransfer(
 }
 
 export { EMPTY }
+
+/**
+ * P1-3: exported so a test can assert exactly what the four emit sites will refuse to send. It is a
+ * predicate, not a writer — nothing in this plugin changes behaviour because it is visible.
+ */
+export { assertSessionSummary }
 
 /**
  * v0.1.3: `manifest.json` names `activate`, and the Loader looks for it. Exporting the alias

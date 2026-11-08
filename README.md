@@ -278,6 +278,9 @@ sessionQuery.readSession(id)                   ← 冷读校验：读回来的�
 - 冷会话通过 `workspaceRegistry.resolveByPath(cwd)` + `attachSession(id)` 挂回发起会话的分组；
 - 再 `emit('api-session/added', …)` 通告客户端（Web UI 只从这个事件认识会话），
   失败都记为 `warnings`，不影响孵化成功。
+- **载荷先过 `assertSessionSummary`（P1-3）**：宿主的 `assertJsonArgs` 只校验载荷可 JSON 序列化，
+  **不校验 `sessionId` 是字符串**——而客户端与 `dsh-api-remotes` 都拿它当 key（`resources.session`）。
+  不合格的载荷会被**跳过**并记 warning，绝不发出去：那是一个在远端静默丢弃、本地看不到任何征兆的失败。
 
 ## 工具一览
 

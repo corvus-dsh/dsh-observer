@@ -55,6 +55,8 @@
 
 import { randomUUID } from 'node:crypto'
 
+import { assertSessionSummary } from './announce.js'
+
 /* ── shapes (erased by the build; kept for readers and for the tests) ───────── */
 
 interface InjectEvent {
@@ -1094,7 +1096,7 @@ export async function injectColdSession(ctx: InjectContext, request: InjectReque
     // summarizeCold produces.
     try {
       if (typeof ctx.emit === 'function') {
-        ctx.emit('api-session/added', {
+        const summary = {
           sessionId,
           updatedAt: createdAt,
           agentAvailable: false,
@@ -1102,7 +1104,20 @@ export async function injectColdSession(ctx: InjectContext, request: InjectReque
           running: false,
           blank: false,
           cwd,
-        })
+        }
+        /**
+         * P1-3: guarded BEFORE the emit, and skipped rather than sent when it cannot be keyed by.
+         * See `core/announce.ts` for why an unresolvable summary is worse than no summary: it is
+         * silent on every side. A skipped announcement is reported in `warnings`; the companion
+         * itself is already written and verified at this point, so the briefing is never lost.
+         */
+        if (!assertSessionSummary(summary)) {
+          warnings.push(
+            `客户端通告跳过：载荷没有可解析的 sessionId/updatedAt（sessionId=${JSON.stringify(summary.sessionId)}）`,
+          )
+        } else {
+          ctx.emit('api-session/added', summary)
+        }
       }
     } catch (error) {
       warnings.push(`客户端通告失败：${String((error as any)?.message ?? error)}`)
