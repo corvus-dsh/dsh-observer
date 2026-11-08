@@ -2630,25 +2630,6 @@ const OBSERVER_MISSION_TEXT = (mainSessionId        )         =>
   ].join('\n')
 
 /**
- * The refusal text when `userConfirmed` is missing or false.
- *
- * Superseded by `confirmationRefusal()` in `confirmation.ts`, which names WHICH fact was missing
- * (no assertion at all vs. assertion without a recorded question). Kept exported so older callers
- * and tests that reference it keep working — but the tool now uses the more specific one.
- */
-const NOT_CONFIRMED_REFUSAL = [
-  '拒绝孵化：缺少用户确认（userConfirmed 不是 true）。',
-  '',
-  '这个工具会创建一个**自动开跑**的主脑，所以计划必须先被用户看到并同意。你现在应当：',
-  '',
-  '1. 把计划**完整**写出来（目标、步骤、验证），不要只说「我打算这么做」；',
-  '2. 调用 `ask_user_question` 请用户确认，选项至少包含「确认，开始执行」与「需要调整」；',
-  '3. 等用户明确回复「确认 / 同意 / 开始 / 可以」之后，再调用本工具并传 `userConfirmed: true`。',
-  '',
-  '如果用户还没确认，就继续讨论计划。**不要**为了通过这个检查而把 userConfirmed 直接设为 true。',
-].join('\n')
-
-/**
  * ── v2.1.0: `permitsExecution` WAS DELETED ──────────────────────────────────────────────────────
  *
  * It answered "may this session still execute work, given its pair role?" and returned
