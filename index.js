@@ -1879,7 +1879,19 @@ function paradiseStatus()
     
           
                                          
-                                                                           
+              
+                  
+                                 
+                    
+         
+                                                                                     
+        
+                                                                                                  
+                                                                                                   
+                   
+         
+                                         
+      
               
                
                  
@@ -2213,8 +2225,34 @@ function confirmationRefusal(verdict                     )         {
  * than a human.
  */
 
-/** Prefix of every ignition prompt. A retry looks for exactly this in the target's log. */
+/**
+ * Prefix of every ignition prompt. A retry looks for exactly this in the target's log.
+ *
+ * ── P0 (audit 2026-11-08): THE MARKER IS NOW A CALLER CONCERN ──────────────────────────────────
+ *
+ * `dsh-paradise` (the layer that actually admits the prompt) used to default to THIS string — a
+ * layer inversion, since L1 was encoding an L4 plugin's identity. It now defaults to a neutral
+ * `'[plugin 点火]'` and takes the marker from the caller.
+ *
+ * The consequence for this file is not cosmetic: paradise's idempotence check reads the target's log
+ * for the marker it is given. Sessions already in the field carry `'[dsh-observer 点火]'`. If this
+ * plugin started passing only a NEW marker, every one of those sessions would stop being recognised
+ * as already ignited and be RE-TRIGGERED — the exact failure the marker exists to prevent.
+ *
+ * So the caller passes a LIST: the current marker first (it is what gets stamped), then every
+ * historical alias the read side must still honour. Today the two are the same; the list exists so
+ * that a future rename does not have to repeat this whole discovery.
+ */
 const IGNITION_MARKER = '[dsh-observer 点火]'
+
+/**
+ * Every marker this plugin has ever stamped, current first.
+ *
+ * Passed to paradise's `trigger` so the idempotence check accepts an older session's prompt. Grows
+ * only by APPENDING: an alias is never removed, because a session ignited two releases ago may still
+ * be resumed.
+ */
+const IGNITION_MARKERS                    = [IGNITION_MARKER]
 
 /** How long the Host is given to admit the prompt before the attempt is abandoned. */
 const IGNITION_TIMEOUT_MS = 20_000
@@ -5023,6 +5061,14 @@ export function apply(ctx                   , config                          = 
             text: DEFAULT_IGNITION_PROMPT,
             mode: 'queue',
             origin: 'plugin:observer:ignition',
+            /**
+             * THE LIST GOES IN, NOT THE SINGLE MARKER.
+             *
+             * paradise now stamps `marker[0]` and checks ALL of them, so a main ignited before a
+             * marker rename is still recognised as already awake. Without this the rename would
+             * silently re-trigger every existing main.
+             */
+            marker: IGNITION_MARKERS,
           },
         )
         if (result.ok) {

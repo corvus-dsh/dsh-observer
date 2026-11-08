@@ -61,7 +61,19 @@ interface SessionAdapterLike {
   }>
   trigger(
     session: { id: string; cwd: string },
-    trigger: { text: string; mode: 'queue' | 'interrupt'; origin: string },
+    trigger: {
+      text: string
+      mode: 'queue' | 'interrupt'
+      origin: string
+      /**
+       * The marker(s) paradise must use for BOTH stamping and the idempotence check.
+       *
+       * A LIST, current first: an already-ignited session carries the marker in force when it was
+       * created, and a rename must not make it invisible. See core/ignition.ts for why this is not
+       * a default.
+       */
+      marker?: string | readonly string[]
+    },
   ): Promise<{
     ok: boolean
     stage: string

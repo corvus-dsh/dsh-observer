@@ -97,7 +97,7 @@ import { ASK_TOOL_NAME, checkConfirmation, confirmationRefusal, findAskEvidence 
  * implementation inside this bundle — the duplication the layer exists to remove — and an unused import
  * is how that duplication quietly survives a refactor.
  */
-import { DEFAULT_IGNITION_PROMPT, IGNITION_MARKER } from './core/ignition.js'
+import { DEFAULT_IGNITION_PROMPT, IGNITION_MARKER, IGNITION_MARKERS } from './core/ignition.js'
 import {
   OBSERVER_MISSION_TEXT,
   SPAWN_MAIN_DESCRIPTION,
@@ -1632,6 +1632,14 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
             text: DEFAULT_IGNITION_PROMPT,
             mode: 'queue',
             origin: 'plugin:observer:ignition',
+            /**
+             * THE LIST GOES IN, NOT THE SINGLE MARKER.
+             *
+             * paradise now stamps `marker[0]` and checks ALL of them, so a main ignited before a
+             * marker rename is still recognised as already awake. Without this the rename would
+             * silently re-trigger every existing main.
+             */
+            marker: IGNITION_MARKERS,
           },
         )
         if (result.ok) {
