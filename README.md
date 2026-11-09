@@ -137,7 +137,7 @@ npm 上的**裸名** `dsh-memory` 和 `dsh-observer` 已被第三方注册，包
 
 ## 测试
 
-**当前 181 / 181。** preflight 15 项，其中三项是 v1.9.0 新增的切换守卫：
+**当前 204 / 204。** preflight 15 项，其中三项是 v1.9.0 新增的切换守卫：
 
 - 产物里写路径必须经 `ensureWriteAdapter → createDshAdapters`；
 - 缺层时必须 `PARADISE_WRITE_UNAVAILABLE`（不允许静默 no-op 或崩溃）；
@@ -158,9 +158,9 @@ npm 上的**裸名** `dsh-memory` 和 `dsh-observer` 已被第三方注册，包
 ## 已知边界
 
 1. **彼岸层现在是硬依赖。** 缺层 → 拒绝孵化（有 stage、有 code、有原因）。这是"零开关"的必然代价，也是它诚实的地方。
-2. **`observer-inject.ts` 仍被 inlined**，因为两个只读助手还在里面。想彻底移出，得把那两个助手搬走——那是下一次清理，不是这次切换。
+2. **`observer-inject.ts` 仍被 inlined**，因为 **4 个**只读助手还在里面（`InjectError` / `resolveInheritedCwdAsync` / `resolveService` / `shortSessionTag`）。想彻底移出，得把这 4 个助手搬走——那是下一次清理，不是这次切换。
 3. **`inject` 只覆盖创建时放置**；向已存在会话追加仍未接线（层里如实报 `NOT_WIRED`）。
-4. **`graft-slice` 一行未动。**
+4. **graft-slice 已完成彼岸层切换**（create / 冷读校验 / 回滚 / trigger 全走 dsh-paradise）。本仓是它的下游观察者，不负责它的写入路径。
 
 ## 许可
 
