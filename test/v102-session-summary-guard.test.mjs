@@ -30,7 +30,22 @@ import { fileURLToPath } from 'node:url'
 import { assertSessionSummary } from '../index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const injectSource = readFileSync(join(here, '..', 'src', 'core', 'observer-inject.ts'), 'utf8')
+
+/**
+ * ── 批次 C-2 (2026-11-09): THE ASSERTION MOVED TO THE LIVE PATH ────────────────────────────────
+ *
+ * This test used to read `src/core/observer-inject.ts` and assert that the `api-session/added` emit was
+ * reachable only through `assertSessionSummary`. That file is the ARCHIVED write path: since v1.9.0 the
+ * companion is created through `dsh-paradise`, and the announcement is made by the LAYER's own writer
+ * (`dsh-paradise/src/adapters/dsh/session-writer.ts`), which carries the same guard and its own test
+ * (`dsh-paradise/test/v102-session-summary-guard.test.mjs`).
+ *
+ * So the old assertion was checking the structure of code that no longer runs. Two honest options were
+ * available: keep reading the dead file (a test that certifies nothing), or point it at the live path.
+ * This file now does the second: it asserts that THIS plugin's live write binding is the layer's writer,
+ * and that no local emit survives here — which is the property the boundary actually depends on.
+ */
+const writeBridge = readFileSync(join(here, '..', 'src', 'core', 'paradise-write.ts'), 'utf8')
 
 test('P1-3: a well-formed cold summary is accepted', () => {
   assert.equal(assertSessionSummary({ sessionId: 'session-abc', updatedAt: 1_700_000_000_000 }), true)
@@ -68,22 +83,37 @@ test('P1-3: a non-object payload is refused rather than throwing', () => {
   }
 })
 
-test('P1-3 STATIC: the single emit site is reachable only through the guard, and refusal is reported', () => {
-  const marker = "'api-session/added'"
-  const sites = []
-  for (let at = injectSource.indexOf(marker); at !== -1; at = injectSource.indexOf(marker, at + 1)) sites.push(at)
-  assert.equal(sites.length, 1, 'observer announces a cold companion from exactly one place')
-
-  const emitAt = sites[0]
-  const guardAt = injectSource.lastIndexOf('assertSessionSummary(', emitAt)
-  assert.notEqual(guardAt, -1, 'the emit must be preceded by assertSessionSummary(summary)')
-  const between = injectSource.slice(guardAt, emitAt)
-  assert.match(between, /^assertSessionSummary\(summary\)/u, 'the guard must inspect the emitted object')
-  assert.match(between, /\}\s*else\s*\{/u, 'the emit must sit in the else branch of the guard')
-  assert.match(between, /warnings\.push\(/u, 'a skipped announcement must be reported, never silent')
-  assert.match(
-    injectSource.slice(Math.max(0, emitAt - 12), emitAt + 45),
-    /ctx\.emit\('api-session\/added', summary\)/u,
-    'the payload must be the named object the guard checked',
+test('P1-3 STATIC: this plugin no longer announces cold sessions itself — the layer does', () => {
+  /**
+   * THE BOUNDARY, ASSERTED IN THE DIRECTION IT ACTUALLY RUNS.
+   *
+   * The announcement is the layer's job now: `dsh-paradise`'s session writer emits `api-session/added`
+   * behind `assertSessionSummary`, and `dsh-paradise/test/v102-session-summary-guard.test.mjs` pins
+   * that. What THIS repository must guarantee is the other half — that no local emit reappears and
+   * bypasses the layer. A reintroduced `ctx.emit('api-session/added', …)` here would announce a
+   * companion the layer does not know it wrote, with a payload nothing validated.
+   */
+  assert.equal(
+    writeBridge.includes("ctx.emit('api-session/added'"),
+    false,
+    'the live write bridge must NOT emit api-session/added itself: the layer owns the announcement',
   )
+  assert.match(
+    writeBridge,
+    /createDshAdapters|ensureWriteAdapter|paradise\.session/u,
+    'the live path must still be the layer (create / trigger / delete via dsh-paradise)',
+  )
+  /**
+   * And the guarded emit that USED to live in the archived file is gone with it: the file is deleted,
+   * so this path cannot be read any more. Asserting its absence is what keeps a future edit from
+   * resurrecting it as "the old code we still had somewhere".
+   */
+  const archived = (() => {
+    try {
+      return readFileSync(join(here, '..', 'src', 'core', 'observer-inject.ts'), 'utf8')
+    } catch {
+      return undefined
+    }
+  })()
+  assert.equal(archived, undefined, 'the archived write path must stay deleted (批次 C-2)')
 })

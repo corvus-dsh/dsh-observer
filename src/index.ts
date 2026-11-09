@@ -27,14 +27,14 @@ import { dirname, join } from 'node:path'
  * validates a whole tape in memory, and writes it through `sessionPersistence.create` +
  * `handle.append` + `handle.flush` — the same writer dsh-graft-slice uses for its cold targets.
  *
- * It lives in `src/core/observer-inject.ts` because it is a different job from pointer
- * bookkeeping, and because `src/index.ts` is already over a thousand lines of policy and prose.
+ * It USED to live in `src/core/observer-inject.ts`. That file was deleted on 2026-11-09 (批次 C-2) and
+ * the four read-only helpers this file still needs moved to `src/core/read-helpers.ts`.
  */
 /**
- * v1.9.0 — THE WRITE PATH MOVED TO THE 彼岸 LAYER.
+ * v1.9.0 — THE WRITE PATH MOVED TO THE 彼岸 LAYER; v1.9.0+ (2026-11-09) — THE ARCHIVE IS GONE.
  *
- * `./core/observer-inject.js` is KEPT ON DISK AS AN ARCHIVE and is no longer imported here. What this
- * file still takes from it is exactly two READ-ONLY helpers:
+ * `./core/observer-inject.js` is DELETED. What this file still takes from the old write path is exactly
+ * four READ-ONLY helpers, now in `./core/read-helpers.js`:
  *
  *   `resolveInheritedCwdAsync` — the cwd donor chain (header → session.cwd → workingDirectory →
  *      durable header). It is a READ, it is tested, and the layer deliberately does not own it: the
@@ -56,7 +56,15 @@ import { dirname, join } from 'node:path'
  *      vocabulary is what the tool result reports. The write path now throws plain `Error`s carrying
  *      the same two properties; unifying the two is also a later step.
  */
-import { InjectError, resolveInheritedCwdAsync, resolveService, shortSessionTag } from './core/observer-inject.js'
+/**
+ * 批次 C-2 (2026-11-09): THE FOUR HELPERS MOVED OUT OF THE ARCHIVED WRITE PATH.
+ *
+ * They used to be imported from `./core/observer-inject.js` — a 1,314-line file whose write machinery
+ * had already moved into `dsh-paradise` and whose only remaining job was exporting these four symbols.
+ * That made the whole file inlined into the bundle, so it could neither be deleted nor cleaned. They
+ * now live in `./core/read-helpers.js` with unchanged bodies; the archived file is gone.
+ */
+import { InjectError, resolveInheritedCwdAsync, resolveService, shortSessionTag } from './core/read-helpers.js'
 /**
  * P1-3 (audit 2026-11-08): the `api-session/added` wire-shape guard. Imported BARE and re-exported
  * rather than `export … from`, for the bundling reason the marker contract below records: the
@@ -838,9 +846,10 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
    *
    * SCOPE (v1.3.0): this is the COMPANION path only — the session made by
    * `sessionController.create`, which is LIVE by construction. The incubated MAIN does NOT come
-   * here any more; it is a COLD artifact written by `src/core/observer-inject.ts`. Keeping the two
-   * separate is the whole point: a live session may be appended to through the store writer, a
-   * prepared one may not.
+   * here any more; it is a COLD artifact written by the 彼岸 layer's session writer
+   * (`dsh-paradise/src/adapters/dsh/session-writer.ts`, via this plugin's `paradise-write.ts`).
+   * Keeping the two separate is the whole point: a live session may be appended to through the store
+   * writer, a prepared one may not.
    *
    * v1.0.5 — WHY `prompt` IS NOT USED.
    *

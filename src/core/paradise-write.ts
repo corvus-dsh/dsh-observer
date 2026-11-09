@@ -16,9 +16,9 @@
  * pin the capability probe to whatever the host looked like at first use. Capabilities are meant to
  * reflect the host NOW.
  *
- * WHAT THIS FILE IS NOT: it introduces no switch, no feature flag, no `legacy/` fork. The old
- * `observer-inject.ts` is kept as an archive that nothing imports (the user's explicit instruction),
- * so there is exactly one live path — this one.
+ * WHAT THIS FILE IS NOT: it introduces no switch, no feature flag, no `legacy/` fork. The old write
+ * path was deleted on 2026-11-09 (批次 C-2) — its four still-used read-only helpers moved to
+ * `src/core/read-helpers.ts` — so there is exactly one live path: this one.
  */
 
 import {

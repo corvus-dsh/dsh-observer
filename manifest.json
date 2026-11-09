@@ -43,7 +43,7 @@
     "noCwd": "refuse",
     "supervisorNeverAppends": "the correction goes through sessionController.prompt(steer), never a step-scoped log write",
     "paradiseReachedLazily": "never a static bare import of dsh-paradise: an absent package must not kill this entry at import time",
-    "singleWritePath": "the archived observer-inject.ts is history; create/trigger/rollback are called ONLY through paradise.session / paradise.deleteSession"
+    "singleWritePath": "the archived observer-inject.ts was deleted on 2026-11-09 (its four read-only helpers moved to src/core/read-helpers.ts); create/trigger/rollback are called ONLY through paradise.session / paradise.deleteSession"
   },
   "notes": [
     "This package OWNS observer-bindings.json. dsh-graft-slice only announces transfers; it has no observer code.",
@@ -51,6 +51,6 @@
     "v1.3.0: the incubated MAIN is a COLD artifact written by sessionPersistence.create + handle.append + handle.flush. It is never published into the live store, so a later agents.resume() cannot collide with it.",
     "v1.7.0: the observer supervises the main it hatched. Three consecutive same-tool failures, or five turns without moving the TODO board, produce ONE steer correction (capped and cooled down); a completed, idle or sliced main triggers a background memory_harvest. Every decision lives in src/core/monitor.ts and is testable without a host.",
     "v1.8.0: the durable-log reader moved to dsh-paradise (src/read/disk.ts), which is a separate bundle entry. The bridge in src/core/paradise-bridge.ts resolves it lazily, caches the answer including a failure, and maps its reading back into the unchanged DiskLogReport shape.",
-    "v1.9.0: the WRITE path moved too, so this plugin is now the 彼岸 layer's first real consumer. Incubation is paradise.session.create(items) + paradise.session.trigger; rollback is paradise.deleteSession. observer-inject.ts stays on disk as an archive and is no longer called: only its READ-ONLY helpers (the cwd donor chain, the error type) are still imported. There is no runtime switch and no forked implementation."
+    "v1.9.0: the WRITE path moved too, so this plugin is now the 彼岸 layer's first real consumer. Incubation is paradise.session.create(items) + paradise.session.trigger; rollback is paradise.deleteSession. observer-inject.ts stayed on disk as an archive until 2026-11-09, when it was DELETED and its four read-only helpers (the cwd donor chain, the error type, the service resolver, the short tag) moved to src/core/read-helpers.ts. There is no runtime switch and no forked implementation."
   ]
 }

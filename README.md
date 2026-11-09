@@ -99,7 +99,7 @@ npm 上的**裸名** `dsh-memory` 和 `dsh-observer` 已被第三方注册，包
 > **`v1.9.0`（2026-11-05）— 写路径切换到彼岸层：本插件成为 `dsh-paradise` 的第一个真实业务消费者**
 >
 > 孵化 = `paradise.session.create(items)` + `paradise.session.trigger`；回滚 = `paradise.deleteSession`。
-> `observer-inject.ts` **保留在盘作为历史存档，但不再被调用**——只有两个只读助手（cwd 供体链、错误类型）
+> `observer-inject.ts` 曾是历史存档（写路径已迁入彼岸层）——**该文件已于 2026-11-09 删除**，其中仍被使用的 4 个只读助手搬到了 `src/core/read-helpers.ts`。
 > 仍从它导入。**零开关、零共享状态、一条活路径**。
 >
 > ⚠️ **依赖性质变了**：彼岸层从"可选"变成"孵化必需"。缺层不再降级为"磁盘核对跳过"，
@@ -158,7 +158,7 @@ npm 上的**裸名** `dsh-memory` 和 `dsh-observer` 已被第三方注册，包
 ## 已知边界
 
 1. **彼岸层现在是硬依赖。** 缺层 → 拒绝孵化（有 stage、有 code、有原因）。这是"零开关"的必然代价，也是它诚实的地方。
-2. **`observer-inject.ts` 仍被 inlined**，因为 **4 个**只读助手还在里面（`InjectError` / `resolveInheritedCwdAsync` / `resolveService` / `shortSessionTag`）。想彻底移出，得把这 4 个助手搬走——那是下一次清理，不是这次切换。
+2. **~~`observer-inject.ts` 仍被 inlined~~ —— 已于 2026-11-09 收口。** 那 4 个只读助手（`InjectError` / `resolveInheritedCwdAsync` / `resolveService` / `shortSessionTag`）已搬到 `src/core/read-helpers.ts`，归档文件 `observer-inject.ts`（1,314 行）**已删除**，`bundle.mjs` 的可达性遍历不再内联它。
 3. **`inject` 只覆盖创建时放置**；向已存在会话追加仍未接线（层里如实报 `NOT_WIRED`）。
 4. **graft-slice 已完成彼岸层切换**（create / 冷读校验 / 回滚 / trigger 全走 dsh-paradise）。本仓是它的下游观察者，不负责它的写入路径。
 
@@ -261,7 +261,7 @@ handle.append(events) → handle.flush() → handle.close()
 sessionQuery.readSession(id)                   ← 冷读校验：读回来的就是我们写进去的
 ```
 
-写出的序列（`src/core/observer-inject.ts` 里由测试逐条断言）：
+写出的序列（写路径已迁入彼岸层，由 `dsh-paradise` 的 `adapters/dsh/inject.ts` 构建与校验；本仓测试仍逐条断言宿主侧契约）：
 
 | # | 事件 | turn/step | surfaceOp |
 |---|---|---|---|
@@ -279,8 +279,8 @@ sessionQuery.readSession(id)                   ← 冷读校验：读回来的�
 > `{ turn, step }`，宿主按「当前打开的那对 turn/step」校验（`requireStep`），冷读也是同一套规则。
 > 写在 `turn/start` 之前，等于 `turn === null` 时写一条 step-scoped 消息 —— 正是 v1.2.2 被拒的那类写入。
 > 真实宿主也是这个顺序：`dsh-graft-slice/test/fixtures/real-session.v4.jsonl.zstd` 里
-> `turn/start`=seq 4、`step/start`=seq 6、`system/message`=seq 7。`src/core/observer-inject.ts`
-> 的 `assertInjectTape` 把这条规则写成了断言，`test/cold-inject.test.mjs` 逐条覆盖。
+> `turn/start`=seq 4、`step/start`=seq 6、`system/message`=seq 7。这条规则现由彼岸层的
+> `assertInjectTape`（`dsh-paradise/src/adapters/dsh/inject.ts`）写成断言，`test/cold-inject.test.mjs` 逐条覆盖。
 
 ## 失败即抛出，回滚不留垃圾
 
