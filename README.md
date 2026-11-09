@@ -99,7 +99,7 @@ npm 上的**裸名** `dsh-memory` 和 `dsh-observer` 已被第三方注册，包
 > **`v1.9.0`（2026-11-05）— 写路径切换到彼岸层：本插件成为 `dsh-paradise` 的第一个真实业务消费者**
 >
 > 孵化 = `paradise.session.create(items)` + `paradise.session.trigger`；回滚 = `paradise.deleteSession`。
-> `observer-inject.ts` 曾是历史存档（写路径已迁入彼岸层）——**该文件已于 2026-11-09 删除**，其中仍被使用的 4 个只读助手搬到了 `src/core/read-helpers.ts`。
+> `observer-inject.ts` 曾是历史存档（写路径已迁入彼岸层）——**该文件已于 2026-11-09 删除**，其中仍被使用的只读助手已全部迁到 `src/core/read-helpers.ts`。
 > 仍从它导入。**零开关、零共享状态、一条活路径**。
 >
 > ⚠️ **依赖性质变了**：彼岸层从"可选"变成"孵化必需"。缺层不再降级为"磁盘核对跳过"，
@@ -158,7 +158,7 @@ npm 上的**裸名** `dsh-memory` 和 `dsh-observer` 已被第三方注册，包
 ## 已知边界
 
 1. **彼岸层现在是硬依赖。** 缺层 → 拒绝孵化（有 stage、有 code、有原因）。这是"零开关"的必然代价，也是它诚实的地方。
-2. **~~`observer-inject.ts` 仍被 inlined~~ —— 已于 2026-11-09 收口。** 那 4 个只读助手（`InjectError` / `resolveInheritedCwdAsync` / `resolveService` / `shortSessionTag`）已搬到 `src/core/read-helpers.ts`，归档文件 `observer-inject.ts`（1,314 行）**已删除**，`bundle.mjs` 的可达性遍历不再内联它。
+2. **~~`observer-inject.ts` 仍被 inlined~~ —— 已于 2026-11-09 收口。** 其中仍被使用的只读助手**已全部迁到 `src/core/read-helpers.ts`**，归档文件 `observer-inject.ts`（1,314 行）**已删除**，`bundle.mjs` 的可达性遍历不再内联它。（迁移面包含 `InjectError` / `resolveService` / `shortSessionTag` / `resolveInheritedCwd(Async)` / `isAbsoluteCwd` / `InjectContext`；此处**不计数**——数字会随实现增减而漂，`src/core/read-helpers.ts` 的 `grep '^export'` 是唯一准绳。）
 3. **`inject` 只覆盖创建时放置**；向已存在会话追加仍未接线（层里如实报 `NOT_WIRED`）。
 4. **graft-slice 已完成彼岸层切换**（create / 冷读校验 / 回滚 / trigger 全走 dsh-paradise）。本仓是它的下游观察者，不负责它的写入路径。
 
