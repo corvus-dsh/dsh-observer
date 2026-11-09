@@ -1,6 +1,6 @@
 {
   "name": "@corvus-dsh/dsh-observer",
-  "version": "0.9.0-beta.2",
+  "version": "0.9.1-beta.1",
   "description": "星火 OS 副脑 (observer): a companion session bound to a main session, co-transferring by pointer, never sliced. Watches for stuck loops and can inject a corrective interruption.",
   "private": false,
   "type": "module",
