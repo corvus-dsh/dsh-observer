@@ -12,6 +12,7 @@
 
 | 模块 | 职责（一句话） | 导出 | 依赖（本地模块） |
 |---|---|---|---|
+| `core/binding-store.ts` | 主脑-观察者绑定表：读入内存、原子写回、按对查询 | `createBindingStore`, `BindingStore`, `BindingFsLike` | — |
 | `core/announce.ts` | 向宿主宣告会话摘要并断言其形状 | `assertSessionSummary` | — |
 | `core/confirmation.ts` | 判定「确认」是否已有真实证据 | `checkConfirmation`, `findAskEvidence` | — |
 | `core/ignition.ts` | 点火文本识别与点火超时判定 | `igniteSession`, `isIgnitionText`, `ignitionDeadline` | — |

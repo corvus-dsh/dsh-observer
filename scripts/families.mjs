@@ -44,7 +44,19 @@ const run = (script, args) => {
 }
 
 const report = run('closure.mjs', [TARGET])
-const members = [...report.matchAll(/^\s+index\.ts:(\w+) \[(\w+)\]/gmu)].map((m) => ({ name: m[1], kind: m[2] }))
+/**
+ * ── 成员正则的 `(\w+)` 漏掉了 `let/var` —— 这就是「1876 vs 1877」那 1 行差的真身 ────────────────
+ *
+ * `closure.mjs` 打印的 kind 里有 `[let/var]`，而旧正则要求 `\[(\w+)\]`：`/` **不是** `\w`，
+ * 于是两个模块级 `let`（`bindingsPath` / `state`）**整条被丢弃**，不进成员表、也不进跨度求和。
+ *
+ * 差额因此凭空出现 2 行（两个 `let` 各 1 行），而 `FollowTransferResult` 的多算 1 行又把差额
+ * 抵消成 **1**（2 − 1 = 1）—— 两个方向相反的缺陷互相掩盖，正是「已知但未解释」最危险的样子。
+ * 上一版 NOTE 把差额解释成「闭包内的空行/游离语句」，**那是错的**：闭包里那 2 行是 `let`。
+ *
+ * 修法：kind 允许 `let/var`（`[\w/]+`），`spanOf` 也要能为它找行（见下）。
+ */
+const members = [...report.matchAll(/^\s+index\.ts:(\w+) \[([\w/]+)\]/gmu)].map((m) => ({ name: m[1], kind: m[2] }))
 console.log(`${TARGET}: ${members.length} declaration(s), ${/lines\s*:\s*(\d+)/u.exec(report)?.[1]} lines`)
 
 /**
@@ -89,10 +101,21 @@ const liveMembers = members.filter((m) => !ambiguousMembers.includes(m.name))
 const lines = readFileSync(SRC, 'utf8').split('\n')
 const spanOf = (name, kind) => {
   // 声明行：interface/type/const/function 后面跟名字；允许 export 前缀
+  /**
+   * ── `let/var` 必须也在这里有一支 ────────────────────────────────────────────────────────────────
+   *
+   * `closure.mjs` 把模块级 `let` 报成 kind `let/var`（它标 MUTABLE）。旧版 `spanOf` 只认
+   * interface / type / function / const，落进 `else` 支后按 `const` 去找 `let x` —— 找不到，返回 `undefined`。
+   * 于是调用方 `sizeOf()` 退回默认值 **1 行**，两个 `let` 各被算 1 行 …
+   *
+   * 但真正的缺陷在上游：成员正则也把它们丢了（见 `members` 那段的说明）。两处都修，
+   * 否则「找到名字但跨度错」和「名字根本没进表」会看起来像同一种病。
+   */
   const kw = kind === 'InterfaceDeclaration' ? 'interface'
     : kind === 'TypeAliasDeclaration' ? 'type'
       : kind === 'FunctionDeclaration' ? 'function'
-        : 'const'
+        : kind === 'let/var' ? '(?:let|var)'
+          : 'const'
   const re = new RegExp(`^(?:export\\s+)?${kw}\\s+${name}\\b`, 'u')
   const start = lines.findIndex((l) => re.test(l))
   if (start < 0) return undefined
@@ -253,34 +276,32 @@ components.sort((a, b) => {
 })
 
 /**
- * ── 自校验：声明跨度之和必须等于 closure 报的闭包行数 ────────────────────────────────────────────
+ * ── 自校验的含义（在 observer 上被校准过**三次**，前两次的结论都不完整）────────────────────────
  *
- * 实测到的症状：修 `spanOf` 之前，各分量之和是 **1,068**，而 `closure.mjs` 说闭包是 **974 行**。
- * 差 94 行不是噪声，是 `spanOf` 把「没有分号的一行常量」一路扫到下一条带括号的声明造成的虚胖
- * （`name` 被报成 20 行、`ATTACHMENT_KINDS` 与 `WRITE_TOOL_NAMES` 同样被放大）。
+ * **第一版**认为「跨度之和 == 闭包行数」，不等就说明 spanOf 错了。
  *
- * 修好后两者相等（863 = 863）。这个等式因此可以当断言用：一旦再次不等，就是 spanOf 又偏了。
- * 不相等时**依然打印整张表**，只在末尾给出警告 —— 一张有瑕疵的表比没有表有用，但瑕疵必须被说出来。
- */
-/**
- * ── 自校验的含义（在 observer 上被校准过两次，结论变了）─────────────────────────────────────────
+ * **第二次**：observer 上出现过 `1,876 != 1,877`（差 1）。当时查清了一处真偏差：
+ *   `FollowTransferResult` 被数成 5 行，编译器说 4 行 —— 联合的最后一行 `| { … }` 行尾是 `}`，
+ *   但它**本身也以 `|` 开头**，旧判据 `!unionMemberLine` 在它上面不成立 ⇒ 跳过 ⇒ 读到紧跟的空行才收尾。
+ *   修法：联合成员行只要 depth 归零**且下一行不再以 `|` 开头**就收尾。
+ *   修完逐成员跨度之和 = 1,875 == 编译器 1,875（0 差），而闭包总行数是 1,877，差 2。
+ *   当时把差 2 解释成「闭包内的非声明行（空行等）」，并把判据放宽成 `跨度之和 <= 闭包总行数`。
  *
- * 第一版认为「跨度之和 == 闭包行数」，不等就说明 spanOf 错了。
- * observer 上出现过 `1,876 != 1,877`（差 1），逐成员核对后查清**两件事**：
+ * **这一次（2026-11-13）证明那个解释是错的。** 用 `_scratch/span-audit2.mjs` 逐成员对照编译器，
+ * 发现 `closure.mjs` 打印的 kind 里有 `[let/var]`，而成员正则写的是 `\[(\w+)\]` ——
+ * **`/` 不是 `\w`**，于是两个模块级 `let` 整条被丢弃，既不入成员表、也不入跨度求和。
+ * 差额的实际来源：
  *
- *   ① 确实有一处 spanOf 偏差：`FollowTransferResult` 被数成 5 行，编译器说 4 行。
- *      原因：联合的最后一行 `| { … }` 行尾是 `}`，但它**本身也以 `|` 开头**，
- *      旧判据 `!unionMemberLine` 在它上面不成立 ⇒ 跳过 ⇒ 一路读到紧随的空行才收尾。
- *      修法：联合成员行只要 depth 归零**且下一行不再以 `|` 开头**就收尾。
- *   ② 修完后逐成员跨度之和 = **1,875**，与编译器的 **1,875** 完全相等（0 差）。
- *      而 `closure` 报的闭包总行数是 **1,877** —— 多的 2 行是闭包内的**非声明行**
- *      （声明之间的空行等）。
+ *   · 两个 `let` 各 1 行 ⇒ **+2**（漏算，使和偏小）
+ *   · `FollowTransferResult` 旧版多算 1 行 ⇒ **−1**（使和偏大）
+ *   · 两个方向相反的缺陷**互相抵消**，差额表现为 1 —— 于是它看起来像"就差点空行"，
+ *     实际是两个错误合成的一个数字。**这是最危险的一类：两个 bug 只有单独修才看得见。**
  *
- * 所以等式的正确形式是 **`跨度之和 <= 闭包总行数`**：
- *   · `跨度之和 > 闭包总行数`  ⇒ 一定是 spanOf 多算了（真缺陷，要报警）；
- *   · `跨度之和 < 闭包总行数`  ⇒ 闭包里有不属于任何声明的行（正常，但要说明白）。
+ * 修完两处后：**跨度之和 == 闭包总行数**（observer：1745 == 1745），逐成员与编译器 0 差。
+ * 所以判据回到**严格相等**，并且 `> ` 与 `<` 都算缺陷（不再有"正常差额"这一档）。
  *
- * **不静默**：两种情形都打印说明，并给出差额。把「已知但未解释」留成 WARNING 与静默通过只差一步。
+ * 为什么不再保留 `<=`：一旦允许"少一点也正常"，上面那种"两者互相抵消"就会永远藏得住。
+ * 差额必须为 0；如果哪天又不为 0，说明又出现了一个我没找到的行。
  */
 const closureLineTotal = Number(/lines\s*:\s*(\d+)/u.exec(report)?.[1])
 const spanTotal = members.reduce((s, m) => s + sizeOf(m.name), 0)
@@ -290,14 +311,12 @@ const inTable = components.reduce((s, c) => s + c.reduce((q, n) => q + sizeOf(n)
 console.log(`\n${components.length} connected component(s), ${inTable} lines in the table (+ ${total - inTable} for the removed ambiguous member = ${total})`)
 console.log('行的口径：每个分量的数字是**声明跨度和**（`families.mjs` 自身的 spanOf），')
 console.log('          既不是「切除区间」，也不是「`index.ts` 实测净变化」；只用于排序与族大小比较。')
-if (spanTotal > closureLineTotal) {
-  console.log(`WARNING: declaration spans total ${spanTotal} > closure total ${closureLineTotal}`)
-  console.log('         The sum EXCEEDS the closure — spanOf is over-counting (a real defect). Do not trust these numbers.\n')
-} else if (spanTotal < closureLineTotal) {
-  console.log(`NOTE: ${closureLineTotal - spanTotal} line(s) of the closure belong to NO declaration (blank lines / stray statements).`)
-  console.log('      逐成员核对已确认 spanOf 与编译器逐条相等 —— 这不代表 spanOf 错了。\n')
+if (spanTotal !== closureLineTotal) {
+  console.log(`WARNING: declaration spans total ${spanTotal} != closure total ${closureLineTotal} (difference ${spanTotal - closureLineTotal})`)
+  console.log('         spanOf and closure DISAGREE — one of them is counting a line the other is not.')
+  console.log('         Do not trust these numbers until the difference is 0. Audit with _scratch/span-audit2.mjs.\n')
 } else {
-  console.log('跨度之和 == 闭包总行数（闭包里没有非声明行）。\n')
+  console.log(`跨度之和 == 闭包总行数（${spanTotal} == ${closureLineTotal}），逐成员与编译器 0 差。\n`)
 }
 let idx = 0
 for (const comp of components) {

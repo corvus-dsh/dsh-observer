@@ -137,7 +137,7 @@ npm 上的**裸名** `dsh-memory` 和 `dsh-observer` 已被第三方注册，包
 
 ## 测试
 
-**当前 212 / 212。** preflight 15 项，其中三项是 v1.9.0 新增的切换守卫：
+**当前 215 / 215。** preflight 15 项，其中三项是 v1.9.0 新增的切换守卫：
 
 - 产物里写路径必须经 `ensureWriteAdapter → createDshAdapters`；
 - 缺层时必须 `PARADISE_WRITE_UNAVAILABLE`（不允许静默 no-op 或崩溃）；
@@ -328,13 +328,36 @@ sessionQuery.readSession(id)                   ← 冷读校验：读回来的�
 - **可选依赖 `dsh-paradise`**：磁盘交叉核对经由它。缺了不影响孵化、点火、监理，只在回执里具名
   降级（见上方 v1.8.0 一节）。
 
+## 绑定表住在哪（v1.10.0 依赖倒置）
+
+`observer-bindings.json` 的读写**只有一处实现**：`src/core/binding-store.ts` 的 `createBindingStore()`。
+
+```
+createBindingStore({ bindingsPath, fs? }) → { load, save, snapshot, observerOf, mainOfObserver,
+                                              pairOf, isObserverHalf, recordPair, takeFocus,
+                                              mutate, pairs, bindLegacy, setFromSnapshot, path }
+```
+
+**为什么要有这一层**：这张表原来靠 `src/index.ts` 里两个**模块级** `let`（`bindingsPath` / `state`）工作，
+于是任何「搬走这块代码」的尝试都同时搬走一个进程级单例，`closure.mjs` 直接报
+`mutable: [bindingsPath, state]`。把两个 `let` 收进工厂闭包后，模块级不再有可变绑定。
+
+> **`mutable: none` 是作用域变化，不是状态消失。** `state` 仍然存在，只是从「进程级单例」
+> 变成「每个 store 实例一份」。`index.ts` 里保留一个模块级 `let bindingStore` 来记住当前实例
+> （`apply()` 可能被多次调用，每次都要换成指向新 `bindingsPath` 的 store）。
+
+**IO 边界**：所有文件系统访问走 `BindingFsLike`（`readFileSync` / `writeFileSync` / `renameSync` /
+`mkdirSync` / `existsSync` 五个，**刻意收窄**）。生产路径不传 `fs` 就用 `node:fs`；
+测试传一个 fake 就**完全不碰磁盘** —— `test/binding-store-fs-boundary.test.mjs` 断言
+「一个完整的 `save()` 之后，真实临时目录里零文件」，并且注入裸 `node:fs` 调用会让它变红（已验证）。
+
 ## 测试
 
 ```
 node scripts/build.mjs && node --test test/*.test.mjs
 ```
 
-**当前：212 / 212。** 覆盖：
+**当前：215 / 215。** 覆盖：
 
 - **冷 tape 物理注入**（`incubation.test.mjs`）：cwd 来自发起会话 header、`persistence.create`
   带 `inheritedEventCount: 0`、事件序列与 `surfaceOp` 逐条断言、turn 必须闭合、

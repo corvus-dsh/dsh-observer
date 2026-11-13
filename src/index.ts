@@ -15,8 +15,8 @@
  * pair free of the four deadlock cycles a "mutual graft" would introduce.
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
+import { createBindingStore, type BindingStore, type ObserverBindings as CoreBindings, type ObserverPair as CorePair } from './core/binding-store.js'
 
 /**
  * v1.3.0 — THE PHYSICAL INJECTION PATH LIVES IN ITS OWN MODULE.
@@ -174,44 +174,9 @@ console.log(`[dsh-observer] host version ${VERSION}`)
  */
 export const inject = ['tools', 'sessionController', 'sessions', 'sessionPersistence', 'sessionQuery']
 
-interface ObserverBindings {
-  /** mainSessionId -> observerSessionId */
-  bindings: Record<string, string>
-  /** observerSessionId -> mainSessionId */
-  reverse: Record<string, string>
-  /**
-   * A one-shot focus request, left by a transfer.
-   *
-   * v1.0.4 NOTE: with every client state read removed, nothing consumes this any more. It is kept
-   * because it is one durable fact about a handoff (and `observer_status` can still read it), not
-   * because something currently acts on it.
-   */
-  focus: { sessionId: string; at: number } | null
-  /**
-   * v1.2.0 — THE PAIR, STORED BOTH WAYS WITH ROLES.
-   *
-   * The first design stored `main -> observer` and its inverse, which is enough to answer "who
-   * follows whom" but not "which half is which". Incubation inverts the roles at runtime (a blank
-   * session becomes the OBSERVER, and the session it hatches becomes the MAIN), so the role has to
-   * be a stored fact rather than something re-derived from position.
-   *
-   * One row per PAIR, keyed by the pair's own stable key, so a transfer can rewrite the members
-   * without touching the role assignment.
-   */
-  pairs: Record<string, ObserverPair>
-  /** sessionId -> pair key. A session belongs to at most one pair. */
-  pairOf: Record<string, string>
-}
-
-interface ObserverPair {
-  /** The session that plans, monitors and hands off. */
-  observerSessionId: string
-  /** The session that does the work. */
-  mainSessionId: string
-  at: number
-  /** Where the plan came from, so a later reader knows how the pair was formed. */
-  origin: 'incubated' | 'summoned'
-}
+/** 绑定表的形状住在 `core/binding-store.ts`；这里只做别名，保持既有引用可用。 */
+type ObserverBindings = CoreBindings
+type ObserverPair = CorePair
 
 interface PluginContextLike {
   get?: (name: string) => any
@@ -224,19 +189,15 @@ interface PluginContextLike {
 
 const EMPTY: ObserverBindings = { bindings: {}, reverse: {}, focus: null, pairs: {}, pairOf: {} }
 
+/**
+ * 绑定表的状态搬进了 `core/binding-store.ts` 的工厂闭包；这里只留"当前 store"的引用。
+ *
+ * 这是**作用域变化，不是状态消失**：`state` 仍然存在，只是从"进程级单例"
+ * 变成"每个 store 实例一份"。保留这个模块级变量是因为 `apply()` 可能被多次调用
+ * （多 profile / 多测试），每次都要换成指向新 bindingsPath 的 store。
+ */
+let bindingStore: BindingStore | undefined
 let bindingsPath = ''
-let state: ObserverBindings = { bindings: {}, reverse: {}, focus: null, pairs: {}, pairOf: {} }
-
-function isRecord(value: unknown): value is Record<string, any> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-/** Atomically write a file: temp + rename, so a reader never sees half a document. */
-function writeAtomic(path: string, value: unknown): void {
-  const temp = `${path}.tmp-${process.pid}-${Date.now().toString(36)}`
-  writeFileSync(temp, JSON.stringify(value, null, 2), 'utf8')
-  renameSync(temp, path)
-}
 
 /**
  * Build the ONE error shape the incubation reports, and build it in ONE place.
@@ -257,173 +218,60 @@ function stageError(stage: string, code: string, message: string): Error {
   return error
 }
 
-const EMPTY_STATE = (): ObserverBindings => ({ bindings: {}, reverse: {}, focus: null, pairs: {}, pairOf: {} })
-
-function load(): void {
-  // Start from empty on EVERY load: the module-level state must describe THIS file, and a
-  // mount that reuses a previous process-level copy would leak bindings across profiles
-  // (and across tests).
-  state = EMPTY_STATE()
-  try {
-    const parsed = JSON.parse(readFileSync(bindingsPath, 'utf8'))
-    if (!isRecord(parsed)) return
-    const next = EMPTY_STATE()
-    if (isRecord(parsed.bindings)) {
-      for (const [main, observer] of Object.entries(parsed.bindings)) {
-        if (typeof observer === 'string' && observer.length > 0) next.bindings[main] = observer
-      }
-    }
-    if (isRecord(parsed.reverse)) {
-      for (const [observer, main] of Object.entries(parsed.reverse)) {
-        if (typeof main === 'string' && main.length > 0) next.reverse[observer] = main
-      }
-    }
-    if (isRecord(parsed.focus) && typeof parsed.focus.sessionId === 'string') {
-      next.focus = { sessionId: parsed.focus.sessionId, at: Number(parsed.focus.at) || 0 }
-    }
-    // v1.2.0 — the pair table. A row is only accepted when both members are non-empty strings and
-    // they differ: a self-pair would make every role question answer "both".
-    if (isRecord(parsed.pairs)) {
-      for (const [key, value] of Object.entries(parsed.pairs)) {
-        if (!isRecord(value)) continue
-        const observerSessionId = typeof value.observerSessionId === 'string' ? value.observerSessionId : ''
-        const mainSessionId = typeof value.mainSessionId === 'string' ? value.mainSessionId : ''
-        if (observerSessionId.length === 0 || mainSessionId.length === 0) continue
-        if (observerSessionId === mainSessionId) continue
-        next.pairs[key] = {
-          observerSessionId,
-          mainSessionId,
-          at: Number(value.at) || 0,
-          origin: value.origin === 'summoned' ? 'summoned' : 'incubated',
-        }
-      }
-    }
-    if (isRecord(parsed.pairOf)) {
-      for (const [sessionId, key] of Object.entries(parsed.pairOf)) {
-        if (typeof key !== 'string' || key.length === 0) continue
-        if (next.pairs[key] === undefined) continue // no dangling index
-        next.pairOf[sessionId] = key
-      }
-    }
-    // `missions` / `missionsSent` from 1.0.2–1.0.3 are deliberately NOT read: the staged-injection
-    // design is gone, and a legacy key must not resurrect it.
-    state = next
-  } catch {
-    // Absent (first run) or torn: start empty. A stale pointer is repairable; a crash is not.
-  }
+function store(): BindingStore {
+  if (bindingStore === undefined) bindingStore = createBindingStore({ bindingsPath })
+  return bindingStore
 }
 
-/**
- * Persist the binding table. Returns false when the file could NOT be written.
+/** 用新的 bindingsPath 换一个 store（`load()` 之前状态是空表）。 */
+function resetBindingStore(path: string): BindingStore {
+  bindingsPath = path
+  bindingStore = createBindingStore({ bindingsPath: path })
+  return bindingStore
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/* writeAtomic 搬进 core/binding-store.ts（唯一碰文件系统的地方）。 */
+
+/* ── 绑定表：实现搬进 core/binding-store.ts，这里只保留同名委托 ───────────────────────────────
  *
- * v0.1.8 P0: this used to swallow the error, which is how a reply of `{ok:true}` reached the
- * UI while `observer-bindings.json` had not been touched. A caller must be able to tell the
- * difference between "stored" and "only in memory", so the failure is reported upward.
+ * 函数名与签名**一个都没改**，所以 index.ts 里约 20 处调用点不用动。
+ * 唯一的 `let state` 从模块级移进工厂闭包 —— 这是**作用域变化，不是状态消失**。
  */
+
+function load(): void {
+  store().load()
+}
+
 function save(): { ok: boolean; path: string; error?: string } {
-  try {
-    mkdirSync(dirname(bindingsPath), { recursive: true })
-    writeAtomic(bindingsPath, state)
-    return { ok: true, path: bindingsPath }
-  } catch (error) {
-    return { ok: false, path: bindingsPath, error: String((error as any)?.message ?? error) }
-  }
+  return store().save()
 }
 
 function observerOf(mainSessionId: string): string {
-  const observer = state.bindings[mainSessionId]
-  return typeof observer === 'string' ? observer : ''
+  return store().observerOf(mainSessionId)
 }
 
 function mainOfObserver(observerSessionId: string): string {
-  const main = state.reverse[observerSessionId]
-  return typeof main === 'string' ? main : ''
-}
-
-/* ── v1.2.0: the pair table ─────────────────────────────────────────────────── */
-
-/** Stable key for a pair. Order-independent, so a role swap cannot orphan the row. */
-function pairKeyOf(a: string, b: string): string {
-  return [a, b].sort().join('|')
+  return store().mainOfObserver(observerSessionId)
 }
 
 function pairOf(sessionId: string): ObserverPair | undefined {
-  const key = state.pairOf[sessionId]
-  if (key === undefined) return undefined
-  return state.pairs[key]
+  return store().pairOf(sessionId)
 }
 
-/**
- * Record (or re-record) a pair, keeping the legacy one-way maps in step for old readers.
- *
- * v1.2.3 — THE INVARIANT IS ENFORCED HERE, NOT ASSUMED.
- *
- * The first version wrote `pairs[key]` and overwrote `pairOf[member]`, but left every PREVIOUS row
- * that named the same session in `pairs`. Incubating three times from one consulting session
- * therefore produced three rows sharing an observer, and `pairOf` kept only the newest — a state
- * where "which pair does this session belong to?" had three answers.
- *
- * A re-record now DISSOLVES the older pairs first: any row naming either member is removed, along
- * with its index entries. One session, one pair, always.
- *
- * v1.3.0 — A FAILED WRITE IS NOT ALLOWED TO LEAVE A POINTER IN MEMORY.
- *
- * `save()` can fail (an unwritable path, a full disk). The old version returned `ok:false` and
- * left the mutated `state` in place, so the running process believed a pair existed that the file
- * had never heard of — `observer_status` would answer with it, and the next `load()` would erase
- * it. The state is now snapshotted before any mutation and restored verbatim on failure, so
- * `ok:false` really means "nothing happened".
- */
 function recordPair(
   observerSessionId: string,
   mainSessionId: string,
   origin: ObserverPair['origin'],
 ): { ok: boolean; error?: string; dissolved?: number } {
-  if (observerSessionId.length === 0 || mainSessionId.length === 0 || observerSessionId === mainSessionId) {
-    return { ok: false, error: 'pair members must be two distinct non-empty session ids' }
-  }
-
-  const before = JSON.stringify(state)
-  let dissolved = 0
-  for (const [existingKey, existing] of Object.entries(state.pairs)) {
-    const sharesMember =
-      existing.observerSessionId === observerSessionId ||
-      existing.observerSessionId === mainSessionId ||
-      existing.mainSessionId === observerSessionId ||
-      existing.mainSessionId === mainSessionId
-    if (!sharesMember) continue
-    delete state.pairs[existingKey]
-    for (const member of [existing.observerSessionId, existing.mainSessionId]) {
-      if (state.pairOf[member] === existingKey) delete state.pairOf[member]
-    }
-    // The legacy maps are pointers INTO a pair; a dissolved pair must not leave them dangling.
-    if (state.bindings[existing.mainSessionId] === existing.observerSessionId) {
-      delete state.bindings[existing.mainSessionId]
-    }
-    if (state.reverse[existing.observerSessionId] === existing.mainSessionId) {
-      delete state.reverse[existing.observerSessionId]
-    }
-    dissolved += 1
-  }
-
-  const key = pairKeyOf(observerSessionId, mainSessionId)
-  state.pairs[key] = { observerSessionId, mainSessionId, at: Date.now(), origin }
-  state.pairOf[observerSessionId] = key
-  state.pairOf[mainSessionId] = key
-  // Legacy maps, kept so `observer_status` and older readers see the same world.
-  state.bindings[mainSessionId] = observerSessionId
-  state.reverse[observerSessionId] = mainSessionId
-  const written = save()
-  if (written.ok) return { ok: true, dissolved }
-  // Restore EXACTLY what was there: a half-dissolved table is worse than an unchanged one.
-  state = JSON.parse(before)
-  return { ok: false, error: written.error }
+  return store().recordPair(observerSessionId, mainSessionId, origin)
 }
 
-/** True when the session is the OBSERVER half of a pair. */
 function isObserverHalf(sessionId: string): boolean {
-  const pair = pairOf(sessionId)
-  return pair !== undefined && pair.observerSessionId === sessionId
+  return store().isObserverHalf(sessionId)
 }
 
 /**
@@ -470,12 +318,14 @@ function followTransfer(
   const wasObserver = pair.observerSessionId === sourceSessionId
   const role: 'main' | 'observer' = wasObserver ? 'observer' : 'main'
   const otherSessionId = wasObserver ? pair.mainSessionId : pair.observerSessionId
-  const key = state.pairOf[sourceSessionId]
-  if (key !== undefined) delete state.pairs[key]
-  delete state.pairOf[sourceSessionId]
-  // The legacy maps must not keep pointing at the retired id.
-  if (wasObserver) delete state.reverse[sourceSessionId]
-  else delete state.bindings[sourceSessionId]
+  store().mutate((st) => {
+    const key = st.pairOf[sourceSessionId]
+    if (key !== undefined) delete st.pairs[key]
+    delete st.pairOf[sourceSessionId]
+    // The legacy maps must not keep pointing at the retired id.
+    if (wasObserver) delete st.reverse[sourceSessionId]
+    else delete st.bindings[sourceSessionId]
+  })
 
   const written =
     role === 'observer'
@@ -485,23 +335,20 @@ function followTransfer(
 
   // A focus note only makes sense for the MAIN half: that is the session the user should see.
   const visible = role === 'main' ? newSessionId : otherSessionId
-  state.focus = { sessionId: visible, at: Date.now() }
+  store().mutate((st) => { st.focus = { sessionId: visible, at: Date.now() } })
   save()
   return { followed: true, role, otherSessionId }
 }
 
 function takeFocus(): { sessionId: string; at: number } | null {
-  const focus = state.focus
-  if (focus === null) return null
-  state.focus = null
-  save()
-  return focus
+  return store().takeFocus()
 }
 
 export function apply(ctx: PluginContextLike, config: Record<string, unknown> = {}): void {
   const configured = typeof config.bindingsPath === 'string' ? config.bindingsPath : ''
-  bindingsPath = configured.length > 0 ? configured : join(process.env.DSH_PROFILE_DIR ?? process.cwd(), 'data', 'dsh-observer', 'observer-bindings.json')
-  load()
+  const resolvedPath = configured.length > 0 ? configured : join(process.env.DSH_PROFILE_DIR ?? process.cwd(), 'data', 'dsh-observer', 'observer-bindings.json')
+  // 换 store 再 load：`apply()` 可能被多次调用，每次都必须指向新的 bindingsPath。
+  resetBindingStore(resolvedPath).load()
 
   /**
    * v1.7.0 — THE SUPERVISOR TABLE.
@@ -611,7 +458,7 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
    * the harvest gate refuses it (`turnsClosed === 0`), and the log says so — which is the honest
    * outcome for a pair that has been quiet since before the restart.
    */
-  for (const pair of Object.values(state.pairs)) {
+  for (const pair of store().pairs()) {
     try {
       supervisePair(pair.observerSessionId, pair.mainSessionId, 'restored at mount')
     } catch (error) {
@@ -699,8 +546,7 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       // Already bound to the same pair: a repeated title event must not re-inject the setting.
       if (observerOf(mainSessionId) === observerSessionId) return
 
-      state.bindings[mainSessionId] = observerSessionId
-      state.reverse[observerSessionId] = mainSessionId
+      store().bindLegacy(mainSessionId, observerSessionId)
       const written = save()
       if (!written.ok) {
         ctx.logger?.warn?.(`[dsh-observer] title-derived bind failed to persist: ${written.error}`)
@@ -807,12 +653,13 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
     }
 
     if (mode === 'bind') {
-      state.bindings[mainSessionId] = observerSessionId
-      state.reverse[observerSessionId] = mainSessionId
+      store().bindLegacy(mainSessionId, observerSessionId)
       const written = save()
       if (!written.ok) {
-        delete state.bindings[mainSessionId]
-        delete state.reverse[observerSessionId]
+        store().mutate((st) => {
+          delete st.bindings[mainSessionId]
+          delete st.reverse[observerSessionId]
+        })
         return {
           ok: false,
           observerSessionId,
@@ -1175,14 +1022,15 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
     }
     const existing = observerOf(mainSessionId)
     if (existing.length > 0 && existing !== observerSessionId) {
-      delete state.reverse[existing]
+      store().mutate((st) => { delete st.reverse[existing] })
     }
-    state.bindings[mainSessionId] = observerSessionId
-    state.reverse[observerSessionId] = mainSessionId
+    store().bindLegacy(mainSessionId, observerSessionId)
     const written = save()
     if (!written.ok) {
-      delete state.bindings[mainSessionId]
-      delete state.reverse[observerSessionId]
+      store().mutate((st) => {
+        delete st.bindings[mainSessionId]
+        delete st.reverse[observerSessionId]
+      })
       return { ok: false, observerSessionId, text: `绑定表写入失败：${written.error}（路径 ${written.path}）` }
     }
     load()
@@ -1312,12 +1160,13 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       return { ok: false, sessionId: '', text: 'sessionController.create 返回了空 id' }
     }
 
-    state.bindings[mainSessionId] = observerSessionId
-    state.reverse[observerSessionId] = mainSessionId
+    store().bindLegacy(mainSessionId, observerSessionId)
     const written = recordPair(observerSessionId, mainSessionId, 'summoned')
     if (!written.ok) {
-      delete state.bindings[mainSessionId]
-      delete state.reverse[observerSessionId]
+      store().mutate((st) => {
+        delete st.bindings[mainSessionId]
+        delete st.reverse[observerSessionId]
+      })
       return { ok: false, sessionId: observerSessionId, text: `绑定表写入失败：${written.error}` }
     }
 
@@ -2133,14 +1982,15 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       render: (_args: unknown, value: any) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     execute: async (args: { ackFocus?: unknown }) => {
-      const pending = state.focus
+      const snapshot = store().snapshot()
+      const pending = snapshot.focus
       if (args?.ackFocus === true) takeFocus()
       const supervisorView: Record<string, unknown> = {}
       for (const [mainId, supervisor] of supervisors.entries()) supervisorView[mainId] = supervisor.describe()
       return {
         ok: true,
-        bindings: { ...state.bindings },
-        reverse: { ...state.reverse },
+        bindings: { ...snapshot.bindings },
+        reverse: { ...snapshot.reverse },
         focus: pending === null ? null : { ...pending },
         supervisors: supervisorView,
         paradise: paradiseStatus(),
@@ -2182,7 +2032,7 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
  *      the proportion is real — the folding is deferred as a costed item, not overlooked.)
  */
 export function debugObserverState(): ObserverBindings {
-  return JSON.parse(JSON.stringify(state))
+  return store().snapshot()
 }
 
 /**
