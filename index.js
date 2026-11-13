@@ -2903,10 +2903,31 @@ const EMPTY                   = { bindings: {}, reverse: {}, focus: null, pairs:
  *
  * 这是**作用域变化，不是状态消失**：`state` 仍然存在，只是从"进程级单例"
  * 变成"每个 store 实例一份"。保留这个模块级变量是因为 `apply()` 可能被多次调用
- * （多 profile / 多测试），每次都要换成指向新 bindingsPath 的 store。
+ * （多 profile / 多测试），每次都要换成新 store。
+ *
+ * ── `bindingsPath` 也已经不在这一层了 ──────────────────────────────────────────────────────────
+ *
+ * 原先这里有两个模块级 `let`（`bindingStore` / `bindingsPath`），于是 `closure.mjs` 报
+ * `mutable: [bindingStore, bindingsPath]` —— 两个都不是"闭包"，是共享状态。
+ *
+ * `bindingsPath` 是**纯派生值**（要么来自 `config.bindingsPath`，要么来自 `DSH_PROFILE_DIR`），
+ * 它唯一的作用是"造 store 的时候喂给工厂一次"。造完之后 `createBindingStore` 把它收进自己的闭包
+ * （`const bindingsPath = options.bindingsPath`），本层再也没有理由留一份。
+ *
+ * 所以它被删掉，而不是"移进另一个变量"：**能算出一次的常量不该占一个可变绑定**。
+ * 现在这一层只剩一个 `let`（`bindingStore`），它消不掉 —— 见下面 `store()` 的说明。
  */
 let bindingStore                          
-let bindingsPath = ''
+
+/**
+ * 在 `apply()` 之前就有人读绑定表时的兜底路径（`debugObserverState()` 这类测试接缝会走到这里）。
+ *
+ * 抽成函数而不是常量：`process.env` / `cwd` 在进程生命周期里是会变的（测试会改 cwd），
+ * 一个模块级 `const` 会把第一次算出来的值冻住，那正好是这类兜底最容易出错的地方。
+ */
+function defaultBindingsPath()         {
+  return join(process.env.DSH_PROFILE_DIR ?? process.cwd(), 'data', 'dsh-observer', 'observer-bindings.json')
+}
 
 /**
  * Build the ONE error shape the incubation reports, and build it in ONE place.
@@ -2927,14 +2948,28 @@ function stageError(stage        , code        , message        )        {
   return error
 }
 
+/**
+ * 懒取「当前 store」。
+ *
+ * 为什么这个 `let` 不能像 `bindingsPath` 那样删掉：它是一个**对象句柄**，不是能算出来的常量。
+ * 两个调用方对它有两种要求 ——
+ *   · `apply(ctx, config)` 要能**换一个**（多 profile / 多测试，每个 profile 一份绑定表）；
+ *   · `debugObserverState()` 这类测试接缝**在 apply 之前**就可能被调用。
+ * 后者需要一个"还没人设过"的状态，前者需要"设置过就沿用"。这个二态就是 `undefined` 的意义。
+ *
+ * 第一次懒创建用 `defaultBindingsPath()`；`resetBindingStore()` 之后一律用它收到的路径。
+ */
 function store()               {
-  if (bindingStore === undefined) bindingStore = createBindingStore({ bindingsPath })
+  if (bindingStore === undefined) bindingStore = createBindingStore({ bindingsPath: defaultBindingsPath() })
   return bindingStore
 }
 
-/** 用新的 bindingsPath 换一个 store（`load()` 之前状态是空表）。 */
+/**
+ * 用新的 bindingsPath 换一个 store（`load()` 之前状态是空表）。
+ *
+ * 路径只在这里被**交给**工厂一次，本层不保留 —— 见上方 `bindingStore` 的注释。
+ */
 function resetBindingStore(path        )               {
-  bindingsPath = path
   bindingStore = createBindingStore({ bindingsPath: path })
   return bindingStore
 }
@@ -3055,7 +3090,7 @@ function takeFocus()                                           {
 
 export function apply(ctx                   , config                          = {})       {
   const configured = typeof config.bindingsPath === 'string' ? config.bindingsPath : ''
-  const resolvedPath = configured.length > 0 ? configured : join(process.env.DSH_PROFILE_DIR ?? process.cwd(), 'data', 'dsh-observer', 'observer-bindings.json')
+  const resolvedPath = configured.length > 0 ? configured : defaultBindingsPath()
   // 换 store 再 load：`apply()` 可能被多次调用，每次都必须指向新的 bindingsPath。
   resetBindingStore(resolvedPath).load()
 
