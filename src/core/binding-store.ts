@@ -112,6 +112,16 @@ function pairKeyOf(a: string, b: string): string {
 /**
  * 工厂对外的全部接口。函数名与签名与 `index.ts` 早先的模块级函数一致 ——
  * 这是"调用点一行都不用改"的前提。
+ *
+ * ── 只留**真有调用方**的成员 ────────────────────────────────────────────────────────────────────
+ *
+ * 第一版还多写了 `setFromSnapshot()` 与 `path()`。写完我自己查了一遍调用方：**两个都是 0 处**。
+ * `setFromSnapshot` 是给「整张表替换」留的口子，而 `resetBindingStore` 已经改用
+ * 「换一个 store 实例」，那个口子就没用了；`path()` 也没人读（`save()` 的返回值里已经带 `path`）。
+ *
+ * 删掉而不是留着"以后可能有用"：这两个函数会把可变状态重新交出去
+ * （`setFromSnapshot(next)` 等于把 `state` 的写权限外包），正好抵消倒置的意义。
+ * 倒置的目的就是**减少能改这张表的人**，那就不能自己再开一扇门。
  */
 export interface BindingStore {
   load(): void
@@ -123,7 +133,6 @@ export interface BindingStore {
   isObserverHalf(sessionId: string): boolean
   recordPair(observerSessionId: string, mainSessionId: string, origin: ObserverPair['origin']): { ok: boolean; error?: string; dissolved?: number }
   takeFocus(): { sessionId: string; at: number } | null
-  setFromSnapshot(next: ObserverBindings): void
   /**
    * 在**同一份状态**上做一次受控改写，然后由调用方决定是否 `save()`。
    *
@@ -136,7 +145,6 @@ export interface BindingStore {
   pairs(): ObserverPair[]
   /** 旧式单写映射（title 派生绑定用）：`state.bindings[main] = observer; state.reverse[obs] = main`。 */
   bindLegacy(mainSessionId: string, observerSessionId: string): void
-  path(): string
 }
 
 export function createBindingStore(options: { bindingsPath: string; fs?: BindingFsLike }): BindingStore {
@@ -332,8 +340,6 @@ export function createBindingStore(options: { bindingsPath: string; fs?: Binding
     isObserverHalf,
     recordPair,
     takeFocus,
-    /** 供 `resetBindingStore` / 测试替换整张表（原 index.ts 里直接赋值 `state`）。 */
-    setFromSnapshot: (next: ObserverBindings) => { state = next },
     /** 见接口注释：一次受控改写，替代外部直接持有 `state`。 */
     mutate: (fn) => { fn(state) },
     pairs: () => Object.values(state.pairs),
@@ -342,6 +348,5 @@ export function createBindingStore(options: { bindingsPath: string; fs?: Binding
       state.bindings[mainSessionId] = observerSessionId
       state.reverse[observerSessionId] = mainSessionId
     },
-    path: () => bindingsPath,
   }
 }
