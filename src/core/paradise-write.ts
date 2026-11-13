@@ -44,6 +44,20 @@ interface SessionAdapterLike {
     cwd: string
     title?: string
     id?: string
+    /**
+     * 新会话继承哪一个会话的 provider/model/preset/policy。
+     *
+     * 这个字段一直**真的被传**（`src/index.ts` 的孵化路径），但接口里没声明 ——
+     * 于是 `tsc` 报 2353「对象字面量只能指定已知属性」。也就是说：**类型欠账，不是代码欠账**。
+     * 没有这段声明，调用方写对了也会被报错，而读代码的人会以为那个字段是笔误。
+     */
+    inheritFrom?: string
+    /** 孵化时随会话一起注入的条目（可见性与原文由调用方决定）。 */
+    items?: ReadonlyArray<{
+      visibility: string
+      text: string
+      origin?: string
+    }>
   }): Promise<{
     ok: boolean
     stage: string

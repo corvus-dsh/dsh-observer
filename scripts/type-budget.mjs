@@ -83,7 +83,8 @@ const TYPE_CHECK = join(ROOT, 'scripts', 'type-check.mjs')
  * 所以这张表只能来自 `node scripts/type-budget.mjs --baseline`。
  */
 const BASELINE = new Map([
-  ['index.ts', 2],
+  // 2026-11-13: 从 2 重冻到 0 —— index.ts 的 2345（判别联合）与 2353（adapter 入参声明）都已修。
+  // 这张表是从这里开始**只许降**的闸门：再加一条真缺陷就会红。
 ])
 
 /** 搬移专属失效模式：声明了没 export，却被别的文件 import。必须是 0，不是「不变」。 */
@@ -221,8 +222,7 @@ const describeIdentity = (key) => {
  * 两张表必须同时下降，否则会出现「计数变了但身份表没变」这类自相矛盾。
  */
 const BASELINE_IDENTITIES = new Map([
-  ["index.ts\u00002345\u0000Argument of type '\"\" | \"main\" | \"observer\"' is not assignable to parameter of type '\"main\" | \"observer\"'.   Type '\"\"' is not assignable to type '\"main\" | \"observer\"'.", 1],
-  ["index.ts\u00002353\u0000Object literal may only specify known properties, and 'inheritFrom' does not exist in type '{ cwd: string; title?: string; id?: string; }'.", 1],
+  // 同上：重冻到空。身份多重集为空时，任何一条新诊断都是「新来的」，会立刻红。
 ])
 
 const argOf = (flag) => {

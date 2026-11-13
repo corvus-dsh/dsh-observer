@@ -137,7 +137,7 @@ npm 上的**裸名** `dsh-memory` 和 `dsh-observer` 已被第三方注册，包
 
 ## 测试
 
-**当前 209 / 209。** preflight 15 项，其中三项是 v1.9.0 新增的切换守卫：
+**当前 212 / 212。** preflight 15 项，其中三项是 v1.9.0 新增的切换守卫：
 
 - 产物里写路径必须经 `ensureWriteAdapter → createDshAdapters`；
 - 缺层时必须 `PARADISE_WRITE_UNAVAILABLE`（不允许静默 no-op 或崩溃）；
@@ -334,7 +334,7 @@ sessionQuery.readSession(id)                   ← 冷读校验：读回来的�
 node scripts/build.mjs && node --test test/*.test.mjs
 ```
 
-**当前：209 / 209。** 覆盖：
+**当前：212 / 212。** 覆盖：
 
 - **冷 tape 物理注入**（`incubation.test.mjs`）：cwd 来自发起会话 header、`persistence.create`
   带 `inheritedEventCount: 0`、事件序列与 `surfaceOp` 逐条断言、turn 必须闭合、

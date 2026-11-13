@@ -440,12 +440,32 @@ function isObserverHalf(sessionId: string): boolean {
  * other half, and no wait for it. That is what keeps the mutual-graft deadlock impossible: a
  * deadlock needs two parties that each wait, and here neither party waits for anything.
  */
+/**
+ * ── 返回类型是**判别联合**：`followed` 为 true 时 `role` 不可能是空串 ────────────────────────────
+ *
+ * 旧签名写的是 `{ followed: boolean; role: 'main' | 'observer' | '' }` —— 两个字段各自独立，
+ * 类型上允许 `{ followed: true, role: '' }` 这种**实现根本不会返回**的组合。
+ * 于是调用点传 `result.role` 给只要 `'main' | 'observer'` 的参数时报 2345，而修法不应该是
+ * 「加一个 `role === ''` 的运行时而变量判断」（那是在为类型系统的无能写代码，且引入了
+ * 一个永远为假的分支）。正确做法是让**类型本身**表达这个不变式。
+ *
+ * 三种情形：
+ *   · `{ followed: false; reason: 'no-pair' }`  —— 这个 id 不属于任何 pair；
+ *   · `{ followed: false; reason: 'write-failed'; role }` —— 认出了角色但指针没写成（**调用方仍可记日志**，
+ *     所以这里保留 role，但类型上它跟着 followed:false 一起出现，不会被当成成功路径）；
+ *   · `{ followed: true; role: 'main' | 'observer'; otherSessionId }` —— 成功，role 一定具体。
+ */
+type FollowTransferResult =
+  | { followed: false; reason: 'no-pair' }
+  | { followed: false; reason: 'write-failed'; role: 'main' | 'observer' }
+  | { followed: true; role: 'main' | 'observer'; otherSessionId: string }
+
 function followTransfer(
   sourceSessionId: string,
   newSessionId: string,
-): { followed: boolean; role: 'main' | 'observer' | ''; otherSessionId: string } {
+): FollowTransferResult {
   const pair = pairOf(sourceSessionId)
-  if (pair === undefined) return { followed: false, role: '', otherSessionId: '' }
+  if (pair === undefined) return { followed: false, reason: 'no-pair' }
 
   const wasObserver = pair.observerSessionId === sourceSessionId
   const role: 'main' | 'observer' = wasObserver ? 'observer' : 'main'
@@ -461,7 +481,7 @@ function followTransfer(
     role === 'observer'
       ? recordPair(newSessionId, otherSessionId, pair.origin)
       : recordPair(otherSessionId, newSessionId, pair.origin)
-  if (!written.ok) return { followed: false, role: '', otherSessionId: '' }
+  if (!written.ok) return { followed: false, reason: 'write-failed', role }
 
   // A focus note only makes sense for the MAIN half: that is the session the user should see.
   const visible = role === 'main' ? newSessionId : otherSessionId
@@ -2313,15 +2333,39 @@ export const supervisorInternals = {
  *
  * `observerSessionId` is kept in the answer for older tests that only asked about the companion
  * half; `role` and `otherSessionId` describe what actually moved in v1.2.0.
+ *
+ * 返回形状仍然是**给旧测试看的扁平结构**（`role` 用 `''` 表示"没角色"），但内部先对
+ * `followTransfer` 的判别联合做**显式收窄** —— 不再用「先展开再假设字段都在」的写法。
+ * 这样 seam 的宽松形状与核心的不变式分开：核心那头现在能保证 `followed: true ⇒ role 具体`。
  */
 export function debugFollowTransfer(
   sourceSessionId: string,
   newSessionId: string,
 ): { followed: boolean; role: 'main' | 'observer' | ''; otherSessionId: string; observerSessionId: string } {
   const result = followTransfer(sourceSessionId, newSessionId)
+  /**
+   * 用 `'reason' in result` 而不是 `!result.followed` 来分叉。
+   *
+   * 实测：在 `strict:false` 下，`if (!result.followed)` **不能**把联合收窄到两个失败分支
+   * （`followed` 是布尔字面量，但 loose 模式下布尔判别不参与控制流收窄），于是下一句访问
+   * `result.reason` 仍报 2339。
+   *
+   * `in` 是**结构化**判断，不依赖 strictNullChecks —— 两个失败分支都有 `reason`，成功分支没有，
+   * 所以它同时是判别键。这不是「加一个运行时变量判断来绕过类型系统」，而是**换一个类型系统
+   * 在当前口径下真的支持的判别方式**；不变式仍由 `FollowTransferResult` 本身保证。
+   */
+  if ('reason' in result) {
+    if (result.reason === 'write-failed') {
+      // 认出了角色但指针没写成：seam 如实报告角色，`otherSessionId` 无从得知。
+      return { followed: false, role: result.role, otherSessionId: '', observerSessionId: '' }
+    }
+    return { followed: false, role: '', otherSessionId: '', observerSessionId: '' }
+  }
   return {
-    ...result,
-    observerSessionId: result.role === 'observer' ? newSessionId : result.role === 'main' ? result.otherSessionId : '',
+    followed: true,
+    role: result.role,
+    otherSessionId: result.otherSessionId,
+    observerSessionId: result.role === 'observer' ? newSessionId : result.otherSessionId,
   }
 }
 
