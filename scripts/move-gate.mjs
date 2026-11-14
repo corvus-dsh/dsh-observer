@@ -207,8 +207,16 @@ function cutTrailingLineComment(line) {
 
 const allDeclarations = declarationTable.byName
 
-/** Resolve a cluster name to wherever it actually lives. */
-const resolveDeclaration = (name) => allDeclarations.get(name)
+/** Resolve a cluster name to wherever it actually lives.
+ *
+ * 第二个参数是可选的 `file`：**带上它才是精确的**。`readJsonl` / `sleepSync` 这类名字
+ * 可能在多个文件里都有，只按名字会取到表里第一个（`byName` 是先到先得）。
+ */
+const resolveDeclaration = (name, file) => {
+  if (file === undefined) return allDeclarations.get(name)
+  const row = declarationTable.rows.find((r) => r.name === name && (r.file ?? 'index.ts') === file)
+  return row ?? allDeclarations.get(name)
+}
 
 const runClosure = (name) => {
   try {
@@ -243,8 +251,38 @@ const aVerdict = spans.length > 0 && moduleLines <= 800
  */
 const memberClosures = CLUSTER.map((name) => ({ name, closure: runClosure(name) })).filter((entry) => entry.closure !== undefined)
 const closureOfCluster = memberClosures.length === 0 ? undefined : memberClosures[0].closure
-const clusterClosureMembers = new Set()
-for (const entry of memberClosures) for (const member of entry.closure.members) clusterClosureMembers.add(member.name)
+
+/**
+ * ── 成员身份必须是「文件:名字」，不是「名字」────────────────────────────────────────────────────
+ *
+ * 这个缺陷在 dsh-memory 上被实测出来（同一份 move-gate 拷贝）：
+ *   · 按名字求并集 → 495 行
+ *   · 按「文件:名字」求并集 → 478 行
+ * 两者**声明数都是 25** —— 一个不可能的组合，说明名字有歧义。
+ *
+ * 追下去：`readJsonl` 在三个文件里各有一个、`sleepSync` 在两处。
+ * 旧代码
+ *
+ *     unionNames.add(member.name)
+ *     … resolveDeclaration(name)          // 按名字解析，取表里第一个
+ *
+ * 于是闭包里那条 `store.ts:readJsonl` 被解析成了 `causal.ts:readJsonl`（20 行而不是 3 行）。
+ * **`runClosure` 明明给了 `file`，代码却把它丢了重新按名字查。**
+ *
+ * 这与下面那段注释（"read the fields, not the string"）是同一个错误的两半：
+ * 那次把对象当字符串读，这次把带文件的身份降级成裸名字。
+ *
+ * 本仓（observer）眼下 `src/` 下没有跨文件同名声明，所以**这个缺陷在这里没有输入** ——
+ * 但同一份工具不该留着同一个坑等下一次输入。
+ */
+const clusterClosureMembers = new Map() // key = `${file}:${name}` → member
+for (const entry of memberClosures) {
+  for (const member of entry.closure.members) {
+    const key = `${member.file ?? 'index.ts'}:${member.name}`
+    if (!clusterClosureMembers.has(key)) clusterClosureMembers.set(key, member)
+  }
+}
+
 const clusterClosureLines = (() => {
   if (memberClosures.length === 0) return undefined
   /**
@@ -256,14 +294,12 @@ const clusterClosureLines = (() => {
    * **0 lines** — for a cluster whose real weight is 558. A zero that looks like "cheap to move".
    *
    * Read the fields, not the string.
+   *
+   * AND read the FILE too: 按名字解析会在同名多声明上取错文件（见上）。
    */
-  const unionNames = new Set()
-  for (const entry of memberClosures) {
-    for (const member of entry.closure.members) unionNames.add(member.name)
-  }
   let total = 0
-  for (const name of unionNames) {
-    const span = resolveDeclaration(name)
+  for (const member of clusterClosureMembers.values()) {
+    const span = resolveDeclaration(member.name, member.file)
     if (span !== undefined) total += span.lines
   }
   return total
