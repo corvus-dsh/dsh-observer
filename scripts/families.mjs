@@ -116,7 +116,17 @@ const spanOf = (name, kind) => {
       : kind === 'FunctionDeclaration' ? 'function'
         : kind === 'let/var' ? '(?:let|var)'
           : 'const'
-  const re = new RegExp(`^(?:export\\s+)?${kw}\\s+${name}\\b`, 'u')
+    /**
+   * ── `async` 必须被允许，否则 async 函数会被算成 1 行 ──────────────────────────────────────────
+   *
+   * 实测在 dsh-memory 上：`spanOf('harvest')` 返回 1 行，编译器说 278 行；
+   * `spanOf('writeMemoryConsoleSetting')` 1 行 vs 真值 33 行 —— 两处相加正好 309，
+   * 就是该仓自校验报出的差额。原因是正则只认 `(?:export\s+)?function`，而源码是
+   * `export async function`。
+   *
+   * 本仓眼下没有 `index.ts` 顶层的 async 函数，所以没暴露 —— 那是"恰好没有输入"，不是修好了。
+   */
+  const re = new RegExp(`^(?:export\\s+)?(?:async\\s+)?${kw}\\s+${name}\\b`, 'u')
   const start = lines.findIndex((l) => re.test(l))
   if (start < 0) return undefined
   /**
