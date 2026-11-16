@@ -173,3 +173,49 @@ jobs:
 
       - name: Test
         run: npm test
+
+      # ── THE GATES THAT HAD NO ENTRY POINT ───────────────────────────────────────────────────────
+      #
+      # Measured 2026-11-16, before this step: `type-budget`, `check-cycles`, `check-readme-counts`,
+      # `verify-bundle-purity` and `verify-pure-move` were all present in `scripts/` and NONE of them
+      # appeared in `package.json`, in this file, in `test/`, or as a call from another script.
+      # They had never run on a push. In this repository's own words: "A gate nobody runs is a comment."
+      #
+      # Order matters and is not alphabetical: a broken dependency graph or a type regression is a
+      # CAUSE, a stale README count is a SYMPTOM. Same reasoning as graft-slice's CI, which also runs
+      # the documentation gate after `npm test`.
+      #
+      # They run AFTER `npm test` on purpose: a behavioural break should fail with a test name to
+      # read, not with a documentation mismatch that is one of its symptoms.
+      - name: Gates (previously unwired)
+        # `check-cycles` and `check-readme-counts` exit non-zero on failure and 0 on success — they
+        # need no wrapper. `type-budget` exits **2** on a machine without a compiler, which is every
+        # CI run here (`package.json` declares no dependencies), so it goes through `run-gate.mjs`:
+        # RESOURCE ⇒ printed loudly + exit 0; FAIL ⇒ exit 1. See docs/gate-wiring.md §三.
+        run: |
+          node scripts/check-cycles.mjs
+          node scripts/run-gate.mjs scripts/type-budget.mjs
+          node scripts/check-readme-counts.mjs
+
+      - name: Bundle purity (vs the previous commit)
+        # ⚠️ THIS STEP IS NOT RED ON EVERY PUSH, AND THAT IS NOT A SKIP.
+        #
+        # `verify-bundle-purity.mjs` correctly exits 2 when there is nothing to compare: most commits
+        # here do not touch the built `index.js`, so `--before HEAD~1` is byte-identical and the
+        # instrument says `VACUOUS`. A shallow clone has no `HEAD~1` at all — the other exit-2 case.
+        #
+        # `bundle-purity-guard.mjs` translates that ONE condition into `RESOURCE — … NOT CHECKED this
+        # run` + exit 0, and passes exit 1 (NOT PURE) straight through. The red path is proven
+        # reachable: `--before 5d32faf~1` reports 2 differing code lines, `--before 7abbd73~1` 602.
+        # Evidence and the full exit-code table: docs/gate-wiring.md §二.
+        run: node scripts/bundle-purity-guard.mjs
+
+      - name: Pure-move checker self-test
+        # `verify-pure-move.mjs` is NOT wired as a gate, and that is a written decision rather than an
+        # omission: measured over the last 40 commits, `--against <parent>` gives PURE=0, RESOURCE=2,
+        # NOT-PURE=38 — this repository has never made a pure move, so the checker has no subject and
+        # would either cry wolf or say nothing. What CAN be verified on every push is that the checker
+        # itself still discriminates: its `--self-test` must report `SELF-TEST PASS`.
+        # Reasoning and the 40-commit measurement: docs/gate-wiring.md §四.
+        run: node scripts/verify-pure-move.mjs --self-test
+

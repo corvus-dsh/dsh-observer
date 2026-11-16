@@ -39,7 +39,8 @@
     "build": "node scripts/build.mjs",
     "test": "node --test test/*.test.mjs",
     "preflight": "node scripts/preflight.mjs",
-    "check": "node scripts/build.mjs && node scripts/preflight.mjs && node --test test/*.test.mjs"
+    "gates": "node scripts/check-cycles.mjs && node scripts/run-gate.mjs scripts/type-budget.mjs && node scripts/check-readme-counts.mjs && node scripts/bundle-purity-guard.mjs && node scripts/verify-pure-move.mjs --self-test",
+    "check": "node scripts/build.mjs && node scripts/preflight.mjs && node scripts/check-cycles.mjs && node scripts/run-gate.mjs scripts/type-budget.mjs && node scripts/check-readme-counts.mjs && node scripts/bundle-purity-guard.mjs && node scripts/verify-pure-move.mjs --self-test && node --test test/*.test.mjs"
   },
   "files": [
     "index.js",
