@@ -131,7 +131,18 @@ diffs.sort((p, q) => (q.after - q.before) - (p.after - p.before) || p.line.local
 const total = (m) => [...m.values()].reduce((s, n) => s + n, 0)
 console.log(`before : ${beforeRef}   code lines: ${total(a)}`)
 console.log(`after  : ${afterRef ?? 'working tree'}   code lines: ${total(b)}`)
-console.log(`bundle : ${before.length} -> ${after.length} bytes`)
+/**
+ * ── 这里曾把字符数标成 bytes，实测误导过一次 ───────────────────────────────────────────────────
+ *
+ * `before` / `after` 是 `readFileSync(..., 'utf8')` 与 `git show` 的返回值，都是 **JS 字符串**。
+ * `String.prototype.length` 是 **UTF-16 码元数**，不是字节数。产物里大量中文字符
+ * （一个汉字 = 3 字节 = 1 个 code unit），于是两个数字差得很远。
+ *
+ * 所以两个都打，各自标对名字：**字节数是产物的真实大小**（发布包按字节算），
+ * 字符数是「删了多少内容」的更直观量。只打一个都会让读的人把另一个当它。
+ */
+const byteLen = (s) => Buffer.byteLength(s, 'utf8')
+console.log(`bundle : ${byteLen(before)} B (${before.length} chars) -> ${byteLen(after)} B (${after.length} chars)`)
 console.log('')
 
 if (diffs.length === 0) {
