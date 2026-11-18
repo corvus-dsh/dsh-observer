@@ -16,11 +16,12 @@
 | `core/announce.ts` | 向宿主宣告会话摘要并断言其形状 | `assertSessionSummary` | — |
 | `core/confirmation.ts` | 判定「确认」是否已有真实证据 | `checkConfirmation`, `findAskEvidence` | — |
 | `core/ignition.ts` | 点火文本识别与点火超时判定 | `igniteSession`, `isIgnitionText`, `ignitionDeadline` | — |
+| `core/long-term-ledger.ts` | 跨代台账：记住跟过的每个主脑与各自被纠偏过的形态 | `parseLedger`, `upsertRecord`, `priorGenerationNudge`, `crossGenerationLine` | — |
 | `core/monitor.ts` | 按失败连击、停滞轮数与冷却决定催促或收割 | `stepMonitor`, `harvestGate`, `createMonitorState` | — |
 | `core/paradise-bridge.ts` | 彼岸层磁盘日志的读取桥接与具名拒绝 | `inspectSessionLog`, `ensureParadise`, `escapeSessionDirName` | — |
 | `core/paradise-write.ts` | 彼岸层写通道的懒加载与状态查询 | `ensureWriteAdapter`, `writePathStatus` | `core/paradise-bridge.ts` |
 | `core/policy.ts` | 监理任务的文本常量（描述、章节、使命） | `OBSERVER_MISSION_TEXT`, `SPAWN_MAIN_DESCRIPTION` | — |
 | `core/read-helpers.ts` | 工作目录继承与 Service 解析的读取助手 | `resolveInheritedCwd`, `isAbsoluteCwd`, `resolveService` | — |
-| `core/supervisor.ts` | 监理生命周期：空闲判定、收割结果与重建 | `createSupervisor`, `SUPERVISOR_DUTY_TEXT` | `core/monitor.ts`, `core/ignition.ts` |
+| `core/supervisor.ts` | 监理生命周期：空闲判定、收割结果与重建 | `createSupervisor`, `SUPERVISOR_DUTY_TEXT` | `core/monitor.ts`, `core/ignition.ts`, `core/long-term-ledger.ts` |
 
 **依赖方向**：表里读出的箭头一律指向更底层，`v145` 的第三条断言就是「光凭这张表也不成环」。

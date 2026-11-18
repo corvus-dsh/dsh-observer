@@ -15,8 +15,24 @@
  * pair free of the four deadlock cycles a "mutual graft" would introduce.
  */
 
-import { join } from 'node:path'
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { createBindingStore, type BindingStore, type ObserverBindings as CoreBindings, type ObserverPair as CorePair } from './core/binding-store.js'
+/**
+ * v0.40 (B3 / F7): the long-term notebook's pure half. The IO below is the only place that opens the
+ * file — one reader, one writer, next to the bindings.
+ */
+import {
+  LONG_TERM_CAP,
+  crossGenerationLine,
+  emptyLedger,
+  findRecord,
+  generationFor,
+  parseLedger,
+  priorGenerationNudge,
+  upsertRecord,
+} from './core/long-term-ledger.js'
+import type { LongTermLedger } from './core/long-term-ledger.js'
 
 /**
  * v1.3.0 — THE PHYSICAL INJECTION PATH LIVES IN ITS OWN MODULE.
@@ -224,6 +240,50 @@ function defaultBindingsPath(): string {
 }
 
 /**
+ * ── v0.40 (B3 / F7): THE LONG-TERM LEDGER, BESIDE THE BINDINGS ────────────────────────────────
+ *
+ * A function, not a const, for the same reason `defaultBindingsPath` is: `process.env` and `cwd` move
+ * during a process's life (tests change cwd), and a module-level `const` would freeze the first answer.
+ *
+ * WHERE IT LIVES. In THIS plugin's store, next to the bindings — never in `dsh-memory`'s. The observer
+ * may not read the other repository's files (zero cross-repo coupling), so the notebook can only hold
+ * what this plugin observed. That is a real limitation and it is the honest one: a claim about the
+ * previous generation has to come from someone who watched it.
+ *
+ * WHAT IT DEGRADES TO. A missing file is an empty ledger (the first run is not a defect). A torn file
+ * is ALSO an empty ledger — rule ⑤: supervision continues, it just cannot say 「上一代也这样」.
+ */
+function longTermLedgerPath(bindingsPath: string = defaultBindingsPath()): string {
+  return join(dirname(bindingsPath), 'observer-main-ledger.json')
+}
+
+/**
+ * The IO half. It takes the EFFECTIVE bindings path rather than recomputing the default: `apply()`
+ * can be handed a `bindingsPath` (tests, multiple profiles), and a notebook that ignored it would
+ * write into the default store while the bindings lived elsewhere — two stores pretending to be one.
+ */
+function createLongTermLedgerStore(bindingsPath: string): { load: () => LongTermLedger; save: (next: LongTermLedger) => void } {
+  return {
+    load: () => {
+      try {
+        return parseLedger(JSON.parse(readFileSync(longTermLedgerPath(bindingsPath), 'utf8')))
+      } catch {
+        /** Absent or torn ⇒ "the previous generation is unknown". Never a thrown error. */
+        return emptyLedger()
+      }
+    },
+    save: (next) => {
+      const path = longTermLedgerPath(bindingsPath)
+      mkdirSync(dirname(path), { recursive: true })
+      /** Atomic (temp + rename): a reader must never see half a notebook. */
+      const temp = `${path}.tmp-${process.pid}`
+      writeFileSync(temp, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+      renameSync(temp, path)
+    },
+  }
+}
+
+/**
  * Build the ONE error shape the incubation reports, and build it in ONE place.
  *
  * WHY THIS EXISTS: the tool handler renders `孵化失败（stage=<stage>）：<message>`, so a message that
@@ -415,14 +475,47 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
    * `resolveService` policy for the whole plugin — which service name, probed by which method — and
    * a second copy inside `supervisor.ts` would be a second opinion about what "available" means.
    */
-  const supervisePair = (observerSessionId: string, mainSessionId: string, reason: string): Supervisor => {
+  const supervisePair = (
+    observerSessionId: string,
+    mainSessionId: string,
+    reason: string,
+    /**
+     * The main this one REPLACED, when the caller knows it (only a transfer does).
+     *
+     * ── WHY IT IS A PARAMETER, NOT A LOOKUP (measured) ──────────────────────────────────────────
+     *
+     * The pair row names the two CURRENT members and nothing else — it never recorded which main
+     * the current one replaced. My first version tried to read `pair.sourceSessionId`: a field that
+     * does not exist, so the chain was always `''` and the cross-generation sentence could never be
+     * spoken in production while its unit test passed. The old id is a fact known ONLY at the
+     * moment of transfer (`resupervise` holds it); passing it here is the honest place for it.
+     * Restore-at-mount genuinely does not know it, and passes nothing — "unknown chain" is the
+     * truthful answer there, and the ledger's own record supplies it once one has been written.
+     */
+    replacedMainId = '',
+  ): Supervisor => {
     const previous = supervisors.get(mainSessionId)
     if (previous !== undefined) previous.dispose()
+    /**
+     * ── v0.40 (B3 / F7): THE LONG-TERM NOTEBOOK IS INJECTED, NOT READ FROM OTHER REPOS ───────────
+     *
+     * It lives beside the bindings, in THIS plugin's store: the observer may not read `dsh-memory`'s
+     * files (zero cross-repo coupling), so "did the previous generation have the same problem" can
+     * only come from what this plugin itself observed. A torn or missing file loads as an EMPTY ledger
+     * — supervision continues, it just cannot say 「上一代也这样」, which is rule ⑤.
+     *
+     * `sourceSessionId` for the chain is the REPLACED main when a transfer hands it to us (see the
+     * parameter's note); an unknown chain yields generation 1 and no cross-generation claim.
+     */
+    const ledger = createLongTermLedgerStore(resolvedPath)
+    const chainSource = replacedMainId
     const supervisor = createSupervisor(observerSessionId, mainSessionId, {
       logger: ctx.logger,
       controller: resolveService(ctx, 'sessionController', 'prompt'),
       tools: resolveService(ctx, 'tools', 'execute'),
       idleMs: DEFAULT_SUPERVISOR_IDLE_MS,
+      ledger,
+      sourceSessionId: chainSource,
     })
     supervisors.set(mainSessionId, supervisor)
     ctx.logger?.info?.(
@@ -476,7 +569,7 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       supervisors.delete(key)
     }
 
-    supervisePair(newObserverId, newMainId, `${role} transferred`)
+    supervisePair(newObserverId, newMainId, `${role} transferred`, role === 'main' ? oldMainId : '')
     ctx.logger?.info?.(
       `[dsh-observer] 监理已重建：主脑 ${newMainId} ← 副脑 ${newObserverId}` +
         `（${role} 转生自 ${sourceSessionId}；旧主脑 ${oldMainId}` +
@@ -2217,6 +2310,24 @@ export const supervisorInternals = {
   DEFAULT_SUPERVISOR_IDLE_MS,
   SUPERVISOR_DUTY_TEXT,
   createSupervisor,
+  /**
+   * ── v0.40 (B3 / F7): THE LONG-TERM NOTEBOOK'S PURE HALF ──────────────────────────────────────
+   *
+   * Folded into the EXISTING supervision seam rather than exported as a tenth `*Internals`: the
+   * inventory is pinned to nine by `test/test-seam-inventory.test.mjs`, and its rule for a new seam
+   * is "fold it into an existing object first". The notebook IS the supervisor's memory, so this is
+   * also the correct home: the pure decision (which main, which shape, is it a repeat) sits beside
+   * the machine that acts on it; the IO stays with the caller that owns the store.
+   */
+  LONG_TERM_CAP,
+  emptyLedger,
+  parseLedger,
+  findRecord,
+  generationFor,
+  upsertRecord,
+  priorGenerationNudge,
+  crossGenerationLine,
+  longTermLedgerPath,
 }
 
 /**

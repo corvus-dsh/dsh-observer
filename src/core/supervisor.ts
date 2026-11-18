@@ -35,6 +35,9 @@ import {
   harvestGate,
   stepMonitor,
 } from './monitor.js'
+/** v0.40 (B3 / F7): the long-term notebook's pure half. IO is injected by the caller. */
+import { crossGenerationLine, generationFor, priorGenerationNudge, upsertRecord } from './long-term-ledger.js'
+import type { LongTermLedger } from './long-term-ledger.js'
 import { ignitionDeadline, describePromptFailure } from './ignition.js'
 
 /**
@@ -113,6 +116,20 @@ export interface SupervisorDeps {
   /** The scheduler. Injected so a test can drive the idle path without waiting. */
   setTimer?: (fn: () => void, ms: number) => any
   clearTimer?: (handle: any) => void
+  /**
+   * ── v0.40 (B3 / F7): THE LONG-TERM NOTEBOOK, INJECTED ────────────────────────────────────────
+   *
+   * Optional so every existing caller keeps working and a supervisor with no notebook still
+   * supervises (rule ⑤: a broken/absent ledger degrades to "the previous generation is unknown",
+   * never to "stop correcting"). The pure decision lives in `core/long-term-ledger.ts`; the IO stays
+   * with the caller that owns the store.
+   */
+  ledger?: {
+    load: () => LongTermLedger
+    save: (next: LongTermLedger) => void
+  }
+  /** Who this main replaced (for the chain and the generation number). `''` for the first. */
+  sourceSessionId?: string
 }
 
 /**
@@ -247,16 +264,61 @@ export function createSupervisor(
   const applyActions = async (actions: MonitorAction[]): Promise<void> => {
     for (const action of actions) {
       if (action.kind === 'nudge') {
-        const report = await deliver(action)
+        /**
+         * ── v0.40 (B3 / F7): ASK HISTORY BEFORE SPEAKING ─────────────────────────────────────────
+         *
+         * The sentence is appended ONCE and computed from `(kind)`, not from the text: a reworded
+         * correction is still the same problem. `undefined` from `priorGenerationNudge` means history
+         * cannot answer (no notebook, no chain, or the previous main was never corrected for this
+         * shape) — and then nothing is said about it, because an unfounded 「上一代也这样」 is an
+         * accusation the reader cannot check.
+         */
+        const note = ((): string | undefined => {
+          if (deps.ledger === undefined) return undefined
+          try {
+            const ledger = deps.ledger.load()
+            const previous = priorGenerationNudge(ledger, mainSessionId, action.trigger, deps.sourceSessionId)
+            return previous === undefined ? undefined : crossGenerationLine(previous, action.trigger)
+          } catch {
+            /** Rule ⑤: an unreadable notebook must not stop the correction. */
+            return undefined
+          }
+        })()
+        const outgoing: MonitorAction = note === undefined ? action : { ...action, text: `${action.text}\n${note}` }
+        const report = await deliver(outgoing as Extract<MonitorAction, { kind: 'nudge' }>)
         if (report.ok) {
           log(
-            `[dsh-observer] 纠偏已投递给主脑 ${mainSessionId}（${action.trigger}，via ${report.channel}）：` +
-              `${action.detail}`,
+            `[dsh-observer] 纠偏已投递给主脑 ${mainSessionId}（${action.trigger}，via ${report.channel}）` +
+              `${note === undefined ? '' : '；且已告知上一代同样形态'}：${action.detail}`,
           )
         } else {
           // A correction that could not be delivered is a FACT, and it is reported — the
           // alternative (silence) makes a broken supervisor look like a calm one.
           warn(`[dsh-observer] 纠偏投递失败（主脑 ${mainSessionId}，${action.trigger}）：${report.detail}`)
+        }
+        /**
+         * Record the shape REGARDLESS of delivery success: the next generation must know this main
+         * needed this correction. A failed delivery is a transport problem, not evidence that the
+         * problem was absent — and a notebook that only remembers successes would learn the wrong
+         * lesson.
+         */
+        if (deps.ledger !== undefined) {
+          try {
+            const ledger = deps.ledger.load()
+            deps.ledger.save(
+              upsertRecord(ledger, {
+                sessionId: mainSessionId,
+                sourceSessionId: deps.sourceSessionId,
+                generation: deps.sourceSessionId === undefined || deps.sourceSessionId.length === 0
+                  ? 1
+                  : generationFor(ledger, deps.sourceSessionId),
+                at: Date.now(),
+                nudgedKind: action.trigger,
+              }),
+            )
+          } catch (error) {
+            warn(`[dsh-observer] 长期台账写入失败（不影响纠偏）：${String((error as any)?.message ?? error)}`)
+          }
         }
         continue
       }
