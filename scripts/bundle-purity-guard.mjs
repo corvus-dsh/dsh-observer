@@ -59,31 +59,59 @@ const argOf = (flag) => {
 const before = argOf('--before') ?? 'HEAD~1'
 
 /**
- * ── v0.39 (B2-T4): A FEATURE COMMIT MAY DECLARE THAT IT CHANGES CODE ────────────────────────────
+ * ── v0.39 (B2-T4b): A DECLARATION IS ONLY AS GOOD AS WHAT IT IS BOUND TO ────────────────────────
  *
- * THE DEFECT THIS FIXES, MEASURED. The instrument answers ONE question — "is the multiset of bundle
- * code lines unchanged from `before`" — and this wrapper treated every "no" as a regression. But a
- * commit that ADDS A FEATURE answers "no" on purpose, and there was no way to say so:
+ * THE VULNERABILITY, REPRODUCED 2026-11-18 with HEAD=63387fe (which carries `[bundle-change]`):
  *
- *     working tree artifact identical to HEAD~1   ⇒ VACUOUS → RESOURCE → exit 0   (the green case)
- *     working tree artifact rebuilt from new src   ⇒ NOT PURE → exit 1            (every feature)
+ *   1. add ONE comment line to `src/core/monitor.ts` — no declaration anywhere
+ *   2. `node scripts/build.mjs`            ⇒ artifact changed (244581 → 244641)
+ *   3. `node scripts/bundle-purity-guard.mjs`
+ *      ⇒ BUNDLE CHANGED — DECLARED via [bundle-change].   ⇒ exit 0
  *
- * So the step was red for any feature commit, before AND after committing (measured: 48 differing
- * lines against HEAD as well as HEAD~1). Since it sits in `npm run check`, and the workflow runs
- * `npm run check`, that would have turned CI red permanently the first time this repository accepted
- * a feature after the gate was wired (09f0e68). It had not accepted one yet — this was the first.
+ * An UNDECLARED change was waived — and the gate printed, in that same run, "Nothing was waived
+ * silently: an UNDECLARED bundle change still fails on the next line of this gate." That sentence was
+ * false in the run that printed it, which is worse than the miss itself: it asserted the miss could
+ * not happen.
  *
- * WHY A DECLARATION AND NOT A SCOPING RULE. The obvious alternative — "skip when `src/` changed" —
- * makes the gate vacuous exactly when it matters: an accidental artifact rebuild usually accompanies
- * a `src/` change, and that rule would wave it through. A DECLARATION is a claim by the author that
- * this commit means to change the bundle, and it costs one word in the commit message. Same shape as
- * `dsh-graft-slice`'s `[export-change]`, on purpose: two repositories, one convention.
+ * ROOT CAUSE. `git log -1` is the declaration on the LATEST COMMIT; the measurement is "working tree
+ * vs `before`". After committing and then continuing to edit, those point at different things:
  *
- * The declaration may come from the commit message OR the environment, because CI checks out with no
- * local message in reach (a squashed PR's merge commit is not the author's message). `git log -1` is
- * the honest LOCAL answer: after committing, the message IS in reach.
+ *   CI (right after a push)   → HEAD == the pushed commit, tree clean → the declaration APPLIES
+ *   local, commit-then-edit   → HEAD == the OLD commit, tree dirty    → it DOES NOT
+ *
+ * THE RULE, therefore: the declaration must be bound to THE ARTIFACT BEING MEASURED.
+ *
+ *   environment variable          → always counts: it is set for THIS run, which is the only thing a
+ *                                   CI checkout can offer (no author message is in reach there)
+ *   commit message (`git log -1`) → counts ONLY when the tree is clean over the measured paths,
+ *                                   i.e. "the artifact being measured IS that commit's artifact"
+ *
+ * WHY NOT BAN COMMIT-MESSAGE DECLARATIONS OUTRIGHT: committing and then running `npm run check` is the
+ * ordinary local path. Banning it sends the developer back to "export a CI variable by hand", the
+ * documented dead end in `dsh-graft-slice/scripts/verify-bundle.mjs:248-258` — a gate people learn to
+ * skip, which this repository calls a comment (⑯).
+ *
+ * WHY NOT "SKIP WHEN `src/` CHANGED": that rule goes mute exactly when it matters, because an
+ * accidental artifact rebuild normally rides along with a `src/` change.
  */
-const commitMessage = (() => {
+const MEASURED_PATHS = ['src', 'index.js']
+
+/** The commit the measurement is anchored to, with its subject — printed when it grants the waiver. */
+const headCommit = (() => {
+  try {
+    const raw = execFileSync('git', ['--no-pager', 'log', '-1', '--pretty=%h%x09%s'], {
+      cwd: REPO,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+    const [sha, subject = ''] = raw.split('\t')
+    return { sha, subject }
+  } catch {
+    return { sha: '', subject: '' }
+  }
+})()
+
+const headCommitMessage = (() => {
   try {
     return execFileSync('git', ['--no-pager', 'log', '-1', '--pretty=%B'], {
       cwd: REPO,
@@ -94,9 +122,52 @@ const commitMessage = (() => {
     return ''
   }
 })()
-const declared = /\[bundle-change\]/u.test(
-  `${process.env.GRAFT_COMMIT_MESSAGE ?? ''}\n${process.env.GITHUB_HEAD_COMMIT_MESSAGE ?? ''}\n${commitMessage}`,
-)
+
+/**
+ * Is the tree CLEAN over the measured paths?
+ *
+ * Only those paths count. A stray `scratch.log` next to the repository says nothing about whether the
+ * artifact being measured belongs to the commit being cited, and letting it revoke a declaration would
+ * make the gate fail for a reason unrelated to purity.
+ */
+const treeCleanOverMeasuredPaths = (() => {
+  /**
+   * ── WHY THIS FILTERS `git status` INSTEAD OF PASSING A PATHSPEC ──────────────────────────────
+   *
+   * `git status --porcelain -- src index.js` ERRORS (exit 128) when `src` matches nothing, and a
+   * catch that reads "cannot ask ⇒ not clean" would then refuse every commit-message declaration in
+   * such a repository. Ask for the whole status and filter by path HERE instead: `src` matches the
+   * directory and anything under it, `index.js` matches exactly, and a rename line is judged by its
+   * TARGET because that is where the file is.
+   *
+   * Same shape as `dsh-graft-slice/scripts/verify-bundle.mjs` on purpose — two repositories, one rule.
+   */
+  const isMeasuredPath = (path) => path === 'index.js' || path === 'src' || path.startsWith('src/')
+  try {
+    const out = execFileSync('git', ['status', '--porcelain'], {
+      cwd: REPO,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+    if (out.length === 0) return true
+    for (const line of out.split('\n')) {
+      const body = line.slice(3)
+      const target = body.includes(' -> ') ? body.split(' -> ').pop() : body
+      const path = target.replace(/^"|"$/gu, '')
+      if (isMeasuredPath(path)) return false
+    }
+    return true
+  } catch {
+    /** Cannot ask at all ⇒ cannot claim the tree is clean ⇒ no commit-message waiver. Fail closed. */
+    return false
+  }
+})()
+
+const envMessage = `${process.env.GRAFT_COMMIT_MESSAGE ?? ''}\n${process.env.GITHUB_HEAD_COMMIT_MESSAGE ?? ''}`
+const fromEnvironment = /\[bundle-change\]/u.test(envMessage)
+/** The commit-message declaration is honoured ONLY when the measured artifact IS that commit's. */
+const fromCommit = treeCleanOverMeasuredPaths && /\[bundle-change\]/u.test(headCommitMessage)
+const declared = fromEnvironment || fromCommit
 
 /** A shallow clone legitimately has no HEAD~1. Say so; do not pass silently. */
 const refExists = (ref) => {
@@ -142,14 +213,30 @@ try {
   if (error?.status === 1) {
     /**
      * A DECLARED change is not a regression — it is the author saying "this commit means to change
-     * the bundle". Say so LOUDLY rather than silently: the next reader must be able to tell a check
-     * that passed from one that was waived.
+     * the bundle". Say so LOUDLY, and NAME WHAT THE DECLARATION IS BOUND TO: "DECLARED" alone leaves
+     * the reader unable to tell whether the waiver covers the change they are looking at, which is
+     * exactly the state the old wording put them in.
+     *
+     * No sentence here may be true in one state and false in another. The old text asserted
+     * "an UNDECLARED bundle change still fails" while this branch was waiving exactly such a change.
      */
     if (declared) {
       console.log('\nBUNDLE CHANGED — DECLARED via [bundle-change].')
       console.log('  The instrument is right that this is not a pure move; the declaration is the author')
-      console.log('  stating that changing the bundle is the point of this commit. Nothing was waived')
-      console.log('  silently: an UNDECLARED bundle change still fails on the next line of this gate.')
+      console.log('  stating that changing the bundle is the point of this commit.')
+      if (fromEnvironment) {
+        console.log('  Declaration source: ENVIRONMENT VARIABLE (GRAFT_COMMIT_MESSAGE /')
+        console.log('  GITHUB_HEAD_COMMIT_MESSAGE) — set for this run, so it covers what this run measured.')
+      }
+      if (fromCommit) {
+        console.log(`  Declaration source: COMMIT ${headCommit.sha} "${headCommit.subject}".`)
+        console.log(`  It covers this change because the tree is clean over ${MEASURED_PATHS.join(', ')} —`)
+        console.log('  the artifact just measured IS that commit\'s artifact.')
+      }
+      if (!treeCleanOverMeasuredPaths && !fromEnvironment) {
+        /** Unreachable by construction; kept so a future edit cannot silently invert the logic. */
+        console.log('  (Inconsistent state: declaration found but not attributable to this measurement.)')
+      }
       process.exit(0)
     }
     console.error(`\nBUNDLE PURITY FAILED against ${before}: the build changed CODE, not just position.`)
@@ -157,7 +244,17 @@ try {
     console.error('the normaliser in scripts/verify-bundle-purity.mjs, do NOT delete this step.')
     console.error('If this commit MEANS to change the bundle (a feature), declare it: put')
     console.error('  [bundle-change]')
-    console.error('in the commit message. That is a claim, not a bypass: it is printed on the next run.')
+    console.error('in the commit message, WITH A CLEAN TREE over these paths, so the declaration is bound')
+    console.error(`to the artifact being measured (${MEASURED_PATHS.join(', ')}); or set GRAFT_COMMIT_MESSAGE.`)
+    if (!treeCleanOverMeasuredPaths && /\[bundle-change\]/u.test(headCommitMessage)) {
+      /**
+       * The precise trap from B2-T4b, named at the moment it bites: the author DID declare, but on the
+       * previous commit, and then kept editing. Silence here reads as "your declaration was ignored".
+       */
+      console.error(`Note: commit ${headCommit.sha} declares [bundle-change], but the tree is DIRTY over`)
+      console.error(`${MEASURED_PATHS.join(', ')} — the artifact measured here is not that commit's, so its`)
+      console.error('declaration does not cover these edits. Commit them (or set GRAFT_COMMIT_MESSAGE).')
+    }
     process.exit(1)
   }
   console.error(`\nBUNDLE PURITY DID NOT RUN: unexpected exit ${error?.status ?? 'unknown'}.`)
