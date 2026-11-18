@@ -67,6 +67,27 @@ export const NUDGE_MARKER = '[dsh-observer 纠偏]'
 /** Recognise `todo_write` under a namespace, exactly like graft does. */
 const TODO_TOOL = /(?:^|[^a-z0-9])todo[_-]?write$/iu
 
+/**
+ * ── v0.39 (B2-T4): THE GRAPH TRIGGER ────────────────────────────────────────────────────────────
+ *
+ * Recognise `memory_graph_update` under a namespace, for the same reason `TODO_TOOL` exists: the
+ * host may present a plugin tool as `memory_graph_update` or `memory__memory_graph_update`, and an
+ * exact `===` comparison silently misses the second spelling — the trigger would never fire for that
+ * deployment, and nothing would say why.
+ */
+const GRAPH_TOOL = /(?:^|[^a-z0-9])memory[_-]?graph[_-]?update$/iu
+
+/**
+ * How many DISTINCT tools in the recent window count as "multi-step".
+ *
+ * Threshold discipline: this is a starting point, not a measurement — and it is reported as such.
+ * The reasoning that produced it: a one-file edit uses one or two tools (read, then edit); a phase of
+ * real work uses at least three (search/read, edit/write, a verification step). Below three, the
+ * trigger would nag about single edits; the cost of being late is a stale graph, which TD-M17 already
+ * records as the next problem to solve.
+ */
+export const GRAPH_DISTINCT_TOOLS_LIMIT = 3
+
 export interface MonitorOptions {
   failureStreak: number
   stallTurns: number
@@ -74,6 +95,8 @@ export interface MonitorOptions {
   nudgeMinSeqGap: number
   nudgeCap: number
   harvestCooldownMs: number
+  /** v0.39: distinct tools in the recent window that count as multi-step work. */
+  graphDistinctTools: number
   /** The clock. Injected so the pure tests do not depend on wall time. */
   now: () => number
 }
@@ -85,6 +108,7 @@ export const DEFAULT_MONITOR_OPTIONS: MonitorOptions = {
   nudgeMinSeqGap: NUDGE_MIN_SEQ_GAP,
   nudgeCap: NUDGE_CAP,
   harvestCooldownMs: HARVEST_COOLDOWN_MS,
+  graphDistinctTools: GRAPH_DISTINCT_TOOLS_LIMIT,
   now: () => Date.now(),
 }
 
@@ -130,6 +154,33 @@ export interface MonitorState {
    * answer to "did the main ever try".
    */
   everUsedTodo: boolean
+  /**
+   * ── v0.39 (B2-T4): HAS THIS MAIN EVER BUILT A TASK GRAPH? ─────────────────────────────────────
+   *
+   * `everUsedTodo` is about the TODO board; this is about the PLAN. They are different artefacts and
+   * different absences: a main can keep a perfect TODO list and never build a graph, and the
+   * supervisor had no way to notice — `memory_graph_update` appeared ZERO times in this repository
+   * before this release.
+   *
+   * Set the moment the call is SEEN (not when it settles), for the same reason `everUsedTodo` is: the
+   * question is "did it ever try", and a call that failed still answers yes.
+   */
+  sawGraphTool: boolean
+  /**
+   * The tool names seen in the turn that is currently open. Flushed into `recentTurnTools` at
+   * `turn/end`, which is where the multi-step evidence is evaluated.
+   */
+  toolsThisTurn: string[]
+  /** Per-turn tool sets for the recent window, newest last, capped at `stallTurns`. */
+  recentTurnTools: string[][]
+  /**
+   * ── ONCE PER MAIN, ON PURPOSE ────────────────────────────────────────────────────────────────
+   *
+   * "There is no graph" is a STATE, not an event. Correcting it every time the window fills is the
+   * nagging this module exists to avoid — and a main that has already been told once and chose not to
+   * build one is making a decision, not missing a hint.
+   */
+  graphNudged: boolean
   todoSignature: string
   openTodos: number
   totalTodos: number
@@ -156,6 +207,10 @@ export function createMonitorState(): MonitorState {
     stalledTurns: 0,
     lastTodoSeq: 0,
     everUsedTodo: false,
+    sawGraphTool: false,
+    toolsThisTurn: [],
+    recentTurnTools: [],
+    graphNudged: false,
     todoSignature: '',
     openTodos: 0,
     totalTodos: 0,
@@ -174,7 +229,7 @@ export function createMonitorState(): MonitorState {
 }
 
 export type MonitorAction =
-  | { kind: 'nudge'; trigger: 'failure' | 'stall'; text: string; detail: string; seq: number }
+  | { kind: 'nudge'; trigger: 'failure' | 'stall' | 'graph'; text: string; detail: string; seq: number }
   | { kind: 'harvest'; reason: HarvestReason; detail: string }
 
 /**
@@ -264,6 +319,57 @@ export function stallWithoutBoardText(stalledTurns: number): string {
   ].join('\n')
 }
 
+/**
+ * ── v0.39 (B2-T4): THE SENTENCE FOR A MAIN THAT NEVER BUILT A GRAPH ─────────────────────────────
+ *
+ * A THIRD complaint, because it is a third situation. `stallNudgeText` is about a board that stopped
+ * moving; `stallWithoutBoardText` is about having no board at all. This one is about doing real
+ * multi-step work and never writing the plan down — the work is visible, the PLAN is not, and
+ * "where am I in the plan" is exactly what a sliced successor will need.
+ *
+ * It cites the measurements it was decided on (turns, distinct tool kinds) rather than asserting a
+ * feeling: `已连续 N 轮用了 M 种工具` is checkable by the reader, and a main that believes it was not
+ * multi-step can say so.
+ */
+export function graphNudgeText(turns: number, distinctTools: number): string {
+  return [
+    `${NUDGE_MARKER} 已连续 ${turns} 轮在做多步工作（用过 ${distinctTools} 种工具），但这段会话从未建立任务图。`,
+    '建议先调用 `memory_graph_update`（op:bootstrap 可从零建整张计划），',
+    '之后每完成一个节点更新状态；跨切片的「我在哪」与 observer 的进度判断都依赖它。',
+  ].join('\n')
+}
+
+/**
+ * ── v0.39 (B2-T4): DECIDE AND RECORD THE GRAPH NUDGE ────────────────────────────────────────────
+ *
+ * Split out of `stepMonitor` so the three conditions read as three conditions, and so the "already
+ * spoke / already built one" guards are one early return instead of a nested if. Returns whether it
+ * fired — the stall branch uses that to yield for one step rather than talk over it.
+ */
+function maybeGraphNudge(state: MonitorState, options: MonitorOptions, seq: number, actions: MonitorAction[]): boolean {
+  /** ② already has a graph, or this trigger has already spoken: nothing to do, forever. */
+  if (state.sawGraphTool === true || state.graphNudged === true) return false
+  /** Not enough log to call it "多步" yet — the window needs `stallTurns` turns in it. */
+  if (state.turnsClosed < options.stallTurns) return false
+  /** ① multi-step evidence: DISTINCT kinds, because one tool called forty times is one kind. */
+  const distinct = new Set(state.recentTurnTools.flat()).size
+  if (distinct < options.graphDistinctTools) return false
+  /** ③ the shared limits — not a second set of constants. */
+  if (cooldownBlocks(state, options, seq).length > 0) return false
+  actions.push({
+    kind: 'nudge',
+    trigger: 'graph',
+    text: graphNudgeText(state.turnsClosed, distinct),
+    detail: `连续 ${state.turnsClosed} 轮、${distinct} 种工具，但从未建立任务图`,
+    seq,
+  })
+  state.nudges += 1
+  state.lastNudgeAt = options.now()
+  state.lastNudgeSeq = seq
+  state.graphNudged = true
+  return true
+}
+
 function cooldownBlocks(state: MonitorState, options: MonitorOptions, seq: number): string {
   if (state.nudges >= options.nudgeCap) return `已达上限 ${options.nudgeCap} 次`
   const since = options.now() - state.lastNudgeAt
@@ -300,6 +406,16 @@ export function stepMonitor(
     const name = String(event.data?.name ?? '')
     if (callId.length === 0 || name.length === 0) return actions
     state.pending[callId] = name
+    /**
+     * v0.39: the two facts the graph trigger needs, recorded when the CALL is seen.
+     *
+     * `sawGraphTool` is "did it ever try" — a failed call still answers yes, and waiting for a settle
+     * would leave the trigger blind to exactly the main whose graph calls never came back.
+     * `toolsThisTurn` is the multi-step evidence, deduplicated per turn: calling one tool forty times
+     * is one kind of tool, not forty.
+     */
+    if (GRAPH_TOOL.test(name)) state.sawGraphTool = true
+    if (!state.toolsThisTurn.includes(name)) state.toolsThisTurn.push(name)
     if (TODO_TOOL.test(name)) {
       /**
        * AUDIT F6/F7: RECORD THE ATTEMPT, not just the payload.
@@ -372,16 +488,51 @@ export function stepMonitor(
   if (type === 'turn/end') {
     state.turnsClosed += 1
     state.stalledTurns += 1
+    /**
+     * v0.39: close the turn's tool window. The completed turn joins the evidence, and the list is
+     * capped at `stallTurns` so the window really is "the recent window" rather than "everything that
+     * ever happened" — a main that used four tools in its first turn and has been writing one file per
+     * turn since would otherwise still look multi-step ten turns later.
+     */
+    if (state.toolsThisTurn.length > 0) state.recentTurnTools.push(state.toolsThisTurn)
+    state.toolsThisTurn = []
+    while (state.recentTurnTools.length > options.stallTurns) state.recentTurnTools.shift()
 
     const finished =
       state.totalTodos > 0 && state.openTodos === 0 && state.todoSignature.length > 0
+    /**
+     * ── v0.39 (B2-T4): THE GRAPH TRIGGER, EVALUATED FIRST ────────────────────────────────────────
+     *
+     * THREE CONDITIONS, ALL REQUIRED — and they are three INDEPENDENT guards, not one rule written
+     * twice. Deleting any single one must turn exactly one test red:
+     *
+     *   ① MULTI-STEP EVIDENCE — at least `graphDistinctTools` distinct tool kinds across the recent
+     *      window. Without it, a one-file edit gets nagged about a plan it does not need.
+     *   ② NEVER BUILT A GRAPH — the whole log holds no `memory_graph_update` call. Deliberately
+     *      "never", not "not recently": "built one and stopped updating it" is TD-M17's problem, and
+     *      merging the two would make this trigger fire forever after a single stale week.
+     *   ③ THE SHARED LIMITS — cooldown, seq gap, cap, plus once-per-main for THIS trigger.
+     *
+     * ── WHY IT OUTRANKS THE STALL BRANCH, AND WHY THAT ORDER IS NOT ARBITRARY ───────────────────
+     *
+     * Measured while writing this: the trigger was unreachable. A main with no TODO board trips the
+     * stall branch at `stallTurns`, which RESETS `stalledTurns`; the graph check then saw a nudge had
+     * just gone out and deferred. Five turns later the same thing happened again. The most common
+     * case for this trigger — a main that works in many steps and never writes anything down — was
+     * starved by the symptom it was meant to diagnose.
+     *
+     * So the ORDER is the fix: the graph complaint is the more specific one (it names the plan and a
+     * tool), it is once-per-main, so pre-empting the stall sentence costs at most one turn, after
+     * which the stall branch resumes normally.
+     */
+    const graphFired = maybeGraphNudge(state, options, seq, actions)
     if (finished) {
       actions.push({
         kind: 'harvest',
         reason: 'completed',
         detail: `清单 ${state.totalTodos} 项全部完成（seq=${state.lastTodoSeq}）`,
       })
-    } else if (state.stalledTurns >= options.stallTurns) {
+    } else if (!graphFired && state.stalledTurns >= options.stallTurns) {
       /**
        * ── AUDIT F6: THE STALL TRIGGER USED TO REQUIRE A BOARD, SO AN ORDERLESS MAIN WAS NEVER SEEN ──
        *
@@ -511,6 +662,23 @@ export function describeMonitorState(state: MonitorState): Record<string, unknow
       state.failure === null ? null : { tool: state.failure.tool, count: state.failure.count },
     stalledTurns: state.stalledTurns,
     todo: { total: state.totalTodos, open: state.openTodos, lastSeq: state.lastTodoSeq },
+    /**
+     * ── v0.39 (B2-T4): THE GRAPH TRIGGER'S OWN READOUT ──────────────────────────────────────────
+     *
+     * Without this an operator cannot tell a trigger that is DORMANT from one that is BROKEN: "0
+     * graph nudges" looks identical whether the main built a graph, or the guard never fired because
+     * its condition can never be met. Naming all four facts makes the answer readable.
+     */
+    graph: {
+      /** True once the main has called `memory_graph_update` at least once. */
+      sawTool: state.sawGraphTool,
+      /** True once this trigger has spoken for this main — it speaks once. */
+      nudged: state.graphNudged,
+      /** Distinct tool kinds across the recent window: the multi-step evidence, as measured. */
+      distinctToolsRecent: new Set(state.recentTurnTools.flat()).size,
+      /** Turns currently in the evidence window (bounded by `stallTurns`). */
+      windowTurns: state.recentTurnTools.length,
+    },
     nudges: state.nudges,
     lastNudgeAt: state.lastNudgeAt === 0 ? null : state.lastNudgeAt,
     harvests: state.harvests,

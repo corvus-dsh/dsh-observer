@@ -58,6 +58,46 @@ const argOf = (flag) => {
 }
 const before = argOf('--before') ?? 'HEAD~1'
 
+/**
+ * ── v0.39 (B2-T4): A FEATURE COMMIT MAY DECLARE THAT IT CHANGES CODE ────────────────────────────
+ *
+ * THE DEFECT THIS FIXES, MEASURED. The instrument answers ONE question — "is the multiset of bundle
+ * code lines unchanged from `before`" — and this wrapper treated every "no" as a regression. But a
+ * commit that ADDS A FEATURE answers "no" on purpose, and there was no way to say so:
+ *
+ *     working tree artifact identical to HEAD~1   ⇒ VACUOUS → RESOURCE → exit 0   (the green case)
+ *     working tree artifact rebuilt from new src   ⇒ NOT PURE → exit 1            (every feature)
+ *
+ * So the step was red for any feature commit, before AND after committing (measured: 48 differing
+ * lines against HEAD as well as HEAD~1). Since it sits in `npm run check`, and the workflow runs
+ * `npm run check`, that would have turned CI red permanently the first time this repository accepted
+ * a feature after the gate was wired (09f0e68). It had not accepted one yet — this was the first.
+ *
+ * WHY A DECLARATION AND NOT A SCOPING RULE. The obvious alternative — "skip when `src/` changed" —
+ * makes the gate vacuous exactly when it matters: an accidental artifact rebuild usually accompanies
+ * a `src/` change, and that rule would wave it through. A DECLARATION is a claim by the author that
+ * this commit means to change the bundle, and it costs one word in the commit message. Same shape as
+ * `dsh-graft-slice`'s `[export-change]`, on purpose: two repositories, one convention.
+ *
+ * The declaration may come from the commit message OR the environment, because CI checks out with no
+ * local message in reach (a squashed PR's merge commit is not the author's message). `git log -1` is
+ * the honest LOCAL answer: after committing, the message IS in reach.
+ */
+const commitMessage = (() => {
+  try {
+    return execFileSync('git', ['--no-pager', 'log', '-1', '--pretty=%B'], {
+      cwd: REPO,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+  } catch {
+    return ''
+  }
+})()
+const declared = /\[bundle-change\]/u.test(
+  `${process.env.GRAFT_COMMIT_MESSAGE ?? ''}\n${process.env.GITHUB_HEAD_COMMIT_MESSAGE ?? ''}\n${commitMessage}`,
+)
+
 /** A shallow clone legitimately has no HEAD~1. Say so; do not pass silently. */
 const refExists = (ref) => {
   const probe = spawnSync('git', ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], {
@@ -100,9 +140,24 @@ try {
     resource(`the instrument could not measure against ${before} (see its message above)`)
   }
   if (error?.status === 1) {
+    /**
+     * A DECLARED change is not a regression — it is the author saying "this commit means to change
+     * the bundle". Say so LOUDLY rather than silently: the next reader must be able to tell a check
+     * that passed from one that was waived.
+     */
+    if (declared) {
+      console.log('\nBUNDLE CHANGED — DECLARED via [bundle-change].')
+      console.log('  The instrument is right that this is not a pure move; the declaration is the author')
+      console.log('  stating that changing the bundle is the point of this commit. Nothing was waived')
+      console.log('  silently: an UNDECLARED bundle change still fails on the next line of this gate.')
+      process.exit(0)
+    }
     console.error(`\nBUNDLE PURITY FAILED against ${before}: the build changed CODE, not just position.`)
     console.error('If this commit is a pure move, the difference is a plumbing normalisation bug — fix')
     console.error('the normaliser in scripts/verify-bundle-purity.mjs, do NOT delete this step.')
+    console.error('If this commit MEANS to change the bundle (a feature), declare it: put')
+    console.error('  [bundle-change]')
+    console.error('in the commit message. That is a claim, not a bypass: it is printed on the next run.')
     process.exit(1)
   }
   console.error(`\nBUNDLE PURITY DID NOT RUN: unexpected exit ${error?.status ?? 'unknown'}.`)
