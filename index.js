@@ -3629,6 +3629,36 @@ export function apply(ctx                   , config                          = 
      */
     const ledger = createLongTermLedgerStore(resolvedPath)
     const chainSource = replacedMainId
+    /**
+     * ── v0.41 (B3 / F7) — THE CHAIN IS WRITTEN WHEN IT IS KNOWN, NOT WHEN IT IS NEEDED ──────────
+     *
+     * The first version only recorded a main in the ledger when a correction fired (the write is
+     * the fact "this main needed THIS correction"). That left a hole with a reachable shape: a main
+     * transferred and then RESTARTED before its first correction had no row, so the next supervisor
+     * ("restored at mount") had neither the caller-provided chain nor a stored one — and history,
+     * which was sitting in the file one line away, could not be consulted.
+     *
+     * `replacedMainId` is only ever known at the moment of transfer. Writing the chain HERE makes
+     * it durable: a restore needs nothing but the ledger. Nudges are still what fill in `nudgedKinds`.
+     */
+    if (chainSource.length > 0) {
+      try {
+        const current = ledger.load()
+        ledger.save(
+          upsertRecord(current, {
+            sessionId: mainSessionId,
+            sourceSessionId: chainSource,
+            generation: generationFor(current, chainSource),
+            at: Date.now(),
+          }),
+        )
+      } catch (error) {
+        /** A notebook that cannot be written must not stop supervision (rule ⑤, both directions). */
+        ctx.logger?.warn?.(
+          `[dsh-observer] 长期台账写入失败（不影响监理）：${String((error       )?.message ?? error)}`,
+        )
+      }
+    }
     const supervisor = createSupervisor(observerSessionId, mainSessionId, {
       logger: ctx.logger,
       controller: resolveService(ctx, 'sessionController', 'prompt'),

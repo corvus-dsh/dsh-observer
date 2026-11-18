@@ -296,9 +296,67 @@ test('v243 ⑧: 台账 load/save 抛错 ⇒ 纠偏照常投递，且不说「上
   )
 })
 
-// ── ⑨ 生产路径：切片换主脑时，链真的被交给新监理 ──────────────────────────────────────────────
+// ── ⑩ 链在切片那一刻落盘 ⇒ 进程重启后仍然知道上一代 ─────────────────────────────────────────
 
-test('v243 ⑨: 真机路径——切片后新监理拿到链，第二代被告知「上一代也这样」', async () => {
+test('v243 ⑨b: 切片后进程重启（mount 恢复，没有 caller 链）⇒ 仍能说「上一代也这样」', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-v243-restart-'))
+  const bindingsPath = join(dir, 'observer-bindings.json')
+
+  const driving = (host) => {
+    const onEvent = host.listeners.get('session/event')
+    const emit = async (sessionId, type, data) => {
+      onEvent({ id: sessionId }, { type, data })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    return async (sessionId) => {
+      for (let round = 0; round < 3; round += 1) {
+        const callId = `r-${round}`
+        await emit(sessionId, 'tool/call', { turn: 1, step: 1, callId, name: 'pwsh' })
+        await emit(sessionId, 'tool/result', {
+          turn: 1,
+          step: 1,
+          message: { isError: true, content: [{ type: 'text', text: 'boom' }], source: { callId } },
+        })
+      }
+    }
+  }
+
+  /** Process 1: gen1 is corrected, then the MAIN is sliced to gen2 — and gen2 is never nudged. */
+  const first = makeHost({ memory: { hint: '' } })
+  apply(first.ctx, { bindingsPath })
+  const spawned = await first.tools
+    .get('observer_spawn_main')
+    .execute({ plan: '## 计划', observerSessionId: 'session-blank', userConfirmed: true }, {})
+  const gen1 = spawned.sessionId
+  await driving(first)(gen1)
+  first.listeners.get('graft/session-transferred')({ sourceSessionId: gen1, newSessionId: 'session-main-gen2' })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  /**
+   * The chain link is now durable ON ITS OWN: at transfer time the new main was written into the
+   * ledger with `sourceSessionId: gen1`. Without that write this test would fail — the restarted
+   * process has no `replacedMainId` to pass (`restored at mount` genuinely does not know one).
+   */
+  const stored = parseLedger(JSON.parse(readFileSync(join(dir, 'observer-main-ledger.json'), 'utf8')))
+  assert.equal(findRecord(stored, 'session-main-gen2')?.sourceSessionId, gen1, '链必须在切片那一刻就落盘')
+  assert.equal(findRecord(stored, 'session-main-gen2')?.nudges, 0, '还没被纠偏过 —— 记的是链，不是次数')
+
+  /** Process 2: a NEW host, the same bindings file. The pair is rehydrated by mount. */
+  const second = makeHost({ memory: { hint: '' } })
+  apply(second.ctx, { bindingsPath })
+  await driving(second)('session-main-gen2')
+
+  const steered = second.prompts
+    .filter((entry) => entry.sessionId === 'session-main-gen2')
+    .map((entry) => entry.content.map((part) => part.text).join(''))
+  assert.ok(steered.length > 0, '重启后仍必须纠偏')
+  assert.ok(
+    steered.some((text) => /上一代（第 1 代）也这样/u.test(text)),
+    `重启后历史仍必须可用；实际投递：${steered.join(' || ')}`,
+  )
+})
+
+test('v243 ⑨a: 真机路径——切片后新监理拿到链，第二代被告知「上一代也这样」', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-v243-e2e-'))
   const bindingsPath = join(dir, 'observer-bindings.json')
   const host = makeHost({ memory: { hint: '' } })
