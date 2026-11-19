@@ -368,6 +368,37 @@ function recordPair(
   return store().recordPair(observerSessionId, mainSessionId, origin)
 }
 
+/**
+ * ── v0.42 (B4-0b-1 A2): THE ONE WAY TO RECORD A BINDING ─────────────────────────────────────────
+ *
+ * The audit's C-2: `observer_bind` wrote `bindLegacy` only. Everything that MATTERS reads `pairs/`:
+ * `debugFollowTransfer` answers `followed:false` when `pairOf()` misses (`:414`), and restart
+ * reconstruction iterates `pairs` (`:622`). So the tool replied `ok:true`, `observer_status` showed
+ * the binding (it reads the legacy maps), and the pair was invisible to both the transfer-following
+ * path and the重启 path. A receipt that says "bound" while the mechanism that acts on the binding
+ * cannot see it is exactly the class of lie this batch exists to remove.
+ *
+ * `recordPair` already writes the legacy maps as a DERIVED VIEW (binding-store.ts:310-311), so
+ * writing them separately was never necessary. The fallback here is for the one case where `pairs`
+ * cannot be persisted: the legacy view is still written so the UI is not blank, but the caller is
+ * told `ok:false` and `pairRecorded:false` — a degraded binding is reported, never dressed up.
+ */
+function bindPair(
+  mainSessionId: string,
+  observerSessionId: string,
+  origin: ObserverPair['origin'],
+): { ok: boolean; error?: string; pairRecorded: boolean; dissolved?: number } {
+  const written = recordPair(observerSessionId, mainSessionId, origin)
+  if (written.ok) return { ok: true, pairRecorded: true, dissolved: written.dissolved }
+  store().bindLegacy(mainSessionId, observerSessionId)
+  const fallback = save()
+  return {
+    ok: false,
+    pairRecorded: false,
+    error: written.error ?? fallback.error ?? 'pair table write failed',
+  }
+}
+
 function isObserverHalf(sessionId: string): boolean {
   return store().isObserverHalf(sessionId)
 }
@@ -707,10 +738,17 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       // Already bound to the same pair: a repeated title event must not re-inject the setting.
       if (observerOf(mainSessionId) === observerSessionId) return
 
-      store().bindLegacy(mainSessionId, observerSessionId)
-      const written = save()
-      if (!written.ok) {
-        ctx.logger?.warn?.(`[dsh-observer] title-derived bind failed to persist: ${written.error}`)
+      /**
+       * v0.42 (B4-0b-1 A2): a title-derived binding is a SUMONED pair, so it goes through the pair
+       * table like every other binding. It used to write the legacy maps only, which made the pair
+       * invisible to `debugFollowTransfer` and to restart reconstruction.
+       */
+      const bound = bindPair(mainSessionId, observerSessionId, 'summoned')
+      if (!bound.ok) {
+        ctx.logger?.warn?.(
+          `[dsh-observer] title-derived bind recorded the LEGACY view only (pair write failed: ${bound.error}); ` +
+            'this pair will not follow a slice and will not survive a restart',
+        )
         return
       }
       ctx.logger?.info?.(`[dsh-observer] bound ${mainSessionId} -> ${observerSessionId} from its title`)
@@ -814,17 +852,12 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
     }
 
     if (mode === 'bind') {
-      store().bindLegacy(mainSessionId, observerSessionId)
-      const written = save()
-      if (!written.ok) {
-        store().mutate((st) => {
-          delete st.bindings[mainSessionId]
-          delete st.reverse[observerSessionId]
-        })
+      const bound = bindPair(mainSessionId, observerSessionId, 'summoned')
+      if (!bound.ok) {
         return {
           ok: false,
           observerSessionId,
-          text: `副脑会话已创建（${observerSessionId}），但绑定表写入失败：${written.error}（路径 ${written.path}）`,
+          text: `副脑会话已创建（${observerSessionId}），但配对表写入失败：${bound.error}`,
         }
       }
       // Verify against DISK, not against the in-memory copy the write came from.
@@ -833,7 +866,7 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
         return {
           ok: false,
           observerSessionId,
-          text: `绑定表回读校验失败：${written.path} 中没有 ${mainSessionId} → ${observerSessionId}`,
+          text: `绑定表回读校验失败：${store().health().path} 中没有 ${mainSessionId} → ${observerSessionId}`,
         }
       }
     }
@@ -1174,7 +1207,7 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
   const bindExisting = async (
     mainSessionId: string,
     observerSessionId: string,
-  ): Promise<{ ok: boolean; observerSessionId: string; text: string }> => {
+  ): Promise<{ ok: boolean; observerSessionId: string; text: string; pairRecorded?: boolean }> => {
     if (mainSessionId.length === 0 || observerSessionId.length === 0) {
       return { ok: false, observerSessionId: '', text: '缺少 mainSessionId 或 observerSessionId。' }
     }
@@ -1185,18 +1218,28 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
     if (existing.length > 0 && existing !== observerSessionId) {
       store().mutate((st) => { delete st.reverse[existing] })
     }
-    store().bindLegacy(mainSessionId, observerSessionId)
-    const written = save()
-    if (!written.ok) {
-      store().mutate((st) => {
-        delete st.bindings[mainSessionId]
-        delete st.reverse[observerSessionId]
-      })
-      return { ok: false, observerSessionId, text: `绑定表写入失败：${written.error}（路径 ${written.path}）` }
+    /**
+     * ── v0.42 (B4-0b-1 A2): THROUGH THE PAIR TABLE, AND SAY SO ──────────────────────────────────
+     *
+     * `bindLegacy` alone was the bug: the receipt said `ok:true`, the legacy maps showed the binding,
+     * and both mechanisms that ACT on it (`debugFollowTransfer`, restart reconstruction) read `pairs/`
+     * and saw nothing. `recordPair` writes the legacy maps as a derived view, so nothing is lost.
+     *
+     * The receipt now carries `pairRecorded`. A degraded binding (pair write failed, legacy view
+     * written) must be `ok:false` — "the UI shows it" is not the same as "the mechanism knows it".
+     */
+    const bound = bindPair(mainSessionId, observerSessionId, 'summoned')
+    if (!bound.ok) {
+      return {
+        ok: false,
+        observerSessionId,
+        pairRecorded: false,
+        text: `绑定表写入失败：${bound.error}（旧式视图已写入，但这一对不会跟随切片、重启也不会恢复监理）`,
+      }
     }
     load()
     if (observerOf(mainSessionId) !== observerSessionId) {
-      return { ok: false, observerSessionId, text: `回读校验失败：${written.path} 中没有该绑定` }
+      return { ok: false, observerSessionId, pairRecorded: true, text: '回读校验失败：绑定表中没有该绑定' }
     }
     /**
      * v1.0.4: send the role as an ordinary message and title the session `[副脑] …`. The title is
@@ -1209,6 +1252,7 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
     return {
       ok: true,
       observerSessionId,
+      pairRecorded: true,
       text:
         `已绑定 ${mainSessionId} → ${observerSessionId}。` +
         (marked.detail.length > 0 ? `（部分步骤未完成：${marked.detail}）` : ''),
@@ -1235,6 +1279,8 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
         properties: {
           ok: { type: 'boolean' },
           observerSessionId: { type: 'string' },
+          /** v0.42 (A2): true only when the PAIR table was written — not just the legacy view. */
+          pairRecorded: { type: 'boolean' },
           text: { type: 'string' },
         },
         required: ['ok'],
@@ -1321,13 +1367,13 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       return { ok: false, sessionId: '', text: 'sessionController.create 返回了空 id' }
     }
 
-    store().bindLegacy(mainSessionId, observerSessionId)
+    /**
+     * v0.42 (A2): the redundant `bindLegacy` that used to sit here is gone. `recordPair` writes the
+     * legacy maps as a derived view, and writing them FIRST meant a failed pair write left a
+     * half-binding behind that the failure path then had to undo by hand.
+     */
     const written = recordPair(observerSessionId, mainSessionId, 'summoned')
     if (!written.ok) {
-      store().mutate((st) => {
-        delete st.bindings[mainSessionId]
-        delete st.reverse[observerSessionId]
-      })
       return { ok: false, sessionId: observerSessionId, text: `绑定表写入失败：${written.error}` }
     }
 
@@ -2131,6 +2177,8 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
           focusConsumed: { type: 'boolean' },
           /** v1.7.0: one entry per supervised main. An empty map means nothing was incubated. */
           supervisors: { type: 'object' },
+          /** v0.42 (A4): `{ path, readOnly, mergedOnLastSave }` — a degraded store must look degraded. */
+          bindingStore: { type: 'object' },
           /**
            * v1.8.0: the 彼岸层's live status. `resolved: false` means no read has happened yet;
            * `available: false` means the layer is missing and says what that costs.
@@ -2154,6 +2202,16 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
         reverse: { ...snapshot.reverse },
         focus: pending === null ? null : { ...pending },
         supervisors: supervisorView,
+        /**
+         * ── v0.42 (B4-0b-1 A4): THE STORE'S OWN HEALTH ─────────────────────────────────────────
+         *
+         * `readOnly` non-empty means the file could not be parsed and this process will not write it
+         * — every bind attempt will honestly fail until someone looks. `mergedOnLastSave` > 0 means
+         * the last write folded in rows another process wrote (a fact an operator wants, not an
+         * error). Without these two, a read-only store and a healthy one read identically: bindings
+         * appear in memory and nothing on disk changed.
+         */
+        bindingStore: store().health(),
         paradise: paradiseStatus(),
         ...(args?.ackFocus === true ? { focusConsumed: true } : {}),
       }

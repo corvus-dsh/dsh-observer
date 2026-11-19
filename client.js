@@ -83,12 +83,37 @@ window.__ModuleLoader__.load({
 
         try {
           /**
+           * ── B4-0b-1 C-6 / judgment ④: "WHY DID IT NOT JUMP" MUST BE ANSWERABLE ──────────────────
+           *
+           * This half can be inert for two very different reasons, and until now both looked the
+           * same from the outside ("nothing happened"):
+           *
+           *   · THE HARNESS DOES NOT BRIDGE Host plugin events to the Client — the documented limit
+           *     at the top of this file. In that case the listener never fires, no matter how many
+           *     slices happen.
+           *   · THE LISTENER NEVER REGISTERED (an old build, a broken `ctx.on`) — then even a bridging
+           *     harness reaches nobody.
+           *
+           * The two diagnostics on `window` make the difference readable without devtools digging:
+           * `__OBSERVER_LOADED__` says this half mounted at all, and `__OBSERVER_TRANSFERS__` says how
+           * many transfer events have ARRIVED (0 with the module loaded = the bridge is the gap).
+           */
+          window.__OBSERVER_LISTENING__ = false
+          window.__OBSERVER_TRANSFERS__ = 0
+          window.__OBSERVER_LAST_TRANSFER__ = null
+
+          /**
            * FOCUS PULL, EVENT DRIVEN. A handoff announces `graft/session-transferred`; when that
            * reaches this half, open the new main session — no poll, no state read, no lookup.
            */
           if (typeof ctx.on === 'function') {
             ctx.on('graft/session-transferred', (payload) => {
               try {
+                window.__OBSERVER_TRANSFERS__ = (Number(window.__OBSERVER_TRANSFERS__) || 0) + 1
+                window.__OBSERVER_LAST_TRANSFER__ = {
+                  at: Date.now(),
+                  newSessionId: typeof payload?.newSessionId === 'string' ? payload.newSessionId : '',
+                }
                 const newSessionId = typeof payload?.newSessionId === 'string' ? payload.newSessionId : ''
                 if (newSessionId.length === 0) return
                 openSession(newSessionId)
@@ -97,10 +122,15 @@ window.__ModuleLoader__.load({
                 console.error('[dsh-observer] transfer handler failed:', String((error && error.message) || error))
               }
             })
+            window.__OBSERVER_LISTENING__ = true
             console.log('[dsh-observer] listening for graft/session-transferred (no UI seats: Plan B)')
           }
         } catch (error) {
           console.error('[dsh-observer] could not subscribe to the transfer event:', String((error && error.message) || error))
+          console.warn(
+            '[dsh-observer] 本窗口不会跟随切片：订阅失败。' +
+              '这不是「没有切片」，而是「收不到通知」——检查 harness 是否把 Host 插件事件桥接到 Client。',
+          )
         }
       },
     }

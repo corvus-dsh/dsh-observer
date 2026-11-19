@@ -395,8 +395,17 @@ test('monitor: the cap is absolute — nagging is not supervision', () => {
     )
     fired += actions.filter((action) => action.kind === 'nudge').length
   }
-  assert.equal(fired, NUDGE_CAP, `exactly ${NUDGE_CAP} corrections, then silence`)
-  assert.equal(state.nudges, NUDGE_CAP)
+  /**
+   * v0.42 (B4-0b-1 A1) CHANGED THE NUMBER, NOT THE RULE. The cap is still absolute; what changed is
+   * that the LAST slot is reserved for the graph trigger (it is once-per-main, so its own bound is
+   * tighter than the cap). A main spending everything on failure corrections now gets `cap - 1` of
+   * them — see `v244` for the case that proves the reserved slot is what the graph trigger uses.
+   *
+   * This assertion encoded the old arithmetic; it is updated rather than deleted, because "the cap
+   * is absolute" is still the rule being protected here.
+   */
+  assert.equal(fired, NUDGE_CAP - 1, `exactly ${NUDGE_CAP - 1} corrections, then silence (last slot reserved)`)
+  assert.equal(state.nudges, NUDGE_CAP - 1)
 })
 
 /* ── A4. the harvest gate ────────────────────────────────────────────────── */

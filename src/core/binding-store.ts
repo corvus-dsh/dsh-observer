@@ -125,7 +125,18 @@ function pairKeyOf(a: string, b: string): string {
  */
 export interface BindingStore {
   load(): void
-  save(): { ok: boolean; path: string; error?: string }
+  /** v0.42 (A4): `omitPairs` = pair keys this save dissolved on purpose (never resurrected). */
+  save(options?: { omitPairs?: readonly string[] }): {
+    ok: boolean
+    path: string
+    error?: string
+    /** Rows another process wrote that this save folded in instead of erasing. */
+    merged?: number
+    /** Non-empty when the table could not be parsed at load: the store is read-only for this process. */
+    readOnly?: string
+  }
+  /** v0.42 (A4): read-only reason + last merge count, for `observer_status`. */
+  health(): { path: string; readOnly: string; mergedOnLastSave: number }
   snapshot(): ObserverBindings
   observerOf(mainSessionId: string): string
   mainOfObserver(observerSessionId: string): string
@@ -153,11 +164,99 @@ export function createBindingStore(options: { bindingsPath: string; fs?: Binding
 
   let state: ObserverBindings = { bindings: {}, reverse: {}, focus: null, pairs: {}, pairOf: {} }
 
-  /** Atomically write a file: temp + rename, so a reader never sees half a document. */
-  function writeAtomic(path: string, value: unknown): void {
+/**
+ * ── v0.42 (B4-0b-1 A4): WHAT THE LAST LOAD/SAVE SAW ON DISK ────────────────────────────────────
+ *
+ * `lastSeenText` is the EXACT bytes this store last read or wrote. A save re-reads the file and
+ * compares: any difference means another process wrote between our load and our write, and a
+ * whole-document write would erase its row. This is the audit's "写前比对 mtime/哈希，冲突则重读重放"
+ * half, implemented on a hash instead of a timestamp on purpose — mtime granularity on Windows is
+ * coarse enough that two writes inside one tick look identical, and a conflict check that can miss a
+ * conflict is worse than none (it reads as protection while providing none).
+ *
+ * `readOnlyReason` is the other half: a table we could not PARSE must not be replaced by the empty
+ * table we started with. The old `catch {}` did exactly that — the next `save()` wrote `{}` over a
+ * repairable file. When this is non-empty the store refuses to write for the rest of the process,
+ * and `health()` says why.
+ */
+let lastSeenText: string | undefined
+let readOnlyReason = ''
+let mergedOnLastSave = 0
+
+/** The bytes currently on disk, or `undefined` when the file is absent. */
+function readRaw(): string | undefined {
+  try {
+    return fs.readFileSync(bindingsPath, 'utf8')
+  } catch {
+    return undefined
+  }
+}
+
+  /**
+   * Atomically write a file: temp + rename, so a reader never sees half a document.
+   *
+   * Returns the exact bytes written, because the conflict check (A4) compares the file's text against
+   * what THIS store last read or wrote. Returning it keeps one result for "what is on disk now" — a
+   * second `JSON.stringify` at the call site would be the same expression written twice.
+   */
+  function writeAtomic(path: string, value: unknown): string {
+    const body = JSON.stringify(value, null, 2)
     const temp = `${path}.tmp-${process.pid}-${Date.now().toString(36)}`
-    fs.writeFileSync(temp, JSON.stringify(value, null, 2), 'utf8')
+    fs.writeFileSync(temp, body, 'utf8')
     fs.renameSync(temp, path)
+    return body
+  }
+
+  /**
+  * Turn a parsed document into the state this store uses.
+  *
+  * EXTRACTED (A4) because the conflict path needs the SAME rules to read what another process wrote.
+  * Two parser copies would drift — the "same field, two parsers" defect this workspace has already
+  * paid for twice (`archive.ts` vs `store.ts`).
+  */
+  function parseBindings(parsed: unknown): ObserverBindings | undefined {
+    if (!isPlainRecord(parsed)) return undefined
+    const next = EMPTY_STATE()
+    if (isPlainRecord(parsed.bindings)) {
+      for (const [main, observer] of Object.entries(parsed.bindings)) {
+        if (typeof observer === 'string' && observer.length > 0) next.bindings[main] = observer
+      }
+    }
+    if (isPlainRecord(parsed.reverse)) {
+      for (const [observer, main] of Object.entries(parsed.reverse)) {
+        if (typeof main === 'string' && main.length > 0) next.reverse[observer] = main
+      }
+    }
+    if (isPlainRecord(parsed.focus) && typeof parsed.focus.sessionId === 'string') {
+      next.focus = { sessionId: parsed.focus.sessionId, at: Number(parsed.focus.at) || 0 }
+    }
+    // v1.2.0 — the pair table. A row is only accepted when both members are non-empty strings and
+    // they differ: a self-pair would make every role question answer "both".
+    if (isPlainRecord(parsed.pairs)) {
+      for (const [key, value] of Object.entries(parsed.pairs)) {
+        if (!isPlainRecord(value)) continue
+        const observerSessionId = typeof value.observerSessionId === 'string' ? value.observerSessionId : ''
+        const mainSessionId = typeof value.mainSessionId === 'string' ? value.mainSessionId : ''
+        if (observerSessionId.length === 0 || mainSessionId.length === 0) continue
+        if (observerSessionId === mainSessionId) continue
+        next.pairs[key] = {
+          observerSessionId,
+          mainSessionId,
+          at: Number(value.at) || 0,
+          origin: value.origin === 'summoned' ? 'summoned' : 'incubated',
+        }
+      }
+    }
+    if (isPlainRecord(parsed.pairOf)) {
+      for (const [sessionId, key] of Object.entries(parsed.pairOf)) {
+        if (typeof key !== 'string' || key.length === 0) continue
+        if (next.pairs[key] === undefined) continue // no dangling index
+        next.pairOf[sessionId] = key
+      }
+    }
+    // `missions` / `missionsSent` from 1.0.2–1.0.3 are deliberately NOT read: the staged-injection
+    // design is gone, and a legacy key must not resurrect it.
+    return next
   }
 
   function load(): void {
@@ -165,53 +264,82 @@ export function createBindingStore(options: { bindingsPath: string; fs?: Binding
     // mount that reuses a previous process-level copy would leak bindings across profiles
     // (and across tests).
     state = EMPTY_STATE()
+    lastSeenText = undefined
+    readOnlyReason = ''
+    /**
+     * `mergedOnLastSave` is deliberately NOT reset here: it describes the last SAVE, and a read-back
+     * (`observer_bind` reloads to verify against disk) must not erase the fact that the write it just
+     * verified had folded in another process's rows.
+     */
     try {
-      const parsed = JSON.parse(fs.readFileSync(bindingsPath, 'utf8'))
-      if (!isPlainRecord(parsed)) return
-      const next = EMPTY_STATE()
-      if (isPlainRecord(parsed.bindings)) {
-        for (const [main, observer] of Object.entries(parsed.bindings)) {
-          if (typeof observer === 'string' && observer.length > 0) next.bindings[main] = observer
-        }
-      }
-      if (isPlainRecord(parsed.reverse)) {
-        for (const [observer, main] of Object.entries(parsed.reverse)) {
-          if (typeof main === 'string' && main.length > 0) next.reverse[observer] = main
-        }
-      }
-      if (isPlainRecord(parsed.focus) && typeof parsed.focus.sessionId === 'string') {
-        next.focus = { sessionId: parsed.focus.sessionId, at: Number(parsed.focus.at) || 0 }
-      }
-      // v1.2.0 — the pair table. A row is only accepted when both members are non-empty strings and
-      // they differ: a self-pair would make every role question answer "both".
-      if (isPlainRecord(parsed.pairs)) {
-        for (const [key, value] of Object.entries(parsed.pairs)) {
-          if (!isPlainRecord(value)) continue
-          const observerSessionId = typeof value.observerSessionId === 'string' ? value.observerSessionId : ''
-          const mainSessionId = typeof value.mainSessionId === 'string' ? value.mainSessionId : ''
-          if (observerSessionId.length === 0 || mainSessionId.length === 0) continue
-          if (observerSessionId === mainSessionId) continue
-          next.pairs[key] = {
-            observerSessionId,
-            mainSessionId,
-            at: Number(value.at) || 0,
-            origin: value.origin === 'summoned' ? 'summoned' : 'incubated',
-          }
-        }
-      }
-      if (isPlainRecord(parsed.pairOf)) {
-        for (const [sessionId, key] of Object.entries(parsed.pairOf)) {
-          if (typeof key !== 'string' || key.length === 0) continue
-          if (next.pairs[key] === undefined) continue // no dangling index
-          next.pairOf[sessionId] = key
-        }
-      }
-      // `missions` / `missionsSent` from 1.0.2–1.0.3 are deliberately NOT read: the staged-injection
-      // design is gone, and a legacy key must not resurrect it.
+      const text = fs.readFileSync(bindingsPath, 'utf8')
+      lastSeenText = text
+      const parsed = JSON.parse(text)
+      const next = parseBindings(parsed)
+      if (next === undefined) return
       state = next
-    } catch {
-      // Absent (first run) or torn: start empty. A stale pointer is repairable; a crash is not.
+    } catch (error) {
+      /**
+       * ── v0.42 (B4-0b-1 A4): ABSENT AND UNREADABLE ARE NOT THE SAME THING ───────────────────────
+       *
+       * "First run" (ENOENT) legitimately starts empty and may write. A table that is PRESENT but
+       * cannot be read or parsed is evidence someone needs to see; starting empty and then saving is
+       * how one unreadable moment becomes permanent data loss. So: absent ⇒ writable empty table;
+       * anything else ⇒ READ-ONLY for this process, reason recorded, original left byte-identical.
+       */
+      if ((error as any)?.code === 'ENOENT') return
+      readOnlyReason = String((error as any)?.message ?? error)
     }
+  }
+
+  /**
+   * Fold the rows ANOTHER process wrote into this one's state.
+   *
+   * Union with "mine wins on the same key", because a save is a whole-document write and the only
+   * alternative to merging is erasing. `omitPairs` carries the keys THIS save dissolved on purpose
+   * (`recordPair` removes any row sharing a member): without it, a stale copy from the other process
+   * would resurrect a pair we just dissolved, and `pairs()` would answer two things for one session
+   * again — the v1.2.3 invariant.
+   *
+   * WHAT THIS DOES NOT DO, stated rather than implied: it does not merge a DELETION of a legacy
+   * pointer (there is no such public operation), and two processes recording a pair for the SAME
+   * session still resolve last-writer-wins (the newer `at` is not consulted). Those need a lock.
+   * Losing an entire row another process wrote — the reported failure — is the one being fixed.
+   */
+  function mergeForeignRows(mine: ObserverBindings, disk: ObserverBindings, omitPairs: readonly string[]): number {
+    const omit = new Set(omitPairs)
+    let merged = 0
+    /**
+     * A pair and its two legacy pointers describe ONE fact; counting all three would turn "one row
+     * arrived from the other window" into `merged: 3` and make the number useless to a reader.
+     */
+    const explained = new Set<string>()
+    const factOf = (main: string, observer: string): string => `${main}|${observer}`
+    for (const [key, row] of Object.entries(disk.pairs)) {
+      if (omit.has(key)) continue
+      if (mine.pairs[key] !== undefined) continue
+      mine.pairs[key] = row
+      mine.pairOf[row.observerSessionId] = key
+      mine.pairOf[row.mainSessionId] = key
+      explained.add(factOf(row.mainSessionId, row.observerSessionId))
+      merged += 1
+    }
+    for (const [main, observer] of Object.entries(disk.bindings)) {
+      if (mine.bindings[main] !== undefined) continue
+      mine.bindings[main] = observer
+      if (!explained.has(factOf(main, observer))) merged += 1
+    }
+    for (const [observer, main] of Object.entries(disk.reverse)) {
+      if (mine.reverse[observer] !== undefined) continue
+      mine.reverse[observer] = main
+      if (!explained.has(factOf(main, observer))) merged += 1
+    }
+    /** A focus note is ONE fact with a timestamp: ours is the newer write and wins when we hold one. */
+    if (mine.focus === null && disk.focus !== null) {
+      mine.focus = disk.focus
+      merged += 1
+    }
+    return merged
   }
 
   /**
@@ -220,15 +348,72 @@ export function createBindingStore(options: { bindingsPath: string; fs?: Binding
    * v0.1.8 P0: this used to swallow the error, which is how a reply of `{ok:true}` reached the
    * UI while `observer-bindings.json` had not been touched. A caller must be able to tell the
    * difference between "stored" and "only in memory", so the failure is reported upward.
+   *
+   * ── v0.42 (B4-0b-1 A4): THREE REFUSALS BEFORE ONE WRITE ───────────────────────────────────────
+   *
+   *   1. the table was unreadable at load ⇒ refuse for the whole process (read-only);
+   *   2. the file changed since our load ⇒ read it, merge its rows in, THEN write (never erase);
+   *   3. the file changed and cannot be parsed ⇒ refuse. Refusing protects evidence; writing the
+   *      version we happen to hold would destroy whatever the other writer actually said.
    */
-  function save(): { ok: boolean; path: string; error?: string } {
+  function save(options: { omitPairs?: readonly string[] } = {}): {
+    ok: boolean
+    path: string
+    error?: string
+    merged?: number
+    readOnly?: string
+  } {
+    if (readOnlyReason.length > 0) {
+      return {
+        ok: false,
+        path: bindingsPath,
+        readOnly: readOnlyReason,
+        error: `绑定表不可读（${readOnlyReason}）：本进程不写它，原文件保持原样`,
+      }
+    }
     try {
       fs.mkdirSync(dirname(bindingsPath), { recursive: true })
-      writeAtomic(bindingsPath, state)
-      return { ok: true, path: bindingsPath }
+      mergedOnLastSave = 0
+      const current = readRaw()
+      if (current !== lastSeenText) {
+        /**
+         * SOMEONE ELSE WROTE IT SINCE WE LOADED (or created it where there was none). Take their
+         * rows instead of erasing them. `current === undefined` means deleted — nothing to merge,
+         * and recreating it loses nothing that still exists.
+         */
+        let disk: ObserverBindings | undefined
+        if (current !== undefined) {
+          try {
+            disk = parseBindings(JSON.parse(current))
+          } catch {
+            disk = undefined
+          }
+          if (disk === undefined) {
+            return {
+              ok: false,
+              path: bindingsPath,
+              error: '另一个进程在本次加载之后改过绑定表，而它现在读不出来：拒绝覆盖（先看那个文件）',
+            }
+          }
+        }
+        if (disk !== undefined) mergedOnLastSave = mergeForeignRows(state, disk, options.omitPairs ?? [])
+      }
+      lastSeenText = writeAtomic(bindingsPath, state)
+      return { ok: true, path: bindingsPath, merged: mergedOnLastSave }
     } catch (error) {
       return { ok: false, path: bindingsPath, error: String((error as any)?.message ?? error) }
     }
+  }
+
+  /**
+   * What a reader (`observer_status`) needs to tell a healthy store from a degraded one.
+   *
+   * A read-only store and a happily-writing one used to look identical from the outside: bindings
+   * appeared in memory, `ok:true` came back, and the file had never been touched. That is the same
+   * lie as the harvest counter, so it gets the same treatment — name it.
+   */
+  function health(): { path: string; readOnly: string; mergedOnLastSave: number } {
+    return { path: bindingsPath, readOnly: readOnlyReason, mergedOnLastSave }
   }
 
   function observerOf(mainSessionId: string): string {
@@ -281,6 +466,8 @@ export function createBindingStore(options: { bindingsPath: string; fs?: Binding
 
     const before = JSON.stringify(state)
     let dissolved = 0
+    /** v0.42 (A4): the keys THIS save dissolved, so a merge cannot resurrect them. */
+    const dissolvedKeys: string[] = []
     for (const [existingKey, existing] of Object.entries(state.pairs)) {
       const sharesMember =
         existing.observerSessionId === observerSessionId ||
@@ -289,6 +476,7 @@ export function createBindingStore(options: { bindingsPath: string; fs?: Binding
         existing.mainSessionId === mainSessionId
       if (!sharesMember) continue
       delete state.pairs[existingKey]
+      dissolvedKeys.push(existingKey)
       for (const member of [existing.observerSessionId, existing.mainSessionId]) {
         if (state.pairOf[member] === existingKey) delete state.pairOf[member]
       }
@@ -309,7 +497,7 @@ export function createBindingStore(options: { bindingsPath: string; fs?: Binding
     // Legacy maps, kept so `observer_status` and older readers see the same world.
     state.bindings[mainSessionId] = observerSessionId
     state.reverse[observerSessionId] = mainSessionId
-    const written = save()
+    const written = save({ omitPairs: dissolvedKeys })
     if (written.ok) return { ok: true, dissolved }
     // Restore EXACTLY what was there: a half-dissolved table is worse than an unchanged one.
     state = JSON.parse(before)
@@ -333,6 +521,7 @@ export function createBindingStore(options: { bindingsPath: string; fs?: Binding
   return {
     load,
     save,
+    health,
     snapshot: () => JSON.parse(JSON.stringify(state)),
     observerOf,
     mainOfObserver,

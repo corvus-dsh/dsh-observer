@@ -78,11 +78,20 @@ test('P1-1: the listener does not write the global knowledge base or the task gr
 
 test('P1-1: the only persistence it performs is its OWN bindings file', () => {
   /**
-   * It does write — `save()` — and that is correct. What must stay true is the TARGET: the plugin's
-   * own bindings document. Asserting the call is present also stops a future refactor from silently
+   * It does write — and that is correct. What must stay true is the TARGET: the plugin's own
+   * bindings document. Asserting a call is present also stops a future refactor from silently
    * removing the only durable record of a title-derived pair.
+   *
+   * v0.42 (B4-0b-1 A2) moved the call from a raw `save()` to `bindPair(...)`, which records the PAIR
+   * (that was the A2 defect: this listener wrote the legacy maps only, so the pair never followed a
+   * slice and never survived a restart). Both shapes satisfy the rule this test protects — the
+   * persistence happens, through the store — so the assertion names the BEHAVIOUR instead of one
+   * function name.
    */
-  assert.ok(body.includes('save()'), 'the title-derived binding must still be persisted')
+  assert.ok(
+    body.includes('bindPair(') || body.includes('save()'),
+    'the title-derived binding must still be persisted (through the pair table since A2)',
+  )
   const saveSites = [...body.matchAll(/writeAtomic\(|writeFileSync\(/gu)].length
   assert.equal(saveSites, 0, 'the listener must call save(), not write the file itself')
 })

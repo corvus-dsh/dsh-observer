@@ -197,6 +197,17 @@ export interface MonitorState {
   harvestedReplacement: boolean
   harvests: number
   lastHarvestAt: number
+  /**
+   * ── v0.41 (B4-0b-1 A1): WHY EACH TRIGGER LAST STAYED SILENT ────────────────────────────────────
+   *
+   * "0 nudges" used to read the same whether the trigger was unneeded, cooled down, out of budget,
+   * or broken. `observer_status` reported `graph.nudged:false` next to `distinctToolsRecent:3` — a
+   * combination that reads "it does not need one" while actually meaning "it cannot send one".
+   * The rule that refused is recorded here, per trigger, so a reader can tell the two apart.
+   *
+   * Values are the four words the audit asked for: `cap` / `cooldown` / `seq` / `fired`.
+   */
+  blocked: { failure: NudgeBlockCode | ''; stall: NudgeBlockCode | ''; graph: NudgeBlockCode | '' }
 }
 
 export function createMonitorState(): MonitorState {
@@ -225,6 +236,7 @@ export function createMonitorState(): MonitorState {
     harvestedReplacement: false,
     harvests: 0,
     lastHarvestAt: 0,
+    blocked: { failure: '', stall: '', graph: '' },
   }
 }
 
@@ -354,8 +366,13 @@ function maybeGraphNudge(state: MonitorState, options: MonitorOptions, seq: numb
   /** ① multi-step evidence: DISTINCT kinds, because one tool called forty times is one kind. */
   const distinct = new Set(state.recentTurnTools.flat()).size
   if (distinct < options.graphDistinctTools) return false
-  /** ③ the shared limits — not a second set of constants. */
-  if (cooldownBlocks(state, options, seq).length > 0) return false
+  /** ③ the shared limits — not a second set of constants. This trigger holds the reserved slot. */
+  const blocked = cooldownBlocks(state, options, seq, 'graph')
+  if (blocked !== undefined) {
+    noteBlock(state, 'graph', blocked.code)
+    return false
+  }
+  noteBlock(state, 'graph', undefined)
   actions.push({
     kind: 'nudge',
     trigger: 'graph',
@@ -370,14 +387,55 @@ function maybeGraphNudge(state: MonitorState, options: MonitorOptions, seq: numb
   return true
 }
 
-function cooldownBlocks(state: MonitorState, options: MonitorOptions, seq: number): string {
-  if (state.nudges >= options.nudgeCap) return `已达上限 ${options.nudgeCap} 次`
-  const since = options.now() - state.lastNudgeAt
-  if (state.nudges > 0 && since < options.nudgeCooldownMs) return `冷却中（${Math.round(since / 1000)}s < ${Math.round(options.nudgeCooldownMs / 1000)}s）`
-  if (state.lastNudgeSeq > 0 && seq - state.lastNudgeSeq < options.nudgeMinSeqGap) {
-    return `日志距离过近（${seq - state.lastNudgeSeq} < ${options.nudgeMinSeqGap} 个事件）`
+/** The four words `blocked` speaks. `fired` is what a trigger that DID speak reads. */
+export type NudgeBlockCode = 'cap' | 'cooldown' | 'seq'
+
+/**
+ * ── v0.41 (B4-0b-1 A1): THE GRAPH TRIGGER KEEPS ONE SLOT OF THE SHARED BUDGET ─────────────────────
+ *
+ * The audit's C-1: a main that collected four failure corrections was then permanently unable to
+ * receive the graph correction, because `nudgeCap` is shared and the graph trigger is the LAST thing
+ * the supervisor would ever say. `observer_status` meanwhile reported `graph.nudged:false` —
+ * indistinguishable from "this main does not need a graph".
+ *
+ * WHY A RESERVED SLOT AND NOT A SEPARATE COUNTER. The cap exists to bound NAGGING, and the graph
+ * trigger is already once-per-main (`graphNudged`), so its own bound is tighter than any cap. What it
+ * needs is not a second budget but a guarantee that another trigger cannot spend the LAST slot. So:
+ * every other trigger may use `cap - 1`; the graph trigger may use the full `cap`. The total number of
+ * nudges a main can ever receive is unchanged (it is still `cap`) — only the last slot is spoken for.
+ *
+ * Returns the RULE that refused, not a string to be pattern-matched by callers: the caller needs the
+ * code to record it, and the sentence for the log.
+ */
+function cooldownBlocks(
+  state: MonitorState,
+  options: MonitorOptions,
+  seq: number,
+  reserveFor?: 'graph',
+): { code: NudgeBlockCode; detail: string } | undefined {
+  const effectiveCap = reserveFor === 'graph' ? options.nudgeCap : Math.max(0, options.nudgeCap - 1)
+  if (state.nudges >= effectiveCap) {
+    return {
+      code: 'cap',
+      detail:
+        reserveFor === 'graph'
+          ? `已达上限 ${options.nudgeCap} 次`
+          : `已达上限 ${effectiveCap} 次（第 ${options.nudgeCap} 个名额留给「从未建图」，它每主脑只发一次）`,
+    }
   }
-  return ''
+  const since = options.now() - state.lastNudgeAt
+  if (state.nudges > 0 && since < options.nudgeCooldownMs) {
+    return { code: 'cooldown', detail: `冷却中（${Math.round(since / 1000)}s < ${Math.round(options.nudgeCooldownMs / 1000)}s）` }
+  }
+  if (state.lastNudgeSeq > 0 && seq - state.lastNudgeSeq < options.nudgeMinSeqGap) {
+    return { code: 'seq', detail: `日志距离过近（${seq - state.lastNudgeSeq} < ${options.nudgeMinSeqGap} 个事件）` }
+  }
+  return undefined
+}
+
+/** Record a refusal so `observer_status` can say WHICH rule kept a trigger quiet. */
+function noteBlock(state: MonitorState, trigger: 'failure' | 'stall' | 'graph', code: NudgeBlockCode | undefined): void {
+  state.blocked[trigger] = code ?? ''
 }
 
 /**
@@ -451,7 +509,8 @@ export function stepMonitor(
       }
       if (state.failure.count >= options.failureStreak) {
         const blocked = cooldownBlocks(state, options, seq)
-        if (blocked.length === 0) {
+        if (blocked === undefined) {
+          noteBlock(state, 'failure', undefined)
           const text = failureNudgeText(state.failure.tool, state.failure.count)
           actions.push({
             kind: 'nudge',
@@ -464,6 +523,8 @@ export function stepMonitor(
           state.lastNudgeAt = options.now()
           state.lastNudgeSeq = seq
           state.failure = null
+        } else {
+          noteBlock(state, 'failure', blocked.code)
         }
       }
       return actions
@@ -560,7 +621,8 @@ export function stepMonitor(
        *                   main can be told exactly where it stopped.
        */
       const blocked = cooldownBlocks(state, options, seq)
-      if (blocked.length === 0) {
+      if (blocked === undefined) {
+        noteBlock(state, 'stall', undefined)
         const neverBuilt = state.everUsedTodo !== true
         actions.push({
           kind: 'nudge',
@@ -577,6 +639,8 @@ export function stepMonitor(
         state.lastNudgeAt = options.now()
         state.lastNudgeSeq = seq
         state.stalledTurns = 0
+      } else {
+        noteBlock(state, 'stall', blocked.code)
       }
     }
     return actions
@@ -654,7 +718,10 @@ export function harvestGate(
 }
 
 /** A read-only view for `observer_status`: what the supervisor currently believes. */
-export function describeMonitorState(state: MonitorState): Record<string, unknown> {
+export function describeMonitorState(
+  state: MonitorState,
+  options: MonitorOptions = DEFAULT_MONITOR_OPTIONS,
+): Record<string, unknown> {
   return {
     events: state.events,
     turnsClosed: state.turnsClosed,
@@ -678,6 +745,26 @@ export function describeMonitorState(state: MonitorState): Record<string, unknow
       distinctToolsRecent: new Set(state.recentTurnTools.flat()).size,
       /** Turns currently in the evidence window (bounded by `stallTurns`). */
       windowTurns: state.recentTurnTools.length,
+      /**
+       * ── v0.41 (B4-0b-1 A1): THE FIFTH FACT ──────────────────────────────────────────────────
+       *
+       * `fired` (it spoke) / `cap` (the shared budget was spent) / `cooldown` / `seq` (too close to
+       * the previous nudge) / `null` (nothing refused it: the conditions simply are not met). Without
+       * this, `nudged:false` next to `distinctToolsRecent:3` reads "not needed" when the truth was
+       * "could not be sent" — the C-1 report that produced this batch was exactly that misreading.
+       */
+      blockedBy: state.graphNudged ? 'fired' : state.blocked.graph === '' ? null : state.blocked.graph,
+    },
+    /**
+     * The same refusals for the other two triggers. `nudgeCap` is SHARED (the last slot is reserved
+     * for the graph trigger), so `failure`/`stall` can hit `cap` while the budget still has a slot
+     * left — that asymmetry is now visible instead of looking like a dead trigger.
+     */
+    blocked: {
+      /** The shared budget, so a reader can compare it against `nudges` without guessing. */
+      cap: options.nudgeCap,
+      failure: state.blocked.failure === '' ? null : state.blocked.failure,
+      stall: state.blocked.stall === '' ? null : state.blocked.stall,
     },
     nudges: state.nudges,
     lastNudgeAt: state.lastNudgeAt === 0 ? null : state.lastNudgeAt,

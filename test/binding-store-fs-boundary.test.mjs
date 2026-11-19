@@ -118,13 +118,17 @@ test('the fake received the exact call sequence, including mkdir before the atom
 
   /**
    * `load()` starts with a read that throws ENOENT (first run). Then `recordPair` saves:
-   * mkdir → write temp → rename temp → target.
+   * mkdir → **read (the A4 conflict check)** → write temp → rename temp → target.
+   *
+   * The second read is the one A4 added on purpose, and it is asserted here rather than tolerated:
+   * a save that overwrites a whole document must first ask whether the file it loaded is still the
+   * file on disk. Without that read the sequence is exactly the old unsafe shape.
    *
    * `mkdirSync` is asserted explicitly because it was the IO point MISSED when the boundary was
    * first sketched: `writeAtomic` was parameterised but the `mkdir` in front of it was not, and a
    * real-fs `mkdirSync` inside `save()` would recreate the directory this test just proved empty.
    */
-  assert.deepEqual(sequence, ['readFileSync', 'mkdirSync', 'writeFileSync', 'renameSync'])
+  assert.deepEqual(sequence, ['readFileSync', 'mkdirSync', 'readFileSync', 'writeFileSync', 'renameSync'])
 
   const mkdir = fake.calls.find((call) => call[0] === 'mkdirSync')
   assert.deepEqual(mkdir[2], { recursive: true }, 'mkdir must keep its recursive option')

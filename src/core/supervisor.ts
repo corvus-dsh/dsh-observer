@@ -211,11 +211,48 @@ export function createSupervisor(
    * what actually happened, including "not yet".
    */
   const harvest = async (reason: HarvestReason): Promise<HarvestOutcome> => {
+    /**
+     * ── v0.42 (B4-0b-1 A3): THE IO CHECK COMES BEFORE THE ACCOUNTING ─────────────────────────────
+     *
+     * Measured (audit C-3): this function used to call `harvestGate` FIRST, and `harvestGate` MUTATES
+     * the state (`harvests+1`, `lastHarvestAt`, `harvestedSignature`), and only then checked whether
+     * `tools.execute` existed. With no tools service the attempt therefore recorded "already
+     * harvested" while NOTHING was mined — and because the completion path refuses on a matching
+     * `harvestedSignature`, that board could never be harvested again, not even after the tools
+     * service came up. A gate that spends the budget before it knows whether it can spend it is the
+     * "记账说完成、实际没做" family this batch is about.
+     *
+     * Two changes, both required:
+     *   1. the IO precondition is checked BEFORE the gate, so the common case cannot spend anything;
+     *   2. the accounting is SNAPSHOTED and restored on every failure path that the gate could not
+     *      have foreseen (execute missing late, execute throwing, an `isError` result). The sentence
+     *      "下一轮提炼会再取一次" can now be true instead of hopeful.
+     */
+    if (deps.tools === undefined || typeof deps.tools.execute !== 'function') {
+      return {
+        attempted: false,
+        ok: false,
+        mined: [],
+        minedOurMain: false,
+        detail: 'tools.execute 不可用（未扣配额：这一次什么都没试，下一轮条件满足时会重新判断）',
+      }
+    }
+    const before = {
+      harvests: state.harvests,
+      lastHarvestAt: state.lastHarvestAt,
+      harvestedSignature: state.harvestedSignature,
+      harvestedTurns: state.harvestedTurns,
+      harvestedReplacement: state.harvestedReplacement,
+    }
+    const restoreGate = (): void => {
+      state.harvests = before.harvests
+      state.lastHarvestAt = before.lastHarvestAt
+      state.harvestedSignature = before.harvestedSignature
+      state.harvestedTurns = before.harvestedTurns
+      state.harvestedReplacement = before.harvestedReplacement
+    }
     const gate = harvestGate(state, reason, options)
     if (!gate.ok) return { attempted: false, ok: false, mined: [], minedOurMain: false, detail: gate.detail }
-    if (deps.tools === undefined || typeof deps.tools.execute !== 'function') {
-      return { attempted: false, ok: false, mined: [], minedOurMain: false, detail: 'tools.execute 不可用' }
-    }
     try {
       const result = await deps.tools.execute({
         callId: `observer-harvest-${mainSessionId}-${Date.now()}`,
@@ -224,11 +261,16 @@ export function createSupervisor(
         signal: new AbortController().signal,
       })
       if (result === null || typeof result !== 'object' || result.isError === true) {
+        /**
+         * An error result is an attempt that did NOT mine: the quota goes back, so the very same
+         * board can be mined once `memory_harvest` works again.
+         */
+        restoreGate()
         const why =
           result !== null && typeof result === 'object' && result.error !== undefined
             ? String(result.error?.message ?? result.error)
             : 'memory_harvest 返回错误'
-        return { attempted: true, ok: false, mined: [], minedOurMain: false, detail: why }
+        return { attempted: true, ok: false, mined: [], minedOurMain: false, detail: `${why}（配额已归还）` }
       }
       const value = result.value ?? {}
       const harvested: any[] = Array.isArray(value.harvested) ? value.harvested : []
@@ -251,12 +293,14 @@ export function createSupervisor(
               `它的这一轮会在被切片（退休）后自动进入提炼队列`,
       }
     } catch (error) {
+      /** v0.42 (A3): a thrown execute is an attempt that did NOT mine — return the quota. */
+      restoreGate()
       return {
         attempted: true,
         ok: false,
         mined: [],
         minedOurMain: false,
-        detail: String((error as any)?.message ?? error),
+        detail: `${String((error as any)?.message ?? error)}（配额已归还）`,
       }
     }
   }

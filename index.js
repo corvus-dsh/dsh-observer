@@ -88,7 +88,18 @@ function pairKeyOf(a        , b        )         {
  */
                                
               
-                                                       
+                                                                                                
+                                                      
+               
+                
+                  
+                                                                                  
+                   
+                                                                                                         
+                     
+   
+                                                                                
+                                                                        
                               
                                            
                                                    
@@ -116,11 +127,99 @@ function createBindingStore(options                                             
 
   let state                   = { bindings: {}, reverse: {}, focus: null, pairs: {}, pairOf: {} }
 
-  /** Atomically write a file: temp + rename, so a reader never sees half a document. */
-  function writeAtomic(path        , value         )       {
+/**
+ * ── v0.42 (B4-0b-1 A4): WHAT THE LAST LOAD/SAVE SAW ON DISK ────────────────────────────────────
+ *
+ * `lastSeenText` is the EXACT bytes this store last read or wrote. A save re-reads the file and
+ * compares: any difference means another process wrote between our load and our write, and a
+ * whole-document write would erase its row. This is the audit's "写前比对 mtime/哈希，冲突则重读重放"
+ * half, implemented on a hash instead of a timestamp on purpose — mtime granularity on Windows is
+ * coarse enough that two writes inside one tick look identical, and a conflict check that can miss a
+ * conflict is worse than none (it reads as protection while providing none).
+ *
+ * `readOnlyReason` is the other half: a table we could not PARSE must not be replaced by the empty
+ * table we started with. The old `catch {}` did exactly that — the next `save()` wrote `{}` over a
+ * repairable file. When this is non-empty the store refuses to write for the rest of the process,
+ * and `health()` says why.
+ */
+let lastSeenText                    
+let readOnlyReason = ''
+let mergedOnLastSave = 0
+
+/** The bytes currently on disk, or `undefined` when the file is absent. */
+function readRaw()                     {
+  try {
+    return fs.readFileSync(bindingsPath, 'utf8')
+  } catch {
+    return undefined
+  }
+}
+
+  /**
+   * Atomically write a file: temp + rename, so a reader never sees half a document.
+   *
+   * Returns the exact bytes written, because the conflict check (A4) compares the file's text against
+   * what THIS store last read or wrote. Returning it keeps one result for "what is on disk now" — a
+   * second `JSON.stringify` at the call site would be the same expression written twice.
+   */
+  function writeAtomic(path        , value         )         {
+    const body = JSON.stringify(value, null, 2)
     const temp = `${path}.tmp-${process.pid}-${Date.now().toString(36)}`
-    fs.writeFileSync(temp, JSON.stringify(value, null, 2), 'utf8')
+    fs.writeFileSync(temp, body, 'utf8')
     fs.renameSync(temp, path)
+    return body
+  }
+
+  /**
+  * Turn a parsed document into the state this store uses.
+  *
+  * EXTRACTED (A4) because the conflict path needs the SAME rules to read what another process wrote.
+  * Two parser copies would drift — the "same field, two parsers" defect this workspace has already
+  * paid for twice (`archive.ts` vs `store.ts`).
+  */
+  function parseBindings(parsed         )                               {
+    if (!isPlainRecord(parsed)) return undefined
+    const next = EMPTY_STATE()
+    if (isPlainRecord(parsed.bindings)) {
+      for (const [main, observer] of Object.entries(parsed.bindings)) {
+        if (typeof observer === 'string' && observer.length > 0) next.bindings[main] = observer
+      }
+    }
+    if (isPlainRecord(parsed.reverse)) {
+      for (const [observer, main] of Object.entries(parsed.reverse)) {
+        if (typeof main === 'string' && main.length > 0) next.reverse[observer] = main
+      }
+    }
+    if (isPlainRecord(parsed.focus) && typeof parsed.focus.sessionId === 'string') {
+      next.focus = { sessionId: parsed.focus.sessionId, at: Number(parsed.focus.at) || 0 }
+    }
+    // v1.2.0 — the pair table. A row is only accepted when both members are non-empty strings and
+    // they differ: a self-pair would make every role question answer "both".
+    if (isPlainRecord(parsed.pairs)) {
+      for (const [key, value] of Object.entries(parsed.pairs)) {
+        if (!isPlainRecord(value)) continue
+        const observerSessionId = typeof value.observerSessionId === 'string' ? value.observerSessionId : ''
+        const mainSessionId = typeof value.mainSessionId === 'string' ? value.mainSessionId : ''
+        if (observerSessionId.length === 0 || mainSessionId.length === 0) continue
+        if (observerSessionId === mainSessionId) continue
+        next.pairs[key] = {
+          observerSessionId,
+          mainSessionId,
+          at: Number(value.at) || 0,
+          origin: value.origin === 'summoned' ? 'summoned' : 'incubated',
+        }
+      }
+    }
+    if (isPlainRecord(parsed.pairOf)) {
+      for (const [sessionId, key] of Object.entries(parsed.pairOf)) {
+        if (typeof key !== 'string' || key.length === 0) continue
+        if (next.pairs[key] === undefined) continue // no dangling index
+        next.pairOf[sessionId] = key
+      }
+    }
+    // `missions` / `missionsSent` from 1.0.2–1.0.3 are deliberately NOT read: the staged-injection
+    // design is gone, and a legacy key must not resurrect it.
+    return next
   }
 
   function load()       {
@@ -128,53 +227,82 @@ function createBindingStore(options                                             
     // mount that reuses a previous process-level copy would leak bindings across profiles
     // (and across tests).
     state = EMPTY_STATE()
+    lastSeenText = undefined
+    readOnlyReason = ''
+    /**
+     * `mergedOnLastSave` is deliberately NOT reset here: it describes the last SAVE, and a read-back
+     * (`observer_bind` reloads to verify against disk) must not erase the fact that the write it just
+     * verified had folded in another process's rows.
+     */
     try {
-      const parsed = JSON.parse(fs.readFileSync(bindingsPath, 'utf8'))
-      if (!isPlainRecord(parsed)) return
-      const next = EMPTY_STATE()
-      if (isPlainRecord(parsed.bindings)) {
-        for (const [main, observer] of Object.entries(parsed.bindings)) {
-          if (typeof observer === 'string' && observer.length > 0) next.bindings[main] = observer
-        }
-      }
-      if (isPlainRecord(parsed.reverse)) {
-        for (const [observer, main] of Object.entries(parsed.reverse)) {
-          if (typeof main === 'string' && main.length > 0) next.reverse[observer] = main
-        }
-      }
-      if (isPlainRecord(parsed.focus) && typeof parsed.focus.sessionId === 'string') {
-        next.focus = { sessionId: parsed.focus.sessionId, at: Number(parsed.focus.at) || 0 }
-      }
-      // v1.2.0 — the pair table. A row is only accepted when both members are non-empty strings and
-      // they differ: a self-pair would make every role question answer "both".
-      if (isPlainRecord(parsed.pairs)) {
-        for (const [key, value] of Object.entries(parsed.pairs)) {
-          if (!isPlainRecord(value)) continue
-          const observerSessionId = typeof value.observerSessionId === 'string' ? value.observerSessionId : ''
-          const mainSessionId = typeof value.mainSessionId === 'string' ? value.mainSessionId : ''
-          if (observerSessionId.length === 0 || mainSessionId.length === 0) continue
-          if (observerSessionId === mainSessionId) continue
-          next.pairs[key] = {
-            observerSessionId,
-            mainSessionId,
-            at: Number(value.at) || 0,
-            origin: value.origin === 'summoned' ? 'summoned' : 'incubated',
-          }
-        }
-      }
-      if (isPlainRecord(parsed.pairOf)) {
-        for (const [sessionId, key] of Object.entries(parsed.pairOf)) {
-          if (typeof key !== 'string' || key.length === 0) continue
-          if (next.pairs[key] === undefined) continue // no dangling index
-          next.pairOf[sessionId] = key
-        }
-      }
-      // `missions` / `missionsSent` from 1.0.2–1.0.3 are deliberately NOT read: the staged-injection
-      // design is gone, and a legacy key must not resurrect it.
+      const text = fs.readFileSync(bindingsPath, 'utf8')
+      lastSeenText = text
+      const parsed = JSON.parse(text)
+      const next = parseBindings(parsed)
+      if (next === undefined) return
       state = next
-    } catch {
-      // Absent (first run) or torn: start empty. A stale pointer is repairable; a crash is not.
+    } catch (error) {
+      /**
+       * ── v0.42 (B4-0b-1 A4): ABSENT AND UNREADABLE ARE NOT THE SAME THING ───────────────────────
+       *
+       * "First run" (ENOENT) legitimately starts empty and may write. A table that is PRESENT but
+       * cannot be read or parsed is evidence someone needs to see; starting empty and then saving is
+       * how one unreadable moment becomes permanent data loss. So: absent ⇒ writable empty table;
+       * anything else ⇒ READ-ONLY for this process, reason recorded, original left byte-identical.
+       */
+      if ((error       )?.code === 'ENOENT') return
+      readOnlyReason = String((error       )?.message ?? error)
     }
+  }
+
+  /**
+   * Fold the rows ANOTHER process wrote into this one's state.
+   *
+   * Union with "mine wins on the same key", because a save is a whole-document write and the only
+   * alternative to merging is erasing. `omitPairs` carries the keys THIS save dissolved on purpose
+   * (`recordPair` removes any row sharing a member): without it, a stale copy from the other process
+   * would resurrect a pair we just dissolved, and `pairs()` would answer two things for one session
+   * again — the v1.2.3 invariant.
+   *
+   * WHAT THIS DOES NOT DO, stated rather than implied: it does not merge a DELETION of a legacy
+   * pointer (there is no such public operation), and two processes recording a pair for the SAME
+   * session still resolve last-writer-wins (the newer `at` is not consulted). Those need a lock.
+   * Losing an entire row another process wrote — the reported failure — is the one being fixed.
+   */
+  function mergeForeignRows(mine                  , disk                  , omitPairs                   )         {
+    const omit = new Set(omitPairs)
+    let merged = 0
+    /**
+     * A pair and its two legacy pointers describe ONE fact; counting all three would turn "one row
+     * arrived from the other window" into `merged: 3` and make the number useless to a reader.
+     */
+    const explained = new Set        ()
+    const factOf = (main        , observer        )         => `${main}|${observer}`
+    for (const [key, row] of Object.entries(disk.pairs)) {
+      if (omit.has(key)) continue
+      if (mine.pairs[key] !== undefined) continue
+      mine.pairs[key] = row
+      mine.pairOf[row.observerSessionId] = key
+      mine.pairOf[row.mainSessionId] = key
+      explained.add(factOf(row.mainSessionId, row.observerSessionId))
+      merged += 1
+    }
+    for (const [main, observer] of Object.entries(disk.bindings)) {
+      if (mine.bindings[main] !== undefined) continue
+      mine.bindings[main] = observer
+      if (!explained.has(factOf(main, observer))) merged += 1
+    }
+    for (const [observer, main] of Object.entries(disk.reverse)) {
+      if (mine.reverse[observer] !== undefined) continue
+      mine.reverse[observer] = main
+      if (!explained.has(factOf(main, observer))) merged += 1
+    }
+    /** A focus note is ONE fact with a timestamp: ours is the newer write and wins when we hold one. */
+    if (mine.focus === null && disk.focus !== null) {
+      mine.focus = disk.focus
+      merged += 1
+    }
+    return merged
   }
 
   /**
@@ -183,15 +311,72 @@ function createBindingStore(options                                             
    * v0.1.8 P0: this used to swallow the error, which is how a reply of `{ok:true}` reached the
    * UI while `observer-bindings.json` had not been touched. A caller must be able to tell the
    * difference between "stored" and "only in memory", so the failure is reported upward.
+   *
+   * ── v0.42 (B4-0b-1 A4): THREE REFUSALS BEFORE ONE WRITE ───────────────────────────────────────
+   *
+   *   1. the table was unreadable at load ⇒ refuse for the whole process (read-only);
+   *   2. the file changed since our load ⇒ read it, merge its rows in, THEN write (never erase);
+   *   3. the file changed and cannot be parsed ⇒ refuse. Refusing protects evidence; writing the
+   *      version we happen to hold would destroy whatever the other writer actually said.
    */
-  function save()                                                {
+  function save(options                                    = {})   
+               
+                
+                  
+                   
+                     
+    {
+    if (readOnlyReason.length > 0) {
+      return {
+        ok: false,
+        path: bindingsPath,
+        readOnly: readOnlyReason,
+        error: `绑定表不可读（${readOnlyReason}）：本进程不写它，原文件保持原样`,
+      }
+    }
     try {
       fs.mkdirSync(dirname(bindingsPath), { recursive: true })
-      writeAtomic(bindingsPath, state)
-      return { ok: true, path: bindingsPath }
+      mergedOnLastSave = 0
+      const current = readRaw()
+      if (current !== lastSeenText) {
+        /**
+         * SOMEONE ELSE WROTE IT SINCE WE LOADED (or created it where there was none). Take their
+         * rows instead of erasing them. `current === undefined` means deleted — nothing to merge,
+         * and recreating it loses nothing that still exists.
+         */
+        let disk                              
+        if (current !== undefined) {
+          try {
+            disk = parseBindings(JSON.parse(current))
+          } catch {
+            disk = undefined
+          }
+          if (disk === undefined) {
+            return {
+              ok: false,
+              path: bindingsPath,
+              error: '另一个进程在本次加载之后改过绑定表，而它现在读不出来：拒绝覆盖（先看那个文件）',
+            }
+          }
+        }
+        if (disk !== undefined) mergedOnLastSave = mergeForeignRows(state, disk, options.omitPairs ?? [])
+      }
+      lastSeenText = writeAtomic(bindingsPath, state)
+      return { ok: true, path: bindingsPath, merged: mergedOnLastSave }
     } catch (error) {
       return { ok: false, path: bindingsPath, error: String((error       )?.message ?? error) }
     }
+  }
+
+  /**
+   * What a reader (`observer_status`) needs to tell a healthy store from a degraded one.
+   *
+   * A read-only store and a happily-writing one used to look identical from the outside: bindings
+   * appeared in memory, `ok:true` came back, and the file had never been touched. That is the same
+   * lie as the harvest counter, so it gets the same treatment — name it.
+   */
+  function health()                                                               {
+    return { path: bindingsPath, readOnly: readOnlyReason, mergedOnLastSave }
   }
 
   function observerOf(mainSessionId        )         {
@@ -244,6 +429,8 @@ function createBindingStore(options                                             
 
     const before = JSON.stringify(state)
     let dissolved = 0
+    /** v0.42 (A4): the keys THIS save dissolved, so a merge cannot resurrect them. */
+    const dissolvedKeys           = []
     for (const [existingKey, existing] of Object.entries(state.pairs)) {
       const sharesMember =
         existing.observerSessionId === observerSessionId ||
@@ -252,6 +439,7 @@ function createBindingStore(options                                             
         existing.mainSessionId === mainSessionId
       if (!sharesMember) continue
       delete state.pairs[existingKey]
+      dissolvedKeys.push(existingKey)
       for (const member of [existing.observerSessionId, existing.mainSessionId]) {
         if (state.pairOf[member] === existingKey) delete state.pairOf[member]
       }
@@ -272,7 +460,7 @@ function createBindingStore(options                                             
     // Legacy maps, kept so `observer_status` and older readers see the same world.
     state.bindings[mainSessionId] = observerSessionId
     state.reverse[observerSessionId] = mainSessionId
-    const written = save()
+    const written = save({ omitPairs: dissolvedKeys })
     if (written.ok) return { ok: true, dissolved }
     // Restore EXACTLY what was there: a half-dissolved table is worse than an unchanged one.
     state = JSON.parse(before)
@@ -296,6 +484,7 @@ function createBindingStore(options                                             
   return {
     load,
     save,
+    health,
     snapshot: () => JSON.parse(JSON.stringify(state)),
     observerOf,
     mainOfObserver,
@@ -2291,6 +2480,17 @@ const DEFAULT_MONITOR_OPTIONS                 = {
                                
                   
                        
+     
+                                                                                                    
+    
+                                                                                                   
+                                                                                                   
+                                                                                               
+                                                                                             
+    
+                                                                                         
+     
+                                                                                                   
  
 
 function createMonitorState()               {
@@ -2319,6 +2519,7 @@ function createMonitorState()               {
     harvestedReplacement: false,
     harvests: 0,
     lastHarvestAt: 0,
+    blocked: { failure: '', stall: '', graph: '' },
   }
 }
 
@@ -2448,8 +2649,13 @@ function maybeGraphNudge(state              , options                , seq      
   /** ① multi-step evidence: DISTINCT kinds, because one tool called forty times is one kind. */
   const distinct = new Set(state.recentTurnTools.flat()).size
   if (distinct < options.graphDistinctTools) return false
-  /** ③ the shared limits — not a second set of constants. */
-  if (cooldownBlocks(state, options, seq).length > 0) return false
+  /** ③ the shared limits — not a second set of constants. This trigger holds the reserved slot. */
+  const blocked = cooldownBlocks(state, options, seq, 'graph')
+  if (blocked !== undefined) {
+    noteBlock(state, 'graph', blocked.code)
+    return false
+  }
+  noteBlock(state, 'graph', undefined)
   actions.push({
     kind: 'nudge',
     trigger: 'graph',
@@ -2464,14 +2670,55 @@ function maybeGraphNudge(state              , options                , seq      
   return true
 }
 
-function cooldownBlocks(state              , options                , seq        )         {
-  if (state.nudges >= options.nudgeCap) return `已达上限 ${options.nudgeCap} 次`
-  const since = options.now() - state.lastNudgeAt
-  if (state.nudges > 0 && since < options.nudgeCooldownMs) return `冷却中（${Math.round(since / 1000)}s < ${Math.round(options.nudgeCooldownMs / 1000)}s）`
-  if (state.lastNudgeSeq > 0 && seq - state.lastNudgeSeq < options.nudgeMinSeqGap) {
-    return `日志距离过近（${seq - state.lastNudgeSeq} < ${options.nudgeMinSeqGap} 个事件）`
+/** The four words `blocked` speaks. `fired` is what a trigger that DID speak reads. */
+                                                       
+
+/**
+ * ── v0.41 (B4-0b-1 A1): THE GRAPH TRIGGER KEEPS ONE SLOT OF THE SHARED BUDGET ─────────────────────
+ *
+ * The audit's C-1: a main that collected four failure corrections was then permanently unable to
+ * receive the graph correction, because `nudgeCap` is shared and the graph trigger is the LAST thing
+ * the supervisor would ever say. `observer_status` meanwhile reported `graph.nudged:false` —
+ * indistinguishable from "this main does not need a graph".
+ *
+ * WHY A RESERVED SLOT AND NOT A SEPARATE COUNTER. The cap exists to bound NAGGING, and the graph
+ * trigger is already once-per-main (`graphNudged`), so its own bound is tighter than any cap. What it
+ * needs is not a second budget but a guarantee that another trigger cannot spend the LAST slot. So:
+ * every other trigger may use `cap - 1`; the graph trigger may use the full `cap`. The total number of
+ * nudges a main can ever receive is unchanged (it is still `cap`) — only the last slot is spoken for.
+ *
+ * Returns the RULE that refused, not a string to be pattern-matched by callers: the caller needs the
+ * code to record it, and the sentence for the log.
+ */
+function cooldownBlocks(
+  state              ,
+  options                ,
+  seq        ,
+  reserveFor          ,
+)                                                       {
+  const effectiveCap = reserveFor === 'graph' ? options.nudgeCap : Math.max(0, options.nudgeCap - 1)
+  if (state.nudges >= effectiveCap) {
+    return {
+      code: 'cap',
+      detail:
+        reserveFor === 'graph'
+          ? `已达上限 ${options.nudgeCap} 次`
+          : `已达上限 ${effectiveCap} 次（第 ${options.nudgeCap} 个名额留给「从未建图」，它每主脑只发一次）`,
+    }
   }
-  return ''
+  const since = options.now() - state.lastNudgeAt
+  if (state.nudges > 0 && since < options.nudgeCooldownMs) {
+    return { code: 'cooldown', detail: `冷却中（${Math.round(since / 1000)}s < ${Math.round(options.nudgeCooldownMs / 1000)}s）` }
+  }
+  if (state.lastNudgeSeq > 0 && seq - state.lastNudgeSeq < options.nudgeMinSeqGap) {
+    return { code: 'seq', detail: `日志距离过近（${seq - state.lastNudgeSeq} < ${options.nudgeMinSeqGap} 个事件）` }
+  }
+  return undefined
+}
+
+/** Record a refusal so `observer_status` can say WHICH rule kept a trigger quiet. */
+function noteBlock(state              , trigger                               , code                            )       {
+  state.blocked[trigger] = code ?? ''
 }
 
 /**
@@ -2545,7 +2792,8 @@ function stepMonitor(
       }
       if (state.failure.count >= options.failureStreak) {
         const blocked = cooldownBlocks(state, options, seq)
-        if (blocked.length === 0) {
+        if (blocked === undefined) {
+          noteBlock(state, 'failure', undefined)
           const text = failureNudgeText(state.failure.tool, state.failure.count)
           actions.push({
             kind: 'nudge',
@@ -2558,6 +2806,8 @@ function stepMonitor(
           state.lastNudgeAt = options.now()
           state.lastNudgeSeq = seq
           state.failure = null
+        } else {
+          noteBlock(state, 'failure', blocked.code)
         }
       }
       return actions
@@ -2654,7 +2904,8 @@ function stepMonitor(
        *                   main can be told exactly where it stopped.
        */
       const blocked = cooldownBlocks(state, options, seq)
-      if (blocked.length === 0) {
+      if (blocked === undefined) {
+        noteBlock(state, 'stall', undefined)
         const neverBuilt = state.everUsedTodo !== true
         actions.push({
           kind: 'nudge',
@@ -2671,6 +2922,8 @@ function stepMonitor(
         state.lastNudgeAt = options.now()
         state.lastNudgeSeq = seq
         state.stalledTurns = 0
+      } else {
+        noteBlock(state, 'stall', blocked.code)
       }
     }
     return actions
@@ -2748,7 +3001,10 @@ function harvestGate(
 }
 
 /** A read-only view for `observer_status`: what the supervisor currently believes. */
-function describeMonitorState(state              )                          {
+function describeMonitorState(
+  state              ,
+  options                 = DEFAULT_MONITOR_OPTIONS,
+)                          {
   return {
     events: state.events,
     turnsClosed: state.turnsClosed,
@@ -2772,6 +3028,26 @@ function describeMonitorState(state              )                          {
       distinctToolsRecent: new Set(state.recentTurnTools.flat()).size,
       /** Turns currently in the evidence window (bounded by `stallTurns`). */
       windowTurns: state.recentTurnTools.length,
+      /**
+       * ── v0.41 (B4-0b-1 A1): THE FIFTH FACT ──────────────────────────────────────────────────
+       *
+       * `fired` (it spoke) / `cap` (the shared budget was spent) / `cooldown` / `seq` (too close to
+       * the previous nudge) / `null` (nothing refused it: the conditions simply are not met). Without
+       * this, `nudged:false` next to `distinctToolsRecent:3` reads "not needed" when the truth was
+       * "could not be sent" — the C-1 report that produced this batch was exactly that misreading.
+       */
+      blockedBy: state.graphNudged ? 'fired' : state.blocked.graph === '' ? null : state.blocked.graph,
+    },
+    /**
+     * The same refusals for the other two triggers. `nudgeCap` is SHARED (the last slot is reserved
+     * for the graph trigger), so `failure`/`stall` can hit `cap` while the budget still has a slot
+     * left — that asymmetry is now visible instead of looking like a dead trigger.
+     */
+    blocked: {
+      /** The shared budget, so a reader can compare it against `nudges` without guessing. */
+      cap: options.nudgeCap,
+      failure: state.blocked.failure === '' ? null : state.blocked.failure,
+      stall: state.blocked.stall === '' ? null : state.blocked.stall,
     },
     nudges: state.nudges,
     lastNudgeAt: state.lastNudgeAt === 0 ? null : state.lastNudgeAt,
@@ -2979,11 +3255,48 @@ function createSupervisor(
    * what actually happened, including "not yet".
    */
   const harvest = async (reason               )                          => {
+    /**
+     * ── v0.42 (B4-0b-1 A3): THE IO CHECK COMES BEFORE THE ACCOUNTING ─────────────────────────────
+     *
+     * Measured (audit C-3): this function used to call `harvestGate` FIRST, and `harvestGate` MUTATES
+     * the state (`harvests+1`, `lastHarvestAt`, `harvestedSignature`), and only then checked whether
+     * `tools.execute` existed. With no tools service the attempt therefore recorded "already
+     * harvested" while NOTHING was mined — and because the completion path refuses on a matching
+     * `harvestedSignature`, that board could never be harvested again, not even after the tools
+     * service came up. A gate that spends the budget before it knows whether it can spend it is the
+     * "记账说完成、实际没做" family this batch is about.
+     *
+     * Two changes, both required:
+     *   1. the IO precondition is checked BEFORE the gate, so the common case cannot spend anything;
+     *   2. the accounting is SNAPSHOTED and restored on every failure path that the gate could not
+     *      have foreseen (execute missing late, execute throwing, an `isError` result). The sentence
+     *      "下一轮提炼会再取一次" can now be true instead of hopeful.
+     */
+    if (deps.tools === undefined || typeof deps.tools.execute !== 'function') {
+      return {
+        attempted: false,
+        ok: false,
+        mined: [],
+        minedOurMain: false,
+        detail: 'tools.execute 不可用（未扣配额：这一次什么都没试，下一轮条件满足时会重新判断）',
+      }
+    }
+    const before = {
+      harvests: state.harvests,
+      lastHarvestAt: state.lastHarvestAt,
+      harvestedSignature: state.harvestedSignature,
+      harvestedTurns: state.harvestedTurns,
+      harvestedReplacement: state.harvestedReplacement,
+    }
+    const restoreGate = ()       => {
+      state.harvests = before.harvests
+      state.lastHarvestAt = before.lastHarvestAt
+      state.harvestedSignature = before.harvestedSignature
+      state.harvestedTurns = before.harvestedTurns
+      state.harvestedReplacement = before.harvestedReplacement
+    }
     const gate = harvestGate(state, reason, options)
     if (!gate.ok) return { attempted: false, ok: false, mined: [], minedOurMain: false, detail: gate.detail }
-    if (deps.tools === undefined || typeof deps.tools.execute !== 'function') {
-      return { attempted: false, ok: false, mined: [], minedOurMain: false, detail: 'tools.execute 不可用' }
-    }
     try {
       const result = await deps.tools.execute({
         callId: `observer-harvest-${mainSessionId}-${Date.now()}`,
@@ -2992,11 +3305,16 @@ function createSupervisor(
         signal: new AbortController().signal,
       })
       if (result === null || typeof result !== 'object' || result.isError === true) {
+        /**
+         * An error result is an attempt that did NOT mine: the quota goes back, so the very same
+         * board can be mined once `memory_harvest` works again.
+         */
+        restoreGate()
         const why =
           result !== null && typeof result === 'object' && result.error !== undefined
             ? String(result.error?.message ?? result.error)
             : 'memory_harvest 返回错误'
-        return { attempted: true, ok: false, mined: [], minedOurMain: false, detail: why }
+        return { attempted: true, ok: false, mined: [], minedOurMain: false, detail: `${why}（配额已归还）` }
       }
       const value = result.value ?? {}
       const harvested        = Array.isArray(value.harvested) ? value.harvested : []
@@ -3019,12 +3337,14 @@ function createSupervisor(
               `它的这一轮会在被切片（退休）后自动进入提炼队列`,
       }
     } catch (error) {
+      /** v0.42 (A3): a thrown execute is an attempt that did NOT mine — return the quota. */
+      restoreGate()
       return {
         attempted: true,
         ok: false,
         mined: [],
         minedOurMain: false,
-        detail: String((error       )?.message ?? error),
+        detail: `${String((error       )?.message ?? error)}（配额已归还）`,
       }
     }
   }
@@ -3488,6 +3808,37 @@ function recordPair(
   return store().recordPair(observerSessionId, mainSessionId, origin)
 }
 
+/**
+ * ── v0.42 (B4-0b-1 A2): THE ONE WAY TO RECORD A BINDING ─────────────────────────────────────────
+ *
+ * The audit's C-2: `observer_bind` wrote `bindLegacy` only. Everything that MATTERS reads `pairs/`:
+ * `debugFollowTransfer` answers `followed:false` when `pairOf()` misses (`:414`), and restart
+ * reconstruction iterates `pairs` (`:622`). So the tool replied `ok:true`, `observer_status` showed
+ * the binding (it reads the legacy maps), and the pair was invisible to both the transfer-following
+ * path and the重启 path. A receipt that says "bound" while the mechanism that acts on the binding
+ * cannot see it is exactly the class of lie this batch exists to remove.
+ *
+ * `recordPair` already writes the legacy maps as a DERIVED VIEW (binding-store.ts:310-311), so
+ * writing them separately was never necessary. The fallback here is for the one case where `pairs`
+ * cannot be persisted: the legacy view is still written so the UI is not blank, but the caller is
+ * told `ok:false` and `pairRecorded:false` — a degraded binding is reported, never dressed up.
+ */
+function bindPair(
+  mainSessionId        ,
+  observerSessionId        ,
+  origin                        ,
+)                                                                             {
+  const written = recordPair(observerSessionId, mainSessionId, origin)
+  if (written.ok) return { ok: true, pairRecorded: true, dissolved: written.dissolved }
+  store().bindLegacy(mainSessionId, observerSessionId)
+  const fallback = save()
+  return {
+    ok: false,
+    pairRecorded: false,
+    error: written.error ?? fallback.error ?? 'pair table write failed',
+  }
+}
+
 function isObserverHalf(sessionId        )          {
   return store().isObserverHalf(sessionId)
 }
@@ -3827,10 +4178,17 @@ export function apply(ctx                   , config                          = 
       // Already bound to the same pair: a repeated title event must not re-inject the setting.
       if (observerOf(mainSessionId) === observerSessionId) return
 
-      store().bindLegacy(mainSessionId, observerSessionId)
-      const written = save()
-      if (!written.ok) {
-        ctx.logger?.warn?.(`[dsh-observer] title-derived bind failed to persist: ${written.error}`)
+      /**
+       * v0.42 (B4-0b-1 A2): a title-derived binding is a SUMONED pair, so it goes through the pair
+       * table like every other binding. It used to write the legacy maps only, which made the pair
+       * invisible to `debugFollowTransfer` and to restart reconstruction.
+       */
+      const bound = bindPair(mainSessionId, observerSessionId, 'summoned')
+      if (!bound.ok) {
+        ctx.logger?.warn?.(
+          `[dsh-observer] title-derived bind recorded the LEGACY view only (pair write failed: ${bound.error}); ` +
+            'this pair will not follow a slice and will not survive a restart',
+        )
         return
       }
       ctx.logger?.info?.(`[dsh-observer] bound ${mainSessionId} -> ${observerSessionId} from its title`)
@@ -3934,17 +4292,12 @@ export function apply(ctx                   , config                          = 
     }
 
     if (mode === 'bind') {
-      store().bindLegacy(mainSessionId, observerSessionId)
-      const written = save()
-      if (!written.ok) {
-        store().mutate((st) => {
-          delete st.bindings[mainSessionId]
-          delete st.reverse[observerSessionId]
-        })
+      const bound = bindPair(mainSessionId, observerSessionId, 'summoned')
+      if (!bound.ok) {
         return {
           ok: false,
           observerSessionId,
-          text: `副脑会话已创建（${observerSessionId}），但绑定表写入失败：${written.error}（路径 ${written.path}）`,
+          text: `副脑会话已创建（${observerSessionId}），但配对表写入失败：${bound.error}`,
         }
       }
       // Verify against DISK, not against the in-memory copy the write came from.
@@ -3953,7 +4306,7 @@ export function apply(ctx                   , config                          = 
         return {
           ok: false,
           observerSessionId,
-          text: `绑定表回读校验失败：${written.path} 中没有 ${mainSessionId} → ${observerSessionId}`,
+          text: `绑定表回读校验失败：${store().health().path} 中没有 ${mainSessionId} → ${observerSessionId}`,
         }
       }
     }
@@ -4294,7 +4647,7 @@ export function apply(ctx                   , config                          = 
   const bindExisting = async (
     mainSessionId        ,
     observerSessionId        ,
-  )                                                                    => {
+  )                                                                                            => {
     if (mainSessionId.length === 0 || observerSessionId.length === 0) {
       return { ok: false, observerSessionId: '', text: '缺少 mainSessionId 或 observerSessionId。' }
     }
@@ -4305,18 +4658,28 @@ export function apply(ctx                   , config                          = 
     if (existing.length > 0 && existing !== observerSessionId) {
       store().mutate((st) => { delete st.reverse[existing] })
     }
-    store().bindLegacy(mainSessionId, observerSessionId)
-    const written = save()
-    if (!written.ok) {
-      store().mutate((st) => {
-        delete st.bindings[mainSessionId]
-        delete st.reverse[observerSessionId]
-      })
-      return { ok: false, observerSessionId, text: `绑定表写入失败：${written.error}（路径 ${written.path}）` }
+    /**
+     * ── v0.42 (B4-0b-1 A2): THROUGH THE PAIR TABLE, AND SAY SO ──────────────────────────────────
+     *
+     * `bindLegacy` alone was the bug: the receipt said `ok:true`, the legacy maps showed the binding,
+     * and both mechanisms that ACT on it (`debugFollowTransfer`, restart reconstruction) read `pairs/`
+     * and saw nothing. `recordPair` writes the legacy maps as a derived view, so nothing is lost.
+     *
+     * The receipt now carries `pairRecorded`. A degraded binding (pair write failed, legacy view
+     * written) must be `ok:false` — "the UI shows it" is not the same as "the mechanism knows it".
+     */
+    const bound = bindPair(mainSessionId, observerSessionId, 'summoned')
+    if (!bound.ok) {
+      return {
+        ok: false,
+        observerSessionId,
+        pairRecorded: false,
+        text: `绑定表写入失败：${bound.error}（旧式视图已写入，但这一对不会跟随切片、重启也不会恢复监理）`,
+      }
     }
     load()
     if (observerOf(mainSessionId) !== observerSessionId) {
-      return { ok: false, observerSessionId, text: `回读校验失败：${written.path} 中没有该绑定` }
+      return { ok: false, observerSessionId, pairRecorded: true, text: '回读校验失败：绑定表中没有该绑定' }
     }
     /**
      * v1.0.4: send the role as an ordinary message and title the session `[副脑] …`. The title is
@@ -4329,6 +4692,7 @@ export function apply(ctx                   , config                          = 
     return {
       ok: true,
       observerSessionId,
+      pairRecorded: true,
       text:
         `已绑定 ${mainSessionId} → ${observerSessionId}。` +
         (marked.detail.length > 0 ? `（部分步骤未完成：${marked.detail}）` : ''),
@@ -4355,6 +4719,8 @@ export function apply(ctx                   , config                          = 
         properties: {
           ok: { type: 'boolean' },
           observerSessionId: { type: 'string' },
+          /** v0.42 (A2): true only when the PAIR table was written — not just the legacy view. */
+          pairRecorded: { type: 'boolean' },
           text: { type: 'string' },
         },
         required: ['ok'],
@@ -4441,13 +4807,13 @@ export function apply(ctx                   , config                          = 
       return { ok: false, sessionId: '', text: 'sessionController.create 返回了空 id' }
     }
 
-    store().bindLegacy(mainSessionId, observerSessionId)
+    /**
+     * v0.42 (A2): the redundant `bindLegacy` that used to sit here is gone. `recordPair` writes the
+     * legacy maps as a derived view, and writing them FIRST meant a failed pair write left a
+     * half-binding behind that the failure path then had to undo by hand.
+     */
     const written = recordPair(observerSessionId, mainSessionId, 'summoned')
     if (!written.ok) {
-      store().mutate((st) => {
-        delete st.bindings[mainSessionId]
-        delete st.reverse[observerSessionId]
-      })
       return { ok: false, sessionId: observerSessionId, text: `绑定表写入失败：${written.error}` }
     }
 
@@ -5251,6 +5617,8 @@ export function apply(ctx                   , config                          = 
           focusConsumed: { type: 'boolean' },
           /** v1.7.0: one entry per supervised main. An empty map means nothing was incubated. */
           supervisors: { type: 'object' },
+          /** v0.42 (A4): `{ path, readOnly, mergedOnLastSave }` — a degraded store must look degraded. */
+          bindingStore: { type: 'object' },
           /**
            * v1.8.0: the 彼岸层's live status. `resolved: false` means no read has happened yet;
            * `available: false` means the layer is missing and says what that costs.
@@ -5274,6 +5642,16 @@ export function apply(ctx                   , config                          = 
         reverse: { ...snapshot.reverse },
         focus: pending === null ? null : { ...pending },
         supervisors: supervisorView,
+        /**
+         * ── v0.42 (B4-0b-1 A4): THE STORE'S OWN HEALTH ─────────────────────────────────────────
+         *
+         * `readOnly` non-empty means the file could not be parsed and this process will not write it
+         * — every bind attempt will honestly fail until someone looks. `mergedOnLastSave` > 0 means
+         * the last write folded in rows another process wrote (a fact an operator wants, not an
+         * error). Without these two, a read-only store and a healthy one read identically: bindings
+         * appear in memory and nothing on disk changed.
+         */
+        bindingStore: store().health(),
         paradise: paradiseStatus(),
         ...(args?.ackFocus === true ? { focusConsumed: true } : {}),
       }
