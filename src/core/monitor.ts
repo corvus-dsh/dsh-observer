@@ -99,6 +99,18 @@ export interface MonitorOptions {
   graphDistinctTools: number
   /** The clock. Injected so the pure tests do not depend on wall time. */
   now: () => number
+  /**
+   * ── v1.4 (B4-0b-2 W2-2): ONE PLACE TO SAY "THE CLOCK MOVED" ─────────────────────────────────
+   *
+   * A backwards clock or a backwards `seq` used to FAIL CLOSED and say nothing: `since` went
+   * negative, `since < cooldown` stayed true forever, and every correction was silently frozen. That
+   * is the worst kind of dead supervisor — it looks calm, and calm is indistinguishable from "nothing
+   * to say".
+   *
+   * Injected rather than imported, the same way `now` is: the decision stays pure, and the caller
+   * keeps the logger. Defaulted to a no-op so no existing test has to change.
+   */
+  warn?: (message: string) => void
 }
 
 export const DEFAULT_MONITOR_OPTIONS: MonitorOptions = {
@@ -190,6 +202,15 @@ export interface MonitorState {
   nudges: number
   lastNudgeAt: number
   lastNudgeSeq: number
+  /**
+   * ── v1.4 (W2-2): WHAT THE CLOCK DID, IN PLAIN WORDS ─────────────────────────────────────────
+   *
+   * Set when a backwards clock or a backwards `seq` was DETECTED and corrected. Empty means "the
+   * timeline was monotonically sane". It lives in the state (not only in a log line) so
+   * `observer_status` can show it: a correction that can only be seen by tailing a log is a
+   * correction nobody sees.
+   */
+  clockRewind: string
   /** The TODO signature already mined, so a finished board is not harvested twice. */
   harvestedSignature: string
   harvestedTurns: number
@@ -231,6 +252,7 @@ export function createMonitorState(): MonitorState {
     nudges: 0,
     lastNudgeAt: 0,
     lastNudgeSeq: 0,
+    clockRewind: '',
     harvestedSignature: '',
     harvestedTurns: 0,
     harvestedReplacement: false,
@@ -238,6 +260,81 @@ export function createMonitorState(): MonitorState {
     lastHarvestAt: 0,
     blocked: { failure: '', stall: '', graph: '' },
   }
+}
+
+/**
+ * ── v1.4 (B4-0b-2 W2-1): A SUPERVISOR THAT RESTARTED HAS NOT BEEN CORRECTING LESS ──────────────
+ *
+ * `createMonitorState()` starts at zero, and the whole budget lives in that object. So a Host restart
+ * (or a plugin reload — this file is re-imported) handed every main a FRESH cap of four: the observer
+ * could nag the same session four more times, four more after that, and the file that records "this
+ * main needed these corrections" was the only thing that remembered.
+ *
+ * The seed comes from the long-term ledger, which is already the observer's memory of mains. This
+ * function is deliberately structural (`{...}` rather than importing `MainRecord`) so `monitor.ts`
+ * keeps no dependency on the ledger module: the caller owns the IO, the decision module owns the
+ * decision.
+ *
+ * NOT restored on purpose: `failure`, `pending`, `toolsThisTurn`, `blocked`. Those describe events in
+ * a LOG, and a log that restarted at seq 0 cannot be resumed by a stale in-flight streak.
+ */
+export function hydrateMonitorState(
+  state: MonitorState,
+  seed: {
+    nudges?: number
+    lastNudgeAt?: number
+    lastNudgeSeq?: number
+    stalledTurns?: number
+    harvestedReplacement?: boolean
+  },
+): void {
+  const number = (value: unknown): number =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0
+  state.nudges = number(seed.nudges)
+  state.lastNudgeAt = number(seed.lastNudgeAt)
+  state.lastNudgeSeq = number(seed.lastNudgeSeq)
+  state.stalledTurns = number(seed.stalledTurns)
+  state.harvestedReplacement = seed.harvestedReplacement === true
+}
+
+/**
+ * ── v1.4 (W2-2): A BACKWARDS TIMELINE IS A FACT TO CORRECT, NOT A REASON TO GO QUIET ────────────
+ *
+ * Measured shape: `since = now - lastNudgeAt` went NEGATIVE when the wall clock stepped back (a VM
+ * resume, a manual clock change, NTP correcting a fast clock). `since < cooldown` is then true for
+ * as long as the clock stays behind — so no correction can EVER fire, and the reason is invisible
+ * because a blocked trigger is silent by design.
+ *
+ * Same shape for `seq`: after a compaction the main's log can restart below `lastNudgeSeq`, and
+ * `seq - lastNudgeSeq < gap` then holds forever.
+ *
+ * ── WHY `lastNudgeAt` IS SET TO "COOLDOWN ALREADY ELAPSED", NOT TO `now` ────────────────────────
+ *
+ * The obvious repair — "reset `lastNudgeAt = now`" — does not work, and the reason is worth writing
+ * down: `since` becomes 0, and the very next check reads 0 as "just nudged", which is the SAME
+ * freeze one line later. Anchoring the cooldown at `now - cooldownMs` states what is actually true
+ * at this moment: the previous correction is not recent, because the clock that timed it is gone.
+ * The criterion ("must fire, and say so") is what governs; the letter of "= now" would fail it.
+ */
+export function normaliseTimeline(state: MonitorState, seq: number, options: MonitorOptions): void {
+  const now = options.now()
+  const notes: string[] = []
+  if (state.lastNudgeAt > 0 && now < state.lastNudgeAt) {
+    const behindMs = state.lastNudgeAt - now
+    state.lastNudgeAt = now - options.nudgeCooldownMs
+    notes.push(
+      `时钟倒退 ${Math.round(behindMs / 1000)}s（上次纠偏记在 ${state.lastNudgeAt + options.nudgeCooldownMs}，` +
+        `现在 ${now}）：冷却按「已过」处理，否则 since<0 会让纠偏永久静默`,
+    )
+  }
+  if (state.lastNudgeSeq > 0 && seq < state.lastNudgeSeq) {
+    notes.push(`日志 seq 回退（${seq} < ${state.lastNudgeSeq}，会话被压缩或重建）：距离规则重置`)
+    /** `0` DISABLES the seq rule (the guard is `lastNudgeSeq > 0`), which is the point of a reset. */
+    state.lastNudgeSeq = 0
+  }
+  if (notes.length === 0) return
+  state.clockRewind = notes.join('；')
+  options.warn?.(`[dsh-observer] 时间线已被纠正：${state.clockRewind}`)
 }
 
 export type MonitorAction =
@@ -458,6 +555,11 @@ export function stepMonitor(
   const seq = Number.isFinite(rawSeq) ? rawSeq : state.lastSeq
   state.events += 1
   if (Number.isFinite(seq) && seq > state.lastSeq) state.lastSeq = seq
+  /**
+   * BEFORE any trigger is judged. A timeline that is about to be compared against must be sane
+   * first — otherwise every rule that follows is answered by a clock the callers cannot see.
+   */
+  normaliseTimeline(state, seq, options)
 
   if (type === 'tool/call') {
     const callId = String(event.data?.callId ?? '')
@@ -768,6 +870,7 @@ export function describeMonitorState(
     },
     nudges: state.nudges,
     lastNudgeAt: state.lastNudgeAt === 0 ? null : state.lastNudgeAt,
+    clockRewind: state.clockRewind,
     harvests: state.harvests,
     lastHarvestAt: state.lastHarvestAt === 0 ? null : state.lastHarvestAt,
     /** True once a slice of this main has been mined. */

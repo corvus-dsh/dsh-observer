@@ -161,6 +161,8 @@ import {
   DEFAULT_MONITOR_OPTIONS,
   createMonitorState,
   describeMonitorState,
+  hydrateMonitorState,
+  normaliseTimeline,
   failureNudgeText,
   graphNudgeText,
   harvestGate,
@@ -2386,6 +2388,16 @@ export const monitorInternals = {
   DEFAULT_MONITOR_OPTIONS,
   createMonitorState,
   describeMonitorState,
+  /**
+   * ── v1.4 (W2-1/W2-2): FOLDED IN, NOT A NEW SEAM ──────────────────────────────────────────────
+   *
+   * The seam inventory is pinned by `test/test-seam-inventory.test.mjs`, and its first rule is to fold
+   * a new test seam into an object that already exists. Both of these answer a question about the
+   * monitor STATE ("what budget has this main used" / "was the timeline sane"), so they sit beside
+   * `createMonitorState` — the function whose zeroing they exist to correct.
+   */
+  hydrateMonitorState,
+  normaliseTimeline,
   failureNudgeText,
   graphNudgeText,
   harvestGate,

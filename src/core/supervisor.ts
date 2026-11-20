@@ -33,10 +33,17 @@ import {
   createMonitorState,
   describeMonitorState,
   harvestGate,
+  hydrateMonitorState,
   stepMonitor,
 } from './monitor.js'
 /** v0.40 (B3 / F7): the long-term notebook's pure half. IO is injected by the caller. */
-import { crossGenerationLine, generationFor, priorGenerationNudge, upsertRecord } from './long-term-ledger.js'
+import {
+  crossGenerationLine,
+  findRecord,
+  generationFor,
+  priorGenerationNudge,
+  upsertRecord,
+} from './long-term-ledger.js'
 import type { LongTermLedger } from './long-term-ledger.js'
 import { ignitionDeadline, describePromptFailure } from './ignition.js'
 
@@ -143,8 +150,47 @@ export function createSupervisor(
   mainSessionId: string,
   deps: SupervisorDeps = {},
 ): Supervisor {
-  const options: MonitorOptions = { ...DEFAULT_MONITOR_OPTIONS, ...(deps.options ?? {}) }
+  const log = (message: string): void => deps.logger?.info?.(message)
+  const warn = (message: string): void => deps.logger?.warn?.(message)
+  const options: MonitorOptions = {
+    ...DEFAULT_MONITOR_OPTIONS,
+    /**
+     * ── v1.4 (W2-2): THE DECISION MODULE'S WARNING GOES TO THIS SUPERVISOR'S LOG ─────────────────
+     *
+     * Placed BEFORE `deps.options` so a caller that supplies its own `warn` still wins. A corrected
+     * timeline that only the pure module knows about is a correction nobody hears about.
+     */
+    warn,
+    ...(deps.options ?? {}),
+  }
   const state = createMonitorState()
+  /**
+   * ── v1.4 (W2-1): THE BUDGET IS RESTORED, NOT RESTARTED ──────────────────────────────────────
+   *
+   * `createMonitorState()` says every main has been corrected zero times. The ledger says otherwise,
+   * and the ledger is the one that survives a Host restart. Not hydrating meant the cap of four was
+   * really "four per process lifetime" — a restart handed the observer four more chances to nag the
+   * same main for the same shape, which is exactly what the trigger spacing exists to prevent.
+   *
+   * Failure to read the notebook degrades to zero (rule ⑤: supervision continues), and says so.
+   */
+  if (deps.ledger !== undefined) {
+    try {
+      const record = findRecord(deps.ledger.load(), mainSessionId)
+      if (record !== undefined) {
+        hydrateMonitorState(state, record)
+        if (record.nudges > 0) {
+          log(
+            `[dsh-observer] 主脑 ${mainSessionId} 的纠偏预算从台账恢复：已用 ${record.nudges}/${options.nudgeCap}`,
+          )
+        }
+      }
+    } catch (error) {
+      warn(
+        `[dsh-observer] 纠偏预算恢复失败（按 0 继续监督）：${String((error as any)?.message ?? error)}`,
+      )
+    }
+  }
   const idleMs = typeof deps.idleMs === 'number' && deps.idleMs > 0 ? deps.idleMs : DEFAULT_SUPERVISOR_IDLE_MS
   const setTimer = deps.setTimer ?? ((fn, ms) => setTimeout(fn, ms))
   const clearTimer = deps.clearTimer ?? ((handle) => clearTimeout(handle as any))
@@ -153,8 +199,44 @@ export function createSupervisor(
   /** Nudges/harvests already applied, so a duplicate feed delivery cannot double-act. */
   let busy = false
 
-  const log = (message: string): void => deps.logger?.info?.(message)
-  const warn = (message: string): void => deps.logger?.warn?.(message)
+  /**
+   * ── v1.4 (W2-1): THE BUDGET IS WRITTEN BACK WHENEVER IT CHANGES ────────────────────────────────
+   *
+   * One function for both writes, because the ledger row is ONE row: "what this main needed" and
+   * "what budget it has left" are the same fact seen twice, and two call sites writing it separately
+   * is how a row ends up saying four corrections happened while the budget says one.
+   *
+   * Written on EVERY applied action, not only on success: a failed delivery still spent the slot
+   * (see the note at the call site), and a ledger that only records successes would hand the slot
+   * back on the next restart — the double-act this ledger exists to prevent.
+   */
+  const persistQuota = (nudgedKind?: 'failure' | 'stall' | 'graph'): void => {
+    if (deps.ledger === undefined) return
+    try {
+      const ledger = deps.ledger.load()
+      deps.ledger.save(
+        upsertRecord(ledger, {
+          sessionId: mainSessionId,
+          sourceSessionId: deps.sourceSessionId,
+          generation:
+            deps.sourceSessionId === undefined || deps.sourceSessionId.length === 0
+              ? 1
+              : generationFor(ledger, deps.sourceSessionId),
+          at: Date.now(),
+          ...(nudgedKind === undefined ? {} : { nudgedKind }),
+          quota: {
+            nudges: state.nudges,
+            lastNudgeAt: state.lastNudgeAt,
+            lastNudgeSeq: state.lastNudgeSeq,
+            stalledTurns: state.stalledTurns,
+            harvestedReplacement: state.harvestedReplacement,
+          },
+        }),
+      )
+    } catch (error) {
+      warn(`[dsh-observer] 长期台账写入失败（不影响纠偏）：${String((error as any)?.message ?? error)}`)
+    }
+  }
 
   const armIdle = (): void => {
     if (disposed) return
@@ -346,24 +428,13 @@ export function createSupervisor(
          * problem was absent — and a notebook that only remembers successes would learn the wrong
          * lesson.
          */
-        if (deps.ledger !== undefined) {
-          try {
-            const ledger = deps.ledger.load()
-            deps.ledger.save(
-              upsertRecord(ledger, {
-                sessionId: mainSessionId,
-                sourceSessionId: deps.sourceSessionId,
-                generation: deps.sourceSessionId === undefined || deps.sourceSessionId.length === 0
-                  ? 1
-                  : generationFor(ledger, deps.sourceSessionId),
-                at: Date.now(),
-                nudgedKind: action.trigger,
-              }),
-            )
-          } catch (error) {
-            warn(`[dsh-observer] 长期台账写入失败（不影响纠偏）：${String((error as any)?.message ?? error)}`)
-          }
-        }
+        /**
+         * The budget AND the shape go in one write (W2-1): the ledger row is now the source of truth
+         * for "how many corrections this main has, and when the last one was". `nudgedKind` keeps the
+         * set for the cross-generation sentence; `quota` keeps the counters that used to die with
+         * the process.
+         */
+        persistQuota(action.trigger)
         continue
       }
       const outcome = await harvest(action.reason)
@@ -372,6 +443,8 @@ export function createSupervisor(
       } else {
         warn(`[dsh-observer] 后台提炼未执行（${action.reason}）：${outcome.detail}`)
       }
+      /** A harvest changes the budget too (`harvestedReplacement`, cooldown), so it is written back. */
+      persistQuota()
     }
   }
 
@@ -409,6 +482,8 @@ export function createSupervisor(
         const outcome = await harvest('idle')
         if (outcome.ok) log(`[dsh-observer] 主脑 ${mainSessionId} 空闲，后台提炼：${outcome.detail}`)
         else log(`[dsh-observer] 主脑 ${mainSessionId} 空闲，未提炼：${outcome.detail}`)
+        /** W2-1: the idle harvest moved the budget, and the budget outlives this process. */
+        persistQuota()
       } catch (error) {
         warn(`[dsh-observer] 空闲提炼失败：${String((error as any)?.message ?? error)}`)
       }
@@ -430,6 +505,8 @@ export function createSupervisor(
         const outcome = await harvest('replaced')
         if (outcome.ok) log(`[dsh-observer] 主脑 ${mainSessionId} 被切片，后台提炼：${outcome.detail}`)
         else warn(`[dsh-observer] 主脑 ${mainSessionId} 被切片，未提炼：${outcome.detail}`)
+        /** The replacement harvest must never run twice, and only the ledger can promise that. */
+        persistQuota()
       } catch (error) {
         warn(`[dsh-observer] 切片后提炼失败：${String((error as any)?.message ?? error)}`)
       }

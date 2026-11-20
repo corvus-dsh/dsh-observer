@@ -546,6 +546,22 @@ function readRaw()                     {
                 
                                                                                       
                        
+     
+                                                                                                 
+    
+                                                                                                   
+                                                                                                    
+                                                                                                      
+                                                                    
+    
+                                                                                                    
+                                                                      
+     
+                     
+                      
+                      
+                                                                                                     
+                               
  
 
                                  
@@ -587,6 +603,15 @@ function parseLedger(raw         )                 {
       nudgedKinds: Array.isArray(entry.nudgedKinds)
         ? entry.nudgedKinds.filter((kind)                 => typeof kind === 'string')
         : [],
+      /**
+       * Tolerant on purpose: a ledger written by v1.3 has none of these, and "the file predates the
+       * field" must read as 0 / false — not as a torn row that drops the whole record, which would
+       * throw away the chain link the record is kept for.
+       */
+      lastNudgeAt: Number.isFinite(Number(entry.lastNudgeAt)) && Number(entry.lastNudgeAt) > 0 ? Number(entry.lastNudgeAt) : 0,
+      lastNudgeSeq: Number.isFinite(Number(entry.lastNudgeSeq)) && Number(entry.lastNudgeSeq) > 0 ? Number(entry.lastNudgeSeq) : 0,
+      stalledTurns: Number.isFinite(Number(entry.stalledTurns)) && Number(entry.stalledTurns) > 0 ? Number(entry.stalledTurns) : 0,
+      harvestedReplacement: entry.harvestedReplacement === true,
     })
   }
   return { version: 1, records: out }
@@ -623,12 +648,28 @@ function upsertRecord(
                        
               
                           
+       
+                                                                                                  
+      
+                                                                                                    
+                                                                                                 
+                                                                                                   
+                                                              
+       
+             
+                    
+                         
+                          
+                          
+                                   
+     
    ,
 )                 {
   const existing = findRecord(ledger, patch.sessionId)
   const kinds = new Set(existing?.nudgedKinds ?? [])
   /** A kind already recorded is NOT added twice: the repeat is the fact, not the count. */
   if (patch.nudgedKind !== undefined && isKind(patch.nudgedKind)) kinds.add(patch.nudgedKind)
+  const quota = patch.quota
   const merged             = {
     sessionId: patch.sessionId,
     generation:
@@ -640,8 +681,16 @@ function upsertRecord(
         ? patch.sourceSessionId
         : existing?.sourceSessionId ?? '',
     lastServiceAt: patch.at,
-    nudges: (existing?.nudges ?? 0) + (patch.nudgedKind === undefined ? 0 : 1),
+    nudges:
+      quota !== undefined
+        ? Math.max(0, Number(quota.nudges) || 0)
+        : (existing?.nudges ?? 0) + (patch.nudgedKind === undefined ? 0 : 1),
     nudgedKinds: [...kinds].sort(),
+    lastNudgeAt: quota !== undefined ? Math.max(0, Number(quota.lastNudgeAt) || 0) : existing?.lastNudgeAt ?? 0,
+    lastNudgeSeq: quota !== undefined ? Math.max(0, Number(quota.lastNudgeSeq) || 0) : existing?.lastNudgeSeq ?? 0,
+    stalledTurns: quota !== undefined ? Math.max(0, Number(quota.stalledTurns) || 0) : existing?.stalledTurns ?? 0,
+    harvestedReplacement:
+      quota !== undefined ? quota.harvestedReplacement === true : existing?.harvestedReplacement === true,
   }
   const others = ledger.records.filter((record) => record.sessionId !== patch.sessionId)
   const next = [...others, merged].sort((left, right) => {
@@ -2382,6 +2431,18 @@ const GRAPH_DISTINCT_TOOLS_LIMIT = 3
                             
                                                                           
                    
+     
+                                                                                                 
+    
+                                                                                             
+                                                                                                     
+                                                                                                      
+             
+    
+                                                                                                  
+                                                                              
+     
+                                  
  
 
 const DEFAULT_MONITOR_OPTIONS                 = {
@@ -2473,6 +2534,15 @@ const DEFAULT_MONITOR_OPTIONS                 = {
                 
                      
                       
+     
+                                                                                                 
+    
+                                                                                                 
+                                                                                        
+                                                                                            
+                            
+     
+                     
                                                                                       
                             
                         
@@ -2514,6 +2584,7 @@ function createMonitorState()               {
     nudges: 0,
     lastNudgeAt: 0,
     lastNudgeSeq: 0,
+    clockRewind: '',
     harvestedSignature: '',
     harvestedTurns: 0,
     harvestedReplacement: false,
@@ -2521,6 +2592,81 @@ function createMonitorState()               {
     lastHarvestAt: 0,
     blocked: { failure: '', stall: '', graph: '' },
   }
+}
+
+/**
+ * ── v1.4 (B4-0b-2 W2-1): A SUPERVISOR THAT RESTARTED HAS NOT BEEN CORRECTING LESS ──────────────
+ *
+ * `createMonitorState()` starts at zero, and the whole budget lives in that object. So a Host restart
+ * (or a plugin reload — this file is re-imported) handed every main a FRESH cap of four: the observer
+ * could nag the same session four more times, four more after that, and the file that records "this
+ * main needed these corrections" was the only thing that remembered.
+ *
+ * The seed comes from the long-term ledger, which is already the observer's memory of mains. This
+ * function is deliberately structural (`{...}` rather than importing `MainRecord`) so `monitor.ts`
+ * keeps no dependency on the ledger module: the caller owns the IO, the decision module owns the
+ * decision.
+ *
+ * NOT restored on purpose: `failure`, `pending`, `toolsThisTurn`, `blocked`. Those describe events in
+ * a LOG, and a log that restarted at seq 0 cannot be resumed by a stale in-flight streak.
+ */
+function hydrateMonitorState(
+  state              ,
+  seed   
+                   
+                        
+                         
+                         
+                                  
+   ,
+)       {
+  const number = (value         )         =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0
+  state.nudges = number(seed.nudges)
+  state.lastNudgeAt = number(seed.lastNudgeAt)
+  state.lastNudgeSeq = number(seed.lastNudgeSeq)
+  state.stalledTurns = number(seed.stalledTurns)
+  state.harvestedReplacement = seed.harvestedReplacement === true
+}
+
+/**
+ * ── v1.4 (W2-2): A BACKWARDS TIMELINE IS A FACT TO CORRECT, NOT A REASON TO GO QUIET ────────────
+ *
+ * Measured shape: `since = now - lastNudgeAt` went NEGATIVE when the wall clock stepped back (a VM
+ * resume, a manual clock change, NTP correcting a fast clock). `since < cooldown` is then true for
+ * as long as the clock stays behind — so no correction can EVER fire, and the reason is invisible
+ * because a blocked trigger is silent by design.
+ *
+ * Same shape for `seq`: after a compaction the main's log can restart below `lastNudgeSeq`, and
+ * `seq - lastNudgeSeq < gap` then holds forever.
+ *
+ * ── WHY `lastNudgeAt` IS SET TO "COOLDOWN ALREADY ELAPSED", NOT TO `now` ────────────────────────
+ *
+ * The obvious repair — "reset `lastNudgeAt = now`" — does not work, and the reason is worth writing
+ * down: `since` becomes 0, and the very next check reads 0 as "just nudged", which is the SAME
+ * freeze one line later. Anchoring the cooldown at `now - cooldownMs` states what is actually true
+ * at this moment: the previous correction is not recent, because the clock that timed it is gone.
+ * The criterion ("must fire, and say so") is what governs; the letter of "= now" would fail it.
+ */
+function normaliseTimeline(state              , seq        , options                )       {
+  const now = options.now()
+  const notes           = []
+  if (state.lastNudgeAt > 0 && now < state.lastNudgeAt) {
+    const behindMs = state.lastNudgeAt - now
+    state.lastNudgeAt = now - options.nudgeCooldownMs
+    notes.push(
+      `时钟倒退 ${Math.round(behindMs / 1000)}s（上次纠偏记在 ${state.lastNudgeAt + options.nudgeCooldownMs}，` +
+        `现在 ${now}）：冷却按「已过」处理，否则 since<0 会让纠偏永久静默`,
+    )
+  }
+  if (state.lastNudgeSeq > 0 && seq < state.lastNudgeSeq) {
+    notes.push(`日志 seq 回退（${seq} < ${state.lastNudgeSeq}，会话被压缩或重建）：距离规则重置`)
+    /** `0` DISABLES the seq rule (the guard is `lastNudgeSeq > 0`), which is the point of a reset. */
+    state.lastNudgeSeq = 0
+  }
+  if (notes.length === 0) return
+  state.clockRewind = notes.join('；')
+  options.warn?.(`[dsh-observer] 时间线已被纠正：${state.clockRewind}`)
 }
 
                            
@@ -2741,6 +2887,11 @@ function stepMonitor(
   const seq = Number.isFinite(rawSeq) ? rawSeq : state.lastSeq
   state.events += 1
   if (Number.isFinite(seq) && seq > state.lastSeq) state.lastSeq = seq
+  /**
+   * BEFORE any trigger is judged. A timeline that is about to be compared against must be sane
+   * first — otherwise every rule that follows is answered by a clock the callers cannot see.
+   */
+  normaliseTimeline(state, seq, options)
 
   if (type === 'tool/call') {
     const callId = String(event.data?.callId ?? '')
@@ -3051,6 +3202,7 @@ function describeMonitorState(
     },
     nudges: state.nudges,
     lastNudgeAt: state.lastNudgeAt === 0 ? null : state.lastNudgeAt,
+    clockRewind: state.clockRewind,
     harvests: state.harvests,
     lastHarvestAt: state.lastHarvestAt === 0 ? null : state.lastHarvestAt,
     /** True once a slice of this main has been mined. */
@@ -3187,8 +3339,47 @@ function createSupervisor(
   mainSessionId        ,
   deps                 = {},
 )             {
-  const options                 = { ...DEFAULT_MONITOR_OPTIONS, ...(deps.options ?? {}) }
+  const log = (message        )       => deps.logger?.info?.(message)
+  const warn = (message        )       => deps.logger?.warn?.(message)
+  const options                 = {
+    ...DEFAULT_MONITOR_OPTIONS,
+    /**
+     * ── v1.4 (W2-2): THE DECISION MODULE'S WARNING GOES TO THIS SUPERVISOR'S LOG ─────────────────
+     *
+     * Placed BEFORE `deps.options` so a caller that supplies its own `warn` still wins. A corrected
+     * timeline that only the pure module knows about is a correction nobody hears about.
+     */
+    warn,
+    ...(deps.options ?? {}),
+  }
   const state = createMonitorState()
+  /**
+   * ── v1.4 (W2-1): THE BUDGET IS RESTORED, NOT RESTARTED ──────────────────────────────────────
+   *
+   * `createMonitorState()` says every main has been corrected zero times. The ledger says otherwise,
+   * and the ledger is the one that survives a Host restart. Not hydrating meant the cap of four was
+   * really "four per process lifetime" — a restart handed the observer four more chances to nag the
+   * same main for the same shape, which is exactly what the trigger spacing exists to prevent.
+   *
+   * Failure to read the notebook degrades to zero (rule ⑤: supervision continues), and says so.
+   */
+  if (deps.ledger !== undefined) {
+    try {
+      const record = findRecord(deps.ledger.load(), mainSessionId)
+      if (record !== undefined) {
+        hydrateMonitorState(state, record)
+        if (record.nudges > 0) {
+          log(
+            `[dsh-observer] 主脑 ${mainSessionId} 的纠偏预算从台账恢复：已用 ${record.nudges}/${options.nudgeCap}`,
+          )
+        }
+      }
+    } catch (error) {
+      warn(
+        `[dsh-observer] 纠偏预算恢复失败（按 0 继续监督）：${String((error       )?.message ?? error)}`,
+      )
+    }
+  }
   const idleMs = typeof deps.idleMs === 'number' && deps.idleMs > 0 ? deps.idleMs : DEFAULT_SUPERVISOR_IDLE_MS
   const setTimer = deps.setTimer ?? ((fn, ms) => setTimeout(fn, ms))
   const clearTimer = deps.clearTimer ?? ((handle) => clearTimeout(handle       ))
@@ -3197,8 +3388,44 @@ function createSupervisor(
   /** Nudges/harvests already applied, so a duplicate feed delivery cannot double-act. */
   let busy = false
 
-  const log = (message        )       => deps.logger?.info?.(message)
-  const warn = (message        )       => deps.logger?.warn?.(message)
+  /**
+   * ── v1.4 (W2-1): THE BUDGET IS WRITTEN BACK WHENEVER IT CHANGES ────────────────────────────────
+   *
+   * One function for both writes, because the ledger row is ONE row: "what this main needed" and
+   * "what budget it has left" are the same fact seen twice, and two call sites writing it separately
+   * is how a row ends up saying four corrections happened while the budget says one.
+   *
+   * Written on EVERY applied action, not only on success: a failed delivery still spent the slot
+   * (see the note at the call site), and a ledger that only records successes would hand the slot
+   * back on the next restart — the double-act this ledger exists to prevent.
+   */
+  const persistQuota = (nudgedKind                                )       => {
+    if (deps.ledger === undefined) return
+    try {
+      const ledger = deps.ledger.load()
+      deps.ledger.save(
+        upsertRecord(ledger, {
+          sessionId: mainSessionId,
+          sourceSessionId: deps.sourceSessionId,
+          generation:
+            deps.sourceSessionId === undefined || deps.sourceSessionId.length === 0
+              ? 1
+              : generationFor(ledger, deps.sourceSessionId),
+          at: Date.now(),
+          ...(nudgedKind === undefined ? {} : { nudgedKind }),
+          quota: {
+            nudges: state.nudges,
+            lastNudgeAt: state.lastNudgeAt,
+            lastNudgeSeq: state.lastNudgeSeq,
+            stalledTurns: state.stalledTurns,
+            harvestedReplacement: state.harvestedReplacement,
+          },
+        }),
+      )
+    } catch (error) {
+      warn(`[dsh-observer] 长期台账写入失败（不影响纠偏）：${String((error       )?.message ?? error)}`)
+    }
+  }
 
   const armIdle = ()       => {
     if (disposed) return
@@ -3390,24 +3617,13 @@ function createSupervisor(
          * problem was absent — and a notebook that only remembers successes would learn the wrong
          * lesson.
          */
-        if (deps.ledger !== undefined) {
-          try {
-            const ledger = deps.ledger.load()
-            deps.ledger.save(
-              upsertRecord(ledger, {
-                sessionId: mainSessionId,
-                sourceSessionId: deps.sourceSessionId,
-                generation: deps.sourceSessionId === undefined || deps.sourceSessionId.length === 0
-                  ? 1
-                  : generationFor(ledger, deps.sourceSessionId),
-                at: Date.now(),
-                nudgedKind: action.trigger,
-              }),
-            )
-          } catch (error) {
-            warn(`[dsh-observer] 长期台账写入失败（不影响纠偏）：${String((error       )?.message ?? error)}`)
-          }
-        }
+        /**
+         * The budget AND the shape go in one write (W2-1): the ledger row is now the source of truth
+         * for "how many corrections this main has, and when the last one was". `nudgedKind` keeps the
+         * set for the cross-generation sentence; `quota` keeps the counters that used to die with
+         * the process.
+         */
+        persistQuota(action.trigger)
         continue
       }
       const outcome = await harvest(action.reason)
@@ -3416,6 +3632,8 @@ function createSupervisor(
       } else {
         warn(`[dsh-observer] 后台提炼未执行（${action.reason}）：${outcome.detail}`)
       }
+      /** A harvest changes the budget too (`harvestedReplacement`, cooldown), so it is written back. */
+      persistQuota()
     }
   }
 
@@ -3453,6 +3671,8 @@ function createSupervisor(
         const outcome = await harvest('idle')
         if (outcome.ok) log(`[dsh-observer] 主脑 ${mainSessionId} 空闲，后台提炼：${outcome.detail}`)
         else log(`[dsh-observer] 主脑 ${mainSessionId} 空闲，未提炼：${outcome.detail}`)
+        /** W2-1: the idle harvest moved the budget, and the budget outlives this process. */
+        persistQuota()
       } catch (error) {
         warn(`[dsh-observer] 空闲提炼失败：${String((error       )?.message ?? error)}`)
       }
@@ -3474,6 +3694,8 @@ function createSupervisor(
         const outcome = await harvest('replaced')
         if (outcome.ok) log(`[dsh-observer] 主脑 ${mainSessionId} 被切片，后台提炼：${outcome.detail}`)
         else warn(`[dsh-observer] 主脑 ${mainSessionId} 被切片，未提炼：${outcome.detail}`)
+        /** The replacement harvest must never run twice, and only the ledger can promise that. */
+        persistQuota()
       } catch (error) {
         warn(`[dsh-observer] 切片后提炼失败：${String((error       )?.message ?? error)}`)
       }
@@ -5826,6 +6048,16 @@ export const monitorInternals = {
   DEFAULT_MONITOR_OPTIONS,
   createMonitorState,
   describeMonitorState,
+  /**
+   * ── v1.4 (W2-1/W2-2): FOLDED IN, NOT A NEW SEAM ──────────────────────────────────────────────
+   *
+   * The seam inventory is pinned by `test/test-seam-inventory.test.mjs`, and its first rule is to fold
+   * a new test seam into an object that already exists. Both of these answer a question about the
+   * monitor STATE ("what budget has this main used" / "was the timeline sane"), so they sit beside
+   * `createMonitorState` — the function whose zeroing they exist to correct.
+   */
+  hydrateMonitorState,
+  normaliseTimeline,
   failureNudgeText,
   graphNudgeText,
   harvestGate,

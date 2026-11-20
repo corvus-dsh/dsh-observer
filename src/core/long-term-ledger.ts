@@ -41,6 +41,22 @@ export interface MainRecord {
   nudges: number
   /** Every shape this main has been corrected for. A set, so a repeat is a repeat. */
   nudgedKinds: string[]
+  /**
+   * ── v1.4 (B4-0b-2 W2-1): THE BUDGET SURVIVES THE PROCESS ────────────────────────────────────
+   *
+   * `nudges` above already counted; what could not survive was the REST of the budget bookkeeping.
+   * A Host restart re-created the monitor state at zero, so the cap "four corrections per main" was
+   * really "four per main per process lifetime" — and the observer could re-nag the same main for the
+   * same shape, which the whole trigger design is built to prevent.
+   *
+   * `stalledTurns` is here for the same reason: it is a COUNT OF TURNS SINCE THE BOARD MOVED, and a
+   * turn boundary that survives a restart must not restart the count.
+   */
+  lastNudgeAt: number
+  lastNudgeSeq: number
+  stalledTurns: number
+  /** Whether the "this main was replaced, mine it" harvest already ran (it must never run twice). */
+  harvestedReplacement: boolean
 }
 
 export interface LongTermLedger {
@@ -82,6 +98,15 @@ export function parseLedger(raw: unknown): LongTermLedger {
       nudgedKinds: Array.isArray(entry.nudgedKinds)
         ? entry.nudgedKinds.filter((kind): kind is string => typeof kind === 'string')
         : [],
+      /**
+       * Tolerant on purpose: a ledger written by v1.3 has none of these, and "the file predates the
+       * field" must read as 0 / false — not as a torn row that drops the whole record, which would
+       * throw away the chain link the record is kept for.
+       */
+      lastNudgeAt: Number.isFinite(Number(entry.lastNudgeAt)) && Number(entry.lastNudgeAt) > 0 ? Number(entry.lastNudgeAt) : 0,
+      lastNudgeSeq: Number.isFinite(Number(entry.lastNudgeSeq)) && Number(entry.lastNudgeSeq) > 0 ? Number(entry.lastNudgeSeq) : 0,
+      stalledTurns: Number.isFinite(Number(entry.stalledTurns)) && Number(entry.stalledTurns) > 0 ? Number(entry.stalledTurns) : 0,
+      harvestedReplacement: entry.harvestedReplacement === true,
     })
   }
   return { version: 1, records: out }
@@ -118,12 +143,28 @@ export function upsertRecord(
     generation?: number
     at: number
     nudgedKind?: NudgeKind
+    /**
+     * ── v1.4 (W2-1): the ABSOLUTE budget, when the caller is the owner of the live state ───────
+     *
+     * `nudgedKind` increments — it records "another correction happened". `quota` SETS — it records
+     * "this is what the budget book now says", which is what a supervisor persisting its monitor
+     * state actually knows. Both exist because the two callers know different things, and deriving
+     * one from the other would double-count on every re-save.
+     */
+    quota?: {
+      nudges: number
+      lastNudgeAt: number
+      lastNudgeSeq: number
+      stalledTurns: number
+      harvestedReplacement: boolean
+    }
   },
 ): LongTermLedger {
   const existing = findRecord(ledger, patch.sessionId)
   const kinds = new Set(existing?.nudgedKinds ?? [])
   /** A kind already recorded is NOT added twice: the repeat is the fact, not the count. */
   if (patch.nudgedKind !== undefined && isKind(patch.nudgedKind)) kinds.add(patch.nudgedKind)
+  const quota = patch.quota
   const merged: MainRecord = {
     sessionId: patch.sessionId,
     generation:
@@ -135,8 +176,16 @@ export function upsertRecord(
         ? patch.sourceSessionId
         : existing?.sourceSessionId ?? '',
     lastServiceAt: patch.at,
-    nudges: (existing?.nudges ?? 0) + (patch.nudgedKind === undefined ? 0 : 1),
+    nudges:
+      quota !== undefined
+        ? Math.max(0, Number(quota.nudges) || 0)
+        : (existing?.nudges ?? 0) + (patch.nudgedKind === undefined ? 0 : 1),
     nudgedKinds: [...kinds].sort(),
+    lastNudgeAt: quota !== undefined ? Math.max(0, Number(quota.lastNudgeAt) || 0) : existing?.lastNudgeAt ?? 0,
+    lastNudgeSeq: quota !== undefined ? Math.max(0, Number(quota.lastNudgeSeq) || 0) : existing?.lastNudgeSeq ?? 0,
+    stalledTurns: quota !== undefined ? Math.max(0, Number(quota.stalledTurns) || 0) : existing?.stalledTurns ?? 0,
+    harvestedReplacement:
+      quota !== undefined ? quota.harvestedReplacement === true : existing?.harvestedReplacement === true,
   }
   const others = ledger.records.filter((record) => record.sessionId !== patch.sessionId)
   const next = [...others, merged].sort((left, right) => {
