@@ -2476,6 +2476,11 @@ const DEFAULT_MONITOR_OPTIONS                 = {
                                            
                                                                                           
                                
+     
+                                                                                                   
+                                                                                              
+     
+                             
                                                                                                      
                       
                      
@@ -2568,6 +2573,7 @@ function createMonitorState()               {
     pending: {},
     pendingTodo: {},
     failure: null,
+    unattributedResults: 0,
     stalledTurns: 0,
     lastTodoSeq: 0,
     everUsedTodo: false,
@@ -2934,6 +2940,24 @@ function stepMonitor(
     if (failed) {
       // A failed todo_write never changed the model's board, so its payload is dropped as well.
       if (callId.length > 0) delete state.pendingTodo[callId]
+      /**
+       * ── v1.4 (W2-3): A RESULT WITH NO `callId` DOES NOT ENTER THE STREAK ────────────────────────
+       *
+       * Measured shape: `tool` was `''` whenever the result carried no `callId`, so every such failure
+       * was filed under the SAME name, `'(unknown)'`. Four DIFFERENT tools failing once each — which is
+       * four unrelated problems — produced a four-long "(unknown) streak" and a correction telling the
+       * main it had retried the same tool repeatedly. That sentence was false, and it was false in the
+       * direction that makes a supervisor look stupid: the main had done nothing repeatedly.
+       *
+       * The streak's whole meaning is SAMENESS, and sameness is exactly what an unattributed result
+       * cannot establish. So it is counted separately and never compared. `unattributedResults` is
+       * shown in `observer_status`, because "results the observer could not attribute" is a fact the
+       * reader of a calm-looking report deserves to see.
+       */
+      if (callId.length === 0) {
+        state.unattributedResults += 1
+        return actions
+      }
       const name = tool.length > 0 ? tool : '(unknown)'
       if (state.failure !== null && state.failure.tool === name) {
         state.failure.count += 1
@@ -3203,6 +3227,8 @@ function describeMonitorState(
     nudges: state.nudges,
     lastNudgeAt: state.lastNudgeAt === 0 ? null : state.lastNudgeAt,
     clockRewind: state.clockRewind,
+    /** v1.4 (W2-3): 「无法归因的结果」也是要看的 —— 它意味着这个监理在这条日志上瞎了一块。 */
+    unattributedResults: state.unattributedResults,
     harvests: state.harvests,
     lastHarvestAt: state.lastHarvestAt === 0 ? null : state.lastHarvestAt,
     /** True once a slice of this main has been mined. */
@@ -3387,6 +3413,8 @@ function createSupervisor(
   let disposed = false
   /** Nudges/harvests already applied, so a duplicate feed delivery cannot double-act. */
   let busy = false
+  /** v1.4 (W2-4): actions decided while a delivery was in flight. Drained, never discarded. */
+  const deferred                  = []
 
   /**
    * ── v1.4 (W2-1): THE BUDGET IS WRITTEN BACK WHENEVER IT CHANGES ────────────────────────────────
@@ -3648,14 +3676,35 @@ function createSupervisor(
         armIdle()
         if (actions.length === 0) return
         if (busy) {
-          // Two decisions in one batch would mean two prompt admissions in the same instant. The
-          // state machine already spaces them by seq; this guard covers a slow first delivery.
-          warn(`[dsh-observer] 监理正在处理上一批动作，本批 ${actions.length} 个动作已跳过`)
+          /**
+           * ── v1.4 (W2-4): QUEUED, NOT DROPPED — BECAUSE THE SLOT IS ALREADY SPENT ─────────────────
+           *
+           * Measured shape: `monitor.ts` increments `nudges` when it DECIDES, and the busy guard here
+           * ran LATER and simply returned. A correction whose delivery landed inside a slow first
+           * delivery was therefore thrown away — and the budget had already been charged for it. The
+           * main never saw the hint, `observer_status` counted it as given, and one of the four
+           * corrections it is allowed was gone.
+           *
+           * Dropping was the wrong repair for a structural reason: ONLY the delivery can say whether a
+           * correction happened. So the action is kept and drained as soon as the channel is free.
+           */
+          deferred.push(...actions)
+          warn(
+            `[dsh-observer] 监理正在处理上一批动作，本批 ${actions.length} 个动作已入队（不丢：配额已扣，丢不起）`,
+          )
           return
         }
         busy = true
         try {
           await applyActions(actions)
+          /**
+           * DRAIN, then re-check: an event that arrives DURING the drain appends again, and the loop
+           * condition re-reads `deferred`. The order is preserved because the queue is FIFO.
+           */
+          while (deferred.length > 0) {
+            const next = deferred.splice(0, deferred.length)
+            await applyActions(next)
+          }
         } finally {
           busy = false
         }

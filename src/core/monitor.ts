@@ -144,6 +144,11 @@ export interface MonitorState {
   pendingTodo: Record<string, TodoSnapshot>
   /** The current same-tool failure streak, or null when the last result was a success. */
   failure: FailureStreak | null
+  /**
+   * v1.4 (W2-3): results that arrived WITHOUT a `callId`, so the observer could not say which tool
+   * produced them. Counted, never used as a streak: sameness cannot be established from them.
+   */
+  unattributedResults: number
   /** Closed turns since the TODO list last MOVED (a rewrite with the same content is not a move). */
   stalledTurns: number
   lastTodoSeq: number
@@ -236,6 +241,7 @@ export function createMonitorState(): MonitorState {
     pending: {},
     pendingTodo: {},
     failure: null,
+    unattributedResults: 0,
     stalledTurns: 0,
     lastTodoSeq: 0,
     everUsedTodo: false,
@@ -602,6 +608,24 @@ export function stepMonitor(
     if (failed) {
       // A failed todo_write never changed the model's board, so its payload is dropped as well.
       if (callId.length > 0) delete state.pendingTodo[callId]
+      /**
+       * ── v1.4 (W2-3): A RESULT WITH NO `callId` DOES NOT ENTER THE STREAK ────────────────────────
+       *
+       * Measured shape: `tool` was `''` whenever the result carried no `callId`, so every such failure
+       * was filed under the SAME name, `'(unknown)'`. Four DIFFERENT tools failing once each — which is
+       * four unrelated problems — produced a four-long "(unknown) streak" and a correction telling the
+       * main it had retried the same tool repeatedly. That sentence was false, and it was false in the
+       * direction that makes a supervisor look stupid: the main had done nothing repeatedly.
+       *
+       * The streak's whole meaning is SAMENESS, and sameness is exactly what an unattributed result
+       * cannot establish. So it is counted separately and never compared. `unattributedResults` is
+       * shown in `observer_status`, because "results the observer could not attribute" is a fact the
+       * reader of a calm-looking report deserves to see.
+       */
+      if (callId.length === 0) {
+        state.unattributedResults += 1
+        return actions
+      }
       const name = tool.length > 0 ? tool : '(unknown)'
       if (state.failure !== null && state.failure.tool === name) {
         state.failure.count += 1
@@ -871,6 +895,8 @@ export function describeMonitorState(
     nudges: state.nudges,
     lastNudgeAt: state.lastNudgeAt === 0 ? null : state.lastNudgeAt,
     clockRewind: state.clockRewind,
+    /** v1.4 (W2-3): 「无法归因的结果」也是要看的 —— 它意味着这个监理在这条日志上瞎了一块。 */
+    unattributedResults: state.unattributedResults,
     harvests: state.harvests,
     lastHarvestAt: state.lastHarvestAt === 0 ? null : state.lastHarvestAt,
     /** True once a slice of this main has been mined. */

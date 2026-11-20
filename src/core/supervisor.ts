@@ -198,6 +198,8 @@ export function createSupervisor(
   let disposed = false
   /** Nudges/harvests already applied, so a duplicate feed delivery cannot double-act. */
   let busy = false
+  /** v1.4 (W2-4): actions decided while a delivery was in flight. Drained, never discarded. */
+  const deferred: MonitorAction[] = []
 
   /**
    * ── v1.4 (W2-1): THE BUDGET IS WRITTEN BACK WHENEVER IT CHANGES ────────────────────────────────
@@ -459,14 +461,35 @@ export function createSupervisor(
         armIdle()
         if (actions.length === 0) return
         if (busy) {
-          // Two decisions in one batch would mean two prompt admissions in the same instant. The
-          // state machine already spaces them by seq; this guard covers a slow first delivery.
-          warn(`[dsh-observer] 监理正在处理上一批动作，本批 ${actions.length} 个动作已跳过`)
+          /**
+           * ── v1.4 (W2-4): QUEUED, NOT DROPPED — BECAUSE THE SLOT IS ALREADY SPENT ─────────────────
+           *
+           * Measured shape: `monitor.ts` increments `nudges` when it DECIDES, and the busy guard here
+           * ran LATER and simply returned. A correction whose delivery landed inside a slow first
+           * delivery was therefore thrown away — and the budget had already been charged for it. The
+           * main never saw the hint, `observer_status` counted it as given, and one of the four
+           * corrections it is allowed was gone.
+           *
+           * Dropping was the wrong repair for a structural reason: ONLY the delivery can say whether a
+           * correction happened. So the action is kept and drained as soon as the channel is free.
+           */
+          deferred.push(...actions)
+          warn(
+            `[dsh-observer] 监理正在处理上一批动作，本批 ${actions.length} 个动作已入队（不丢：配额已扣，丢不起）`,
+          )
           return
         }
         busy = true
         try {
           await applyActions(actions)
+          /**
+           * DRAIN, then re-check: an event that arrives DURING the drain appends again, and the loop
+           * condition re-reads `deferred`. The order is preserved because the queue is FIFO.
+           */
+          while (deferred.length > 0) {
+            const next = deferred.splice(0, deferred.length)
+            await applyActions(next)
+          }
         } finally {
           busy = false
         }
