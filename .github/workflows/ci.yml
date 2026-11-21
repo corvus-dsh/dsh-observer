@@ -196,6 +196,11 @@ jobs:
           node scripts/check-cycles.mjs
           node scripts/run-gate.mjs scripts/type-budget.mjs
           node scripts/check-readme-counts.mjs
+          # Test-file numbers must be unique WITHIN this repository (B4-0b-2 W5-1). Measured
+          # 2026-11-21: one number (`v274`) is already shared; that stock is baselined and any NEW
+          # collision fails. Same shape as the count gate above: the stock is recorded, growth is
+          # refused.
+          node scripts/check-test-numbers.mjs
 
       - name: Bundle purity (vs the previous commit)
         # ⚠️ THIS STEP IS NOT RED ON EVERY PUSH, AND THAT IS NOT A SKIP.
