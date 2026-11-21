@@ -171,6 +171,18 @@ jobs:
       - name: Syntax-check the shipped entry point
         run: node --check index.js
 
+      # ── PREFLIGHT RAN LOCALLY AND NEVER ON A PUSH ───────────────────────────────────────────────
+      #
+      # Measured 2026-11-21 by `scripts/check-check-parity.mjs`: `npm run check` starts with
+      # `node scripts/preflight.mjs` and this file did not mention it. `preflight` is not decoration —
+      # it is the check that the package's declared surface matches what is on disk — and it is the
+      # FIRST step of the local gate chain, so the local chain began with something CI never ran.
+      #
+      # It runs BEFORE `npm test` here (LOCAL order), not after: the local chain puts it first because
+      # a malformed manifest makes every later answer meaningless.
+      - name: Preflight (manifest and entry points agree)
+        run: npm run preflight
+
       - name: Test
         run: npm test
 
@@ -201,6 +213,9 @@ jobs:
           # collision fails. Same shape as the count gate above: the stock is recorded, growth is
           # refused.
           node scripts/check-test-numbers.mjs
+          # Test numbers must also be unique WITHIN this repository (B4-0b-2 W5-1). Already shared:
+          # one number. That stock is baselined; a NEW collision fails.
+          node scripts/check-check-parity.mjs
 
       - name: Bundle purity (vs the previous commit)
         # ⚠️ THIS STEP IS NOT RED ON EVERY PUSH, AND THAT IS NOT A SKIP.
