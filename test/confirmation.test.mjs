@@ -98,21 +98,44 @@ test('gate: asserted AND asked is allowed, and the evidence is cited', async () 
   assert.equal(verdict.askedAtSeq, 5)
 })
 
-test('gate: an unreadable log is UNVERIFIABLE — allowed, but reported', async () => {
-  const verdict = await checkConfirmation({
-    claimed: true,
-    sessionId: 's',
-    readLog: async () => { throw new Error('sessionQuery unavailable') },
-  })
-  assert.equal(verdict.ok, true, 'a capability of OURS must not cost the user their session')
-  assert.equal(verdict.evidence, 'unverifiable')
-  assert.match(verdict.warning, /未能核实/u)
+/**
+ * B4-B B6 — THE TWO "UNVERIFIABLE" CASES USED TO BE `ok: true`, AND BOTH ARE NOW REFUSED.
+ *
+ * This is a deliberate behaviour change, so the old case is not deleted — it is SPLIT, so the
+ * difference between 「our host cannot read logs」 and 「this id's log could not be read」 stays
+ * visible instead of collapsing back into one word:
+ *
+ *   (a) no reader at all  → `unavailable`, refused by DEFAULT, admitted by `allowUnverified`
+ *   (b) the read threw    → `unreadable`,  refused by DEFAULT, admitted by `allowUnverified`
+ *
+ * WHY (b) HAD TO CHANGE: measured, passing an id whose log throws produced `ok: true`, one created
+ * session and one ignition. An unreadable id and a FOREIGN id are the same observation, so a gate
+ * that admits the first cannot exclude the second — it was borrowable without a victim, only a typo.
+ */
+test('gate: no reader at all is UNAVAILABLE — refused by default, admitted only by operator config', async () => {
+  const refused = await checkConfirmation({ claimed: true, sessionId: 's', readLog: undefined })
+  assert.equal(refused.ok, false, '「cannot check」 must not be reported as 「checked and fine」')
+  assert.equal(refused.evidence, 'unavailable')
+  assert.match(refused.detail, /无法读取会话日志/u)
+
+  const admitted = await checkConfirmation({ claimed: true, sessionId: 's', readLog: undefined, allowUnverified: true })
+  assert.equal(admitted.ok, true, 'the operator can restore the old permissiveness — see allowUnverified')
+  assert.equal(admitted.evidence, 'unavailable')
+  assert.match(admitted.warning, /allowUnverified/u)
 })
 
-test('gate: no reader at all is unverifiable too', async () => {
-  const verdict = await checkConfirmation({ claimed: true, sessionId: 's', readLog: undefined })
-  assert.equal(verdict.ok, true)
-  assert.equal(verdict.evidence, 'unverifiable')
+test('gate: an unreadable log is UNREADABLE — and it is NOT the same fact as (a)', async () => {
+  const readLog = async () => {
+    throw new Error('sessionQuery unavailable')
+  }
+  const refused = await checkConfirmation({ claimed: true, sessionId: 's', readLog })
+  assert.equal(refused.ok, false, 'a failed read is the borrowable shape — it must not pass')
+  assert.equal(refused.evidence, 'unreadable')
+
+  const admitted = await checkConfirmation({ claimed: true, sessionId: 's', readLog, allowUnverified: true })
+  assert.equal(admitted.ok, true)
+  assert.equal(admitted.evidence, 'unreadable', 'still reported as its own word, not folded into (a)')
+  assert.match(admitted.warning, /allowUnverified/u)
 })
 
 /**
@@ -162,8 +185,61 @@ test('tool: asserted AND asked goes through, and the receipt cites the evidence'
 
   assert.equal(reply.ok, true, reply.text)
   assert.equal(reply.confirmation.evidence, 'asked')
-  assert.match(reply.text, /需求对齐：已核实/u)
+  assert.match(reply.text, /需求对齐：证据存在/u)
   assert.equal(tapeOf(harness.persistence, reply.sessionId).length, 8)
+})
+
+/**
+ * B4-B B6 — the ownership label, on the paths that can and cannot prove it.
+ *
+ * The tool's identity witness is `exec.agent.id`. `spawn()` above passes `{}`, so the host "named
+ * nobody" — the case that must stay runnable but must stop reading as verified.
+ */
+test('tool: an id the host cannot attribute is reported UNATTRIBUTED, not quietly verified', async () => {
+  const harness = boot({ askedUser: true })
+  const reply = await spawn(harness, { userConfirmed: true })
+
+  assert.equal(reply.ok, true, 'an unattributable host must not lose the feature outright')
+  assert.equal(reply.confirmation.ownership, 'unattributed', 'the receipt says what was NOT proven')
+  assert.match(reply.text, /归属核验：未核实/u)
+  assert.match(reply.text, /归属未核实/u, 'and the evidence line refuses to say 已核实 on its own')
+})
+
+test('tool: a MATCHING exec.agent.id is attributed, and the receipt says so', async () => {
+  const harness = boot({ askedUser: true })
+  const reply = await harness.tools.get('observer_spawn_main').execute(
+    { plan: '## 计划\n1. 做 A', observerSessionId: 'session-blank', userConfirmed: true },
+    { agent: { id: 'session-blank' } },
+  )
+
+  assert.equal(reply.ok, true, reply.text)
+  assert.equal(reply.confirmation.ownership, 'attributed')
+  assert.match(reply.text, /归属核验：已核实/u)
+  assert.match(reply.text, /需求对齐：已核实/u)
+})
+
+/**
+ * THE INCIDENT THIS FIXES, END TO END: the caller names a DIFFERENT session and borrows its evidence.
+ *
+ * `session-blank` is the one the harness stamps with an `ask_user_question` call. A caller whose own
+ * id is `session-other` must not be able to reach it — and must create nothing by trying.
+ */
+test('tool: naming another session is REFUSED, and creates nothing', async () => {
+  const harness = boot({ askedUser: true })
+  // The victim must have a resolvable cwd, otherwise the test would pass on CWD_REQUIRED instead.
+  harness.sessions.live.set('session-victim', { id: 'session-victim', header: { cwd: '/tmp/victim' } })
+
+  const reply = await harness.tools.get('observer_spawn_main').execute(
+    { plan: '## 计划\n1. 做 A', observerSessionId: 'session-victim', userConfirmed: true },
+    { agent: { id: 'session-other' } },
+  )
+
+  assert.equal(reply.ok, false, 'a foreign id must not borrow another session\'s confirmation')
+  assert.match(reply.text, /这个会话 id 不属于调用方/u)
+  assert.match(reply.text, /session-victim/u, 'the refusal names the id that did not belong')
+  assert.match(reply.text, /session-other/u, 'and the caller it belonged to instead')
+  assert.equal(harness.persistence.createCalls.length, 0, 'nothing was created')
+  assert.equal(harness.prompts.length, 0, 'nothing was ignited')
 })
 
 /**
@@ -204,7 +280,37 @@ test('refusal: it instructs the model to go and ASK, and forbids forging the fla
 
 test('refusal: an allowed verdict produces no text', async () => {
   /** v2.1.0: `skip`/`skipped` are gone from the signature; an allowed verdict is the evidence path. */
-  const verdict = await checkConfirmation({ claimed: true, sessionId: 's' })
+  const verdict = await checkConfirmation({
+    claimed: true,
+    sessionId: 's',
+    readLog: async () => ({ events: [{ type: 'tool/call', seq: 1, data: { name: ASK_TOOL_NAME } }] }),
+  })
   assert.equal(verdict.ok, true)
   assert.equal(confirmationRefusal(verdict), '')
+})
+
+/**
+ * B4-B B6 — THE ADVICE MUST MATCH THE MISSING FACT.
+ *
+ * A refusal that says 「go and ask the user」 to a session whose LOG was merely unreadable sends it
+ * round the loop: ask again, hit the same unreadable read, be refused again. So the two evidence
+ * words get their own paragraph, which names the actual problem and the real escape hatch (config,
+ * never an argument).
+ */
+test('refusal: unreadable / unavailable get their own advice, not 「go ask the user」', async () => {
+  const unreadable = await checkConfirmation({
+    claimed: true,
+    sessionId: 's',
+    readLog: async () => {
+      throw new Error('boom')
+    },
+  })
+  const text = confirmationRefusal(unreadable)
+  assert.match(text, /用户确认环节无法核实/u)
+  assert.match(text, /读不到/u)
+  assert.match(text, /allowUnverifiedConfirmation/u, 'the real escape hatch is named')
+  assert.doesNotMatch(text, /调用 `ask_user_question` 请用户确认/u, 'asking again would loop forever')
+
+  const unavailable = await checkConfirmation({ claimed: true, sessionId: 's', readLog: undefined })
+  assert.match(confirmationRefusal(unavailable), /没有可用的会话日志读取能力/u)
 })

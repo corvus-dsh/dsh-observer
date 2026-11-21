@@ -118,7 +118,7 @@ import {
  * a crash deep inside a half-built artifact.
  */
 import { ensureWriteAdapter, hasWriteAdapterProvider, setWriteAdapterProvider, writePathStatus } from './core/paradise-write.js'
-import { ASK_TOOL_NAME, checkConfirmation, confirmationRefusal, findAskEvidence } from './core/confirmation.js'
+import { ASK_TOOL_NAME, checkConfirmation, checkOwnership, confirmationRefusal, findAskEvidence } from './core/confirmation.js'
 /**
  * v1.9.0 — ONLY THE PROMPT TEXT AND THE MARKER COME FROM THE ARCHIVED IGNITION MODULE.
  *
@@ -1415,6 +1415,13 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
     plan: string,
     /** v1.6.0: the caller's assertion that the user approved this plan. */
     confirmation: { claimed: boolean } = { claimed: false },
+    /**
+     * B4-B B6: WHO is calling, as the host reported it (`exec.agent.id`), or `''` when the host did
+     * not say. Passed in rather than read here because this function is also reached from paths
+     * that have no tool invocation behind them — identity belongs to the ENTRY POINT, and a witness
+     * obtained any other way would not be one.
+     */
+    callerId = '',
   ): Promise<{
     ok: boolean
     sessionId: string
@@ -1427,8 +1434,15 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
     briefingSourceKind?: string
     /** v1.5.0: whether the main was actually woken, and through which channel. */
     ignition?: { attempted: boolean; ok: boolean; channel?: string; reason?: string; alreadyIgnited?: true }
-    /** v1.6.0: what the confirmation check found. */
-    confirmation?: { ok: boolean; evidence: string; askedAtSeq: number | null; detail: string }
+    /** v1.6.0: what the confirmation check found. B4-B B6 adds `ownership`. */
+    confirmation?: {
+      ok: boolean
+      evidence: string
+      askedAtSeq: number | null
+      detail: string
+      /** Was the named id PROVEN to be the caller's? Added by B4-B B6. */
+      ownership?: 'attributed' | 'unattributed'
+    }
     diskLog?: unknown
   }> => {
     if (observerSessionId.length === 0) {
@@ -1466,11 +1480,60 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       askedAtSeq: null,
       detail: '未执行检查',
     }
+    /** B4-B B6: whether the id was PROVEN to be the caller's, reported alongside the evidence. */
+    let ownershipReport: 'attributed' | 'unattributed' = 'unattributed'
     {
+      /**
+       * B4-B B6 — OWNERSHIP FIRST, THEN EVIDENCE.
+       *
+       * The gate reads evidence out of the log of whatever session the caller NAMES, so the id is
+       * part of the proof, not a routing detail. Checking it first keeps the two failures apart in
+       * the receipt: a foreign id is reported as `foreign`, not as 「日志里没有 ask_user_question」
+       * — which would send the caller off to ask the user about a session that is not theirs.
+       *
+       * `exec.agent.id` is the only identity this layer receives, and it is absent on some calls
+       * (a bare `execute(args, {})`, or a host that does not populate it). That case does NOT
+       * pretend the id is verified: it is admitted and LABELLED `unattributed`, which is what the
+       * success text then shows the reader.
+       */
+      const ownership = checkOwnership({
+        claimedId: observerSessionId,
+        callerId,
+      })
+      const allowUnverified = config.allowUnverifiedConfirmation === true
+      if (!ownership.ok) {
+        ctx.logger?.warn?.(
+          `[dsh-observer] incubation REFUSED for ${observerSessionId}: ownership ${ownership.reason} (${ownership.detail})`,
+        )
+        throw new InjectError(
+          'CONFIRMATION_REQUIRED',
+          'confirm',
+          [
+            '拒绝孵化：这个会话 id 不属于调用方。',
+            '',
+            `核实结果：${ownership.detail}`,
+            '',
+            '确认证据只对**发起孵化那个会话**成立：别人会话里问过的问题，不是这份方案被批准过。',
+            '',
+            '现在应当：',
+            '',
+            '1. 不要传 `observerSessionId`（默认就是当前会话），或者传**你自己**的会话 id；',
+            '2. 如果确实需要在别人的会话里孵化，先让**那个会话**把计划展示给它的用户并取得确认。',
+          ].join('\n'),
+        )
+      }
+      if (!ownership.attributed) {
+        ownershipReport = 'unattributed'
+        ctx.logger?.warn?.(`[dsh-observer] ownership UNATTRIBUTED for ${observerSessionId}: ${ownership.detail}`)
+      } else {
+        ownershipReport = 'attributed'
+      }
+
       const queryForEvidence = resolveService(ctx, 'sessionQuery', 'readSession')
       const verdict = await checkConfirmation({
         claimed: confirmation.claimed === true,
         sessionId: observerSessionId,
+        ...(allowUnverified ? { allowUnverified: true } : {}),
         readLog:
           isRecord(queryForEvidence) && typeof queryForEvidence.readSession === 'function'
             ? (id: string) => queryForEvidence.readSession(id)
@@ -1482,7 +1545,7 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
         )
         throw new InjectError('CONFIRMATION_REQUIRED', 'confirm', confirmationRefusal(verdict))
       }
-      if (verdict.evidence === 'unverifiable' && verdict.warning.length > 0) {
+      if ((verdict.evidence === 'unavailable' || verdict.evidence === 'unreadable') && verdict.warning.length > 0) {
         ctx.logger?.warn?.(`[dsh-observer] confirmation unverified: ${verdict.warning}`)
       }
       ctx.logger?.info?.(`[dsh-observer] confirmation check: ${verdict.evidence} — ${verdict.detail}`)
@@ -1830,11 +1893,26 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       `自动点火：${ignition.ok
         ? `${ignition.alreadyIgnited === true ? '该主脑已在运行（此前已点火）' : '已触发'}（via ${ignition.channel ?? 'n/a'}）`
         : `失败 —— ${ignition.reason ?? '未知原因'}${ignition.attempted ? '' : '（无可用点火通道）'}；主脑已创建，可手动打开`}`,
+      /**
+       * B4-B B6 — THE TEXT MUST NOT CLAIM MORE THAN THE CHECK PROVED.
+       *
+       * Two facts now travel separately, and the old single line welded them: `asked` says an
+       * `ask_user_question` exists in the named log; `ownership` says the named log is OURS. A receipt
+       * that prints 「已核实」 for a borrowed log is the very claim this fix exists to stop, so an
+       * unattributed id is printed as unverified even when the evidence was found.
+       */
       `需求对齐：${confirmationReport.evidence === 'asked'
-        ? `已核实（seq=${String(confirmationReport.askedAtSeq)} 调用过 ask_user_question）`
-        : confirmationReport.evidence === 'unverifiable'
-          ? '未核实（无法读取会话日志，按调用方声明处理）'
-          : '未完成'}`,
+        ? ownershipReport === 'attributed'
+          ? `已核实（本会话 seq=${String(confirmationReport.askedAtSeq)} 调用过 ask_user_question）`
+          : `证据存在（seq=${String(confirmationReport.askedAtSeq)} 调用过 ask_user_question），但**归属未核实**：本宿主未告知调用方身份，无法证明这条 id 是自己的`
+        : confirmationReport.evidence === 'unavailable'
+          ? '未核实（本宿主没有会话日志读取能力，按宿主配置 allowUnverifiedConfirmation 放行）'
+          : confirmationReport.evidence === 'unreadable'
+            ? '未核实（该会话日志读不到，按宿主配置 allowUnverifiedConfirmation 放行）'
+            : '未完成'}`,
+      `归属核验：${ownershipReport === 'attributed'
+        ? '已核实（该会话 id 就是调用方）'
+        : '未核实（宿主未提供 exec.agent.id）'}`,
       `用户确认：${confirmation.claimed === true ? '调用方声明已确认' : '未声明（跳过确认）'}`,
       /**
        * v1.5.0 — WHICH SURFACES THE TRANSCRIPT WILL SHOW, AND WHAT THE DISK ACTUALLY HOLDS.
@@ -1882,7 +1960,7 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
       briefingEventSeq: injected.briefingEventSeq,
       briefingSourceKind: injected.briefingSourceKind,
       ignition,
-      confirmation: confirmationReport,
+      confirmation: { ...confirmationReport, ownership: ownershipReport },
       diskLog,
       text,
     }
@@ -2094,9 +2172,14 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
          * incubation is `userConfirmed: true` PLUS evidence of an `ask_user_question` call — a fact
          * the host can check, not a claim the model can make.
          */
-        const spawned = await spawnMainFromObserver(observerSessionId, plan, {
-          claimed: args?.userConfirmed === true,
-        })
+        const spawned = await spawnMainFromObserver(
+          observerSessionId,
+          plan,
+          {
+            claimed: args?.userConfirmed === true,
+          },
+          typeof exec?.agent?.id === 'string' ? exec.agent.id : '',
+        )
         /**
          * v1.3.1 — THE SUCCESS PATH CARRIES THE SAME DIAGNOSTIC FIELD AS THE FAILURE PATH.
          *
@@ -2363,6 +2446,7 @@ export const ignitionInternals = {
 export const confirmationInternals = {
   ASK_TOOL_NAME,
   checkConfirmation,
+  checkOwnership,
   confirmationRefusal,
   findAskEvidence,
 }

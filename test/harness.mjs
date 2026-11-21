@@ -310,6 +310,42 @@ export function makeHost({
       if (name === 'sessionQuery') {
         return {
           async readSession(id) {
+            /**
+             * ── B4-B B6: EVERY LIVE SESSION HAS A READABLE LOG ────────────────────────────────
+             *
+             * The fixture used to answer only for `sourceId` and throw for anything else. That was
+             * invisible while the confirmation gate treated a failed read as 「unverifiable, allow」;
+             * once B6 made a failed read REFUSE, `session-blank-2` (a live session the fixture seeds
+             * itself, at `sessions.live.set`) started being refused for a limitation of the FIXTURE.
+             *
+             * A real host can read the log of a session that exists. So a live id falls through to
+             * the same log shape as the source, and only an id that is genuinely unknown throws —
+             * which keeps the distinction the gate now depends on: readable-but-no-ask (refuse),
+             * versus not-readable-at-all (refuse, for a different reason).
+             */
+            if (id !== sourceId && sessions.live.has(id)) {
+              const askEvents = askedUser
+                ? [
+                    {
+                      type: 'tool/call',
+                      seq: 0,
+                      time: 1,
+                      data: {
+                        turn: 1,
+                        step: 2,
+                        callId: `call-ask-${id}`,
+                        name: 'ask_user_question',
+                        arguments: '{"questions":[{"id":"plan","question":"确认这份计划？"}]}',
+                      },
+                    },
+                  ]
+                : []
+              return {
+                session: { id, cwd: headerCwd ?? cwd, ...(sourceHeader ?? {}) },
+                inheritedEventCount: 0,
+                events: askEvents,
+              }
+            }
             if (id === sourceId) {
               const stored = persistence.read(sourceId)
               if (stored !== undefined) return stored

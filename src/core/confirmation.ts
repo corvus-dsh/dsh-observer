@@ -32,10 +32,39 @@
 /** The built-in tool whose call IS the evidence that the user was asked. */
 export const ASK_TOOL_NAME = 'ask_user_question'
 
+/**
+ * ── B4-B B6: `unverifiable` WAS ONE WORD FOR TWO DIFFERENT FACTS ──────────────────────────────
+ *
+ * It used to cover both of these, and both were `ok: true`:
+ *
+ *   (a) THIS HOST has no log reader at all        — a limitation of OURS
+ *   (b) THIS SESSION's log could not be read      — `readLog` threw
+ *
+ * (b) is not a limitation of ours, and it is not a neutral state either: **it is the exact shape of
+ * borrowing somebody else's confirmation.** Measured (probe, 2026-11-21): passing an id whose log
+ * cannot be read produced `ok: true`, one created session and one ignition — with no victim that had
+ * ever confirmed anything. A caller that can pick the id and cannot be contradicted by a failed read
+ * does not need to attack the gate at all; it only needs to name a session the reader chokes on.
+ *
+ * The two facts also mean different things about the USER:
+ *
+ *   (a) "we cannot check" — the user may well have confirmed; we just have no way to see it.
+ *   (b) "we could not read THIS log" — and `ask_user_question` in a foreign session means THAT
+ *       session's user was asked. The plan being hatched now was never shown to them. Borrowing it
+ *       would assert 「this plan was shown」 on evidence that belongs to a different plan.
+ *
+ * So they are separate evidence words, and BOTH are refused by default. The operator can restore
+ * the old permissiveness with a CONFIG flag — never a tool argument. A model-facing
+ * `--unverified-ok` would be `skipConfirmation` again: a permission slip only the model can sign,
+ * about a conversation only the model is producing (see the v2.1.0 note below).
+ */
+export type ConfirmationEvidence = 'asked' | 'not-asked' | 'unavailable' | 'unreadable'
+
 export type ConfirmationVerdict =
   | { ok: true; evidence: 'asked'; askedAtSeq: number; detail: string }
-  | { ok: true; evidence: 'unverifiable'; askedAtSeq: null; detail: string; warning: string }
-  | { ok: false; evidence: 'not-asked'; askedAtSeq: null; detail: string }
+  /** (a) or (b), ADMITTED only because the operator turned the gate off for this host. */
+  | { ok: true; evidence: 'unavailable' | 'unreadable'; askedAtSeq: null; detail: string; warning: string }
+  | { ok: false; evidence: 'not-asked' | 'unavailable' | 'unreadable'; askedAtSeq: null; detail: string }
 
 /**
  * Find the LAST `ask_user_question` call in a session log.
@@ -81,8 +110,18 @@ export async function checkConfirmation(options: {
   claimed: boolean
   readLog?: (sessionId: string) => Promise<any>
   sessionId: string
+  /**
+   * B4-B B6: the OPERATOR's escape hatch, and it defaults to OFF.
+   *
+   * Who the id belongs to cannot always be established (`exec.agent.id` is missing on some hosts),
+   * and a host with no log service cannot verify anything. Refusing both forever would brick those
+   * hosts. So the permissive answer stays reachable — through CONFIG, which the person running the
+   * plugin controls, never through a tool argument, which the model controls.
+   */
+  allowUnverified?: boolean
 }): Promise<ConfirmationVerdict> {
   const { claimed, readLog, sessionId } = options
+  const allowUnverified = options.allowUnverified === true
 
   // 1. The explicit assertion. Without it, nothing else matters — do not even read the log.
   if (claimed !== true) {
@@ -94,28 +133,51 @@ export async function checkConfirmation(options: {
     }
   }
 
-  // 2. The evidence check.
+  /**
+   * 2. (a) THE HOST HAS NO READER.
+   *
+   * Refusing this by default is a real cost: a host that simply cannot expose `sessionQuery` loses
+   * incubation until its operator says otherwise. That is the trade B6 makes on purpose — the
+   * alternative was to keep treating "cannot check" as "checked and fine", which is how the gate
+   * came to be borrowable. `allowUnverified` is where that cost is paid, by the person who can
+   * actually judge it.
+   */
   if (typeof readLog !== 'function') {
-    return {
-      ok: true,
-      evidence: 'unverifiable',
-      askedAtSeq: null,
-      detail: '本宿主无法读取会话日志，无法核实是否调用过 ask_user_question',
-      warning: '未能核实确认证据（sessionQuery 不可用），请确保用户确实已确认',
+    const detail = '本宿主无法读取会话日志，无法核实是否调用过 ask_user_question'
+    if (allowUnverified) {
+      return {
+        ok: true,
+        evidence: 'unavailable',
+        askedAtSeq: null,
+        detail,
+        warning: '未能核实确认证据（sessionQuery 不可用），按宿主配置 allowUnverified 放行；请确保用户确实已确认',
+      }
     }
+    return { ok: false, evidence: 'unavailable', askedAtSeq: null, detail }
   }
 
+  /**
+   * 3. (b) THE READ ITSELF FAILED.
+   *
+   * THIS is the borrowable shape, and it is a refusal for a reason that has nothing to do with
+   * politeness: an unreadable id and a foreign id are the same observation. A gate that admits the
+   * first cannot exclude the second, so it does not gate anything.
+   */
   let snapshot: any
   try {
     snapshot = await readLog(sessionId)
   } catch (error) {
-    return {
-      ok: true,
-      evidence: 'unverifiable',
-      askedAtSeq: null,
-      detail: `读取会话日志失败：${String((error as any)?.message ?? error)}`,
-      warning: '未能核实确认证据（日志读取失败），请确保用户确实已确认',
+    const detail = `读取会话日志失败：${String((error as any)?.message ?? error)}`
+    if (allowUnverified) {
+      return {
+        ok: true,
+        evidence: 'unreadable',
+        askedAtSeq: null,
+        detail,
+        warning: '未能核实确认证据（日志读取失败），按宿主配置 allowUnverified 放行；请确保用户确实已确认',
+      }
     }
+    return { ok: false, evidence: 'unreadable', askedAtSeq: null, detail }
   }
 
   const events: any[] = snapshot !== null && typeof snapshot === 'object' && Array.isArray(snapshot.events) ? snapshot.events : []
@@ -139,6 +201,73 @@ export async function checkConfirmation(options: {
 }
 
 /**
+ * B4-B B6 — IS THIS ID THE CALLER'S OWN SESSION?
+ *
+ * The gate's evidence is read from the log of whatever session the caller NAMES. `ask_user_question`
+ * proves 「that session's user was asked about that session's plan」 — which is only the same fact as
+ * 「THIS plan was approved」 when the two ids are the same.
+ *
+ * `exec.agent.id` is the only identity this layer is handed, so it decides when it is present. When
+ * it is absent the question is unanswerable; `caller` describes that honestly rather than guessing,
+ * and the caller of this function decides what an unanswerable question is worth (see the tool
+ * handler — it refuses by default).
+ *
+ * WHY NOT COMPARE AGAINST THE PAIR TABLE: a first incubation has no pair yet, so "no binding" would
+ * be read as "not yours" and every legitimate first hatch would be refused. Identity, not bookkeeping.
+ */
+export function checkOwnership(options: {
+  claimedId: string
+  callerId: string
+}):
+  | { ok: true; attributed: true; reason: ''; detail: string }
+  | { ok: true; attributed: false; reason: ''; detail: string }
+  | { ok: false; attributed: false; reason: 'foreign'; detail: string } {
+  const claimedId = typeof options.claimedId === 'string' ? options.claimedId.trim() : ''
+  const callerId = typeof options.callerId === 'string' ? options.callerId.trim() : ''
+  /**
+   * ── TWO ADMITTED OUTCOMES, AND WHY THEY ARE NOT THE SAME ─────────────────────────────────────
+   *
+   * `attributed: true` — the host named the caller and it MATCHES. The evidence belongs to the
+   * session that is hatching, so the gate's conclusion stands on its own.
+   *
+   * `attributed: false` — the host named NOBODY (`exec.agent.id` absent). Ownership is UNANSWERABLE
+   * here, not "probably fine". It is admitted as a NAMED STATE: the receipt carries
+   * `ownership: 'unattributed'` and the success text says so, so a reader is never told
+   * 「已核实归属」 when nothing was checked. Refusing instead would brick incubation on every host
+   * that does not populate the field — trading one silent lie for one silent outage, and the
+   * dispatch forbids both.
+   *
+   * `ok: false` — the host named the caller and it DISAGREES. That is the only case where a FACT
+   * contradicts the claim, so it is the only case that refuses. The old behaviour had no such case
+   * at all: any id could be named.
+   */
+  if (callerId.length === 0) {
+    return {
+      ok: true,
+      attributed: false,
+      reason: '',
+      detail:
+        '本宿主没有把调用方身份交给工具（exec.agent.id 缺失），无法确认这个会话 id 属于调用方；' +
+        '已按未核实归属放行，并在回执里点名。',
+    }
+  }
+  if (claimedId.length === 0) {
+    return { ok: false, attributed: false, reason: 'foreign', detail: '没有可核对的会话 id' }
+  }
+  if (claimedId !== callerId) {
+    return {
+      ok: false,
+      attributed: false,
+      reason: 'foreign',
+      detail:
+        `调用方是 ${callerId}，但要求的发起会话是 ${claimedId}。` +
+        '确认证据只能来自发起孵化那个会话自己的日志 —— 别人的会话里问过的问题，不是本项目方案被批准过。',
+    }
+  }
+  return { ok: true, attributed: true, reason: '', detail: `该会话 id 就是调用方（${callerId}）` }
+}
+
+/**
  * The refusal body for a failed confirmation check.
  *
  * Kept next to the check so the two cannot drift: the text names the exact missing fact the code
@@ -146,6 +275,36 @@ export async function checkConfirmation(options: {
  */
 export function confirmationRefusal(verdict: ConfirmationVerdict): string {
   if (verdict.ok) return ''
+  /**
+   * B4-B B6 — THE ADVICE HAS TO MATCH THE MISSING FACT.
+   *
+   * 「没有 ask_user_question 记录」 and 「日志读不到」 are different situations and a caller that gets
+   * the wrong advice retries forever: told to "go and ask the user", a session whose log is merely
+   * unreadable will ask again, get the same unreadable result, and loop. So `unavailable` / `unreadable`
+   * get their own paragraph that says what is actually wrong — ours, or the id's.
+   */
+  if (verdict.evidence === 'unavailable' || verdict.evidence === 'unreadable') {
+    const why =
+      verdict.evidence === 'unavailable'
+        ? '这个宿主没有可用的会话日志读取能力（sessionQuery 不可用）。'
+        : '这个会话的日志读不到 —— 注意：点名一个读不到的会话，和点名别人的会话，在本层是同一个观测。'
+    return [
+      '拒绝孵化：用户确认环节无法核实。',
+      '',
+      `核实结果：${verdict.detail}`,
+      '',
+      why,
+      '',
+      '这不再是「放行并告警」：不核实就孵化一个**自动开跑**的主脑，等于把「用户看过这份方案」当成推定事实。',
+      '',
+      '现在应当：',
+      '',
+      `1. 确认你用的是**自己这个会话**的 id（\`observerSessionId\` 默认就是当前会话，不要指向别的会话）；`,
+      '2. 如果只是想在本会话里孵化，去掉 `observerSessionId` 参数即可；',
+      '3. 如果确实是宿主的日志能力缺失，这是运维决定：由插件配置 `allowUnverifiedConfirmation: true` 放行，',
+      '   **不要**为了通过检查而试图把这个开关当参数传 —— 它不是工具参数，传了会被 schema 拒绝。',
+    ].join('\n')
+  }
   return [
     '拒绝孵化：用户确认环节没有完成。',
     '',
