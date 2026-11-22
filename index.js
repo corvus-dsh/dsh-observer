@@ -106,7 +106,16 @@ function pairKeyOf(a        , b        )         {
                                                      
                                             
                                                                                                                                                    
-                                                       
+     
+                                                                  
+    
+                                                                                                  
+                                                                                                   
+                                                                                                     
+                                                                                                   
+                                                               
+     
+                                                                                               
      
                                             
     
@@ -473,12 +482,24 @@ function readRaw()                     {
     return pair !== undefined && pair.observerSessionId === sessionId
   }
 
-  function takeFocus()                                           {
+  function takeFocus()                                                                                   {
     const focus = state.focus
-    if (focus === null) return null
+    if (focus === null) return { ok: true, focus: null }
     state.focus = null
-    save()
-    return focus
+    const written = save()
+    if (written.ok) return { ok: true, focus }
+    /**
+     * v8.x B12 (P0) — THE WRITE DID NOT LAND, SO MEMORY MUST NOT CLAIM IT DID.
+     *
+     * The old shape was `state.focus = null; save()` with the result discarded: a refused write (a
+     * read-only table, a directory in the way, a foreign edit) left memory saying 「focus consumed」
+     * while the file still carried it. Then ANY later `save()` — `recordPair`, `bindLegacy`,
+     * `followTransfer` — merges the disk rows back in (`mergeForeignRows`), and the one-shot request
+     * the UI already acknowledged reappears. Restoring `state.focus` makes the failure stop at the
+     * receipt instead of leaking into the next write.
+     */
+    state.focus = focus
+    return { ok: false, focus, ...(written.error === undefined ? {} : { error: written.error }) }
   }
 
   return {
@@ -4257,14 +4278,40 @@ function bindPair(
   mainSessionId        ,
   observerSessionId        ,
   origin                        ,
-)                                                                             {
+)                                                                                                                {
   const written = recordPair(observerSessionId, mainSessionId, origin)
   if (written.ok) return { ok: true, pairRecorded: true, dissolved: written.dissolved }
   store().bindLegacy(mainSessionId, observerSessionId)
   const fallback = save()
+  /**
+   * v8.x B12 (P0) — A DEGRADED BINDING MUST BE ONE THE DISK ACTUALLY HAS.
+   *
+   * The fallback above writes the legacy view so a reader is not left staring at a blank panel. That
+   * is only honest while the fallback write LANDS. When it does not, the old code returned `ok:false`
+   * and left the binding in memory anyway: the tool said the bind failed, `observer_status` showed a
+   * binding, and a restart showed nothing — the two halves disagreeing about one fact, with the
+   * memory half being the one nobody could act on.
+   *
+   * So the failure is rolled back in memory and NAMED in the receipt (`degraded: 'none'`), instead of
+   * being left to be discovered after the next restart. `degraded: 'legacy-only'` is the surviving,
+   * genuinely-degraded case: the pair table is missing but the binding is on disk.
+   */
+  if (fallback.ok) {
+    return {
+      ok: false,
+      pairRecorded: false,
+      degraded: 'legacy-only',
+      error: written.error ?? 'pair table write failed',
+    }
+  }
+  store().mutate((st) => {
+    if (st.bindings[mainSessionId] === observerSessionId) delete st.bindings[mainSessionId]
+    if (st.reverse[observerSessionId] === mainSessionId) delete st.reverse[observerSessionId]
+  })
   return {
     ok: false,
     pairRecorded: false,
+    degraded: 'none',
     error: written.error ?? fallback.error ?? 'pair table write failed',
   }
 }
@@ -4339,7 +4386,7 @@ function followTransfer(
   return { followed: true, role, otherSessionId }
 }
 
-function takeFocus()                                           {
+function takeFocus()                                                                                   {
   return store().takeFocus()
 }
 
@@ -5100,11 +5147,22 @@ export function apply(ctx                   , config                          = 
      */
     const bound = bindPair(mainSessionId, observerSessionId, 'summoned')
     if (!bound.ok) {
+      /**
+       * v8.x B12 (P0): THE TEXT MUST MATCH WHAT LANDED.
+       *
+       * Both branches used to say 「旧式视图已写入」. That sentence is true only when the fallback
+       * write landed (`degraded: 'legacy-only'`); when the store refused BOTH writes the binding is
+       * gone from memory too (`degraded: 'none'`), and telling the caller the UI still shows it is how
+       * a caller concludes the bind half-worked and stops looking.
+       */
       return {
         ok: false,
         observerSessionId,
         pairRecorded: false,
-        text: `绑定表写入失败：${bound.error}（旧式视图已写入，但这一对不会跟随切片、重启也不会恢复监理）`,
+        text:
+          bound.degraded === 'legacy-only'
+            ? `绑定表写入失败：${bound.error}（旧式视图已写入，但这一对不会跟随切片、重启也不会恢复监理）`
+            : `绑定表写入失败：${bound.error}（旧式视图也没写成，绑定已从内存回滚：重启与面板都不会看到它）`,
       }
     }
     load()
@@ -6128,6 +6186,12 @@ export function apply(ctx                   , config                          = 
           // (the whole plugin half never mounts). `oneOf` IS supported.
           focus: { oneOf: [{ type: 'object' }, { type: 'null' }] },
           focusConsumed: { type: 'boolean' },
+          /**
+           * v8.x B12: WHY an `ackFocus` was refused (`UNATTRIBUTED` / `NOT_YOUR_FOCUS` /
+           * `FOCUS_WRITE_FAILED`). Absent when the ack was accepted or never requested — a refusal
+           * with a code is actionable, a silently-kept focus is not.
+           */
+          focusRefusal: { type: 'string' },
           /** v1.7.0: one entry per supervised main. An empty map means nothing was incubated. */
           supervisors: { type: 'object' },
           /** v0.42 (A4): `{ path, readOnly, mergedOnLastSave }` — a degraded store must look degraded. */
@@ -6143,17 +6207,43 @@ export function apply(ctx                   , config                          = 
       },
       render: (_args         , value     ) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
-    execute: async (args                        ) => {
+    execute: async (args                        , exec     ) => {
       const snapshot = store().snapshot()
       const pending = snapshot.focus
-      if (args?.ackFocus === true) takeFocus()
+      /**
+       * ── v8.x B12 (P0): «THIS IS MINE» MUST BE ANSWERED FROM THE CALLER, NOT FROM THE REQUEST ────
+       *
+       * `ackFocus` used to consume the ONE global focus note for ANY caller: `observer_status({ackFocus:
+       * true})` from an unrelated session retired a request that belonged to another one. The focus
+       * note names the session the user should be looking at (`focus.sessionId`), so the caller can be
+       * checked against it — and the same function that writes the note already stores exactly that.
+       *
+       * A caller whose id is unknown is refused rather than trusted: 「I cannot tell who you are」 is
+       * not evidence that the note is yours. The refusal is NAMED and the note is left in place, so a
+       * second, legitimate caller can still consume it.
+       */
+      const callerSessionId = typeof exec?.agent?.id === 'string' ? exec.agent.id.trim() : ''
+      let focusConsumed = false
+      let focusRefusal                    
+      if (args?.ackFocus === true && pending !== null) {
+        if (callerSessionId.length === 0) {
+          focusRefusal = 'UNATTRIBUTED: the caller session id is unknown, so this focus cannot be proven to be yours'
+        } else if (pending.sessionId !== callerSessionId) {
+          focusRefusal =
+            `NOT_YOUR_FOCUS: this focus belongs to ${pending.sessionId}, not to ${callerSessionId}`
+        } else {
+          const taken = takeFocus()
+          if (taken.ok) focusConsumed = true
+          else focusRefusal = `FOCUS_WRITE_FAILED: ${taken.error ?? 'the binding store refused the write'}`
+        }
+      }
       const supervisorView                          = {}
       for (const [mainId, supervisor] of supervisors.entries()) supervisorView[mainId] = supervisor.describe()
       return {
         ok: true,
         bindings: { ...snapshot.bindings },
         reverse: { ...snapshot.reverse },
-        focus: pending === null ? null : { ...pending },
+        focus: focusConsumed || pending === null ? null : { ...pending },
         supervisors: supervisorView,
         /**
          * ── v0.42 (B4-0b-1 A4): THE STORE'S OWN HEALTH ─────────────────────────────────────────
@@ -6166,7 +6256,14 @@ export function apply(ctx                   , config                          = 
          */
         bindingStore: store().health(),
         paradise: paradiseStatus(),
-        ...(args?.ackFocus === true ? { focusConsumed: true } : {}),
+        /**
+         * v8.x B12: `focusConsumed` now means CONSUMED, not 「an ack was requested」. The old line was
+         * keyed on the ARGUMENT, so a refused consumption still reported success — the receipt agreed
+         * with the request instead of with the store. `focusRefusal` names the reason and the note is
+         * still pending (`focus` above is not null), so the next legitimate caller can still take it.
+         */
+        ...(focusConsumed ? { focusConsumed: true } : {}),
+        ...(focusRefusal === undefined ? {} : { focusRefusal }),
       }
     },
   })

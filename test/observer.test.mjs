@@ -194,10 +194,35 @@ test('observer: focus is one-shot — ack consumes it exactly once', async () =>
   assert.equal(state.focus.sessionId, 'main-2')
 
   const status = tools.get('observer_status')
-  const first = await status.execute({ ackFocus: true })
+  /**
+   * v8.x B12: the ack is now answered from the CALLER (`exec.agent.id`) against `focus.sessionId`,
+   * so this call must say who it is. The old form passed no identity at all and still consumed the
+   * note — that is exactly the defect the new assertion below pins in the other direction.
+   */
+  const first = await status.execute({ ackFocus: true }, { agent: { id: 'main-2' } })
   assert.equal(first.focusConsumed, true)
-  const second = await status.execute({ ackFocus: true })
+  const second = await status.execute({ ackFocus: true }, { agent: { id: 'main-2' } })
   assert.equal(second.focus, null, 'a second ack finds nothing — safe on a remount')
+})
+
+test('observer: a focus note is NOT consumed by a session it does not name', async () => {
+  const { tools } = boot()
+  await tools.get('observer_create').execute({}, { agent: { id: 'main-1' } })
+  assert.equal(debugFollowTransfer('main-1', 'main-2').followed, true)
+
+  const status = tools.get('observer_status')
+  const foreign = await status.execute({ ackFocus: true }, { agent: { id: 'some-other-session' } })
+  assert.equal(foreign.focusConsumed, undefined, 'a foreign session must not consume the note')
+  assert.match(String(foreign.focusRefusal), /^NOT_YOUR_FOCUS/u)
+  assert.equal(debugObserverState().focus.sessionId, 'main-2', 'and the note is still pending')
+
+  const anonymous = await status.execute({ ackFocus: true }, undefined)
+  assert.equal(anonymous.focusConsumed, undefined, 'an anonymous caller must not consume it either')
+  assert.match(String(anonymous.focusRefusal), /^UNATTRIBUTED/u)
+
+  // ...and the legitimate owner still can, afterwards. A refusal must not be a permanent mute.
+  const owner = await status.execute({ ackFocus: true }, { agent: { id: 'main-2' } })
+  assert.equal(owner.focusConsumed, true)
 })
 
 test('observer: an unknown transfer changes nothing', () => {

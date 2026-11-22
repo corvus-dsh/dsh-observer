@@ -143,7 +143,16 @@ export interface BindingStore {
   pairOf(sessionId: string): ObserverPair | undefined
   isObserverHalf(sessionId: string): boolean
   recordPair(observerSessionId: string, mainSessionId: string, origin: ObserverPair['origin']): { ok: boolean; error?: string; dissolved?: number }
-  takeFocus(): { sessionId: string; at: number } | null
+  /**
+   * v8.x B12 (P0): the `save()` result is now part of the answer.
+   *
+   * Was `{sessionId, at} | null` and the write result was DROPPED (`state.focus = null; save()`).
+   * A refused write therefore cleared memory while the file still carried the focus — and the next
+   * `save()` from any other operation folded that stale focus back in, so the request the UI already
+   * said it consumed came back. `ok:false` + `focus` restored is the only shape that lets a caller
+   * both report the failure AND stay consistent with the disk.
+   */
+  takeFocus(): { ok: boolean; focus: { sessionId: string; at: number } | null; error?: string }
   /**
    * 在**同一份状态**上做一次受控改写，然后由调用方决定是否 `save()`。
    *
@@ -510,12 +519,24 @@ function readRaw(): string | undefined {
     return pair !== undefined && pair.observerSessionId === sessionId
   }
 
-  function takeFocus(): { sessionId: string; at: number } | null {
+  function takeFocus(): { ok: boolean; focus: { sessionId: string; at: number } | null; error?: string } {
     const focus = state.focus
-    if (focus === null) return null
+    if (focus === null) return { ok: true, focus: null }
     state.focus = null
-    save()
-    return focus
+    const written = save()
+    if (written.ok) return { ok: true, focus }
+    /**
+     * v8.x B12 (P0) — THE WRITE DID NOT LAND, SO MEMORY MUST NOT CLAIM IT DID.
+     *
+     * The old shape was `state.focus = null; save()` with the result discarded: a refused write (a
+     * read-only table, a directory in the way, a foreign edit) left memory saying 「focus consumed」
+     * while the file still carried it. Then ANY later `save()` — `recordPair`, `bindLegacy`,
+     * `followTransfer` — merges the disk rows back in (`mergeForeignRows`), and the one-shot request
+     * the UI already acknowledged reappears. Restoring `state.focus` makes the failure stop at the
+     * receipt instead of leaking into the next write.
+     */
+    state.focus = focus
+    return { ok: false, focus, ...(written.error === undefined ? {} : { error: written.error }) }
   }
 
   return {

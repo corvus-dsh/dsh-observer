@@ -114,11 +114,17 @@ test('v245 ③: 重启（同一份绑定文件再 apply）之后，监理为这�
   assert.deepEqual(debugObserverState().bindings, { 'main-c': 'obs-c' }, '重启后绑定仍在')
 })
 
-test('v245 ④: 退化路径（配对写失败）如实回 ok:false —— 不许把「UI 看得见」当成「机制知道」', async () => {
+test('v245 ④: 退化路径（两次写都失败）如实回 ok:false，且内存不留脏绑定', async () => {
   /**
-   * Force the pair write to fail by making the bindings path a DIRECTORY: `writeAtomic` cannot
-   * rename a temp file onto it. The legacy view is written in memory, so the UI would still show a
-   * binding — which is exactly the state the old code reported as success.
+   * Force BOTH writes to fail by making the bindings path a DIRECTORY: `writeAtomic` cannot rename a
+   * temp file onto it. `recordPair` therefore fails AND the legacy fallback fails.
+   *
+   * v8.x B12 (P0): the old assertion here was 「旧式视图已写入」 — and it PASSED, because the code
+   * said so. It was not true in this scenario: neither write landed, yet the legacy maps were left in
+   * memory, so `observer_status` showed a binding that the file did not have. The sentence and the
+   * memory were both lying in the same direction, which is why the test could not see it. Now the
+   * assertion is on the STATE, not on the wording: after a double write failure there must be no
+   * binding in memory to disagree with the disk.
    */
   const root = mkdtempSync(join(tmpdir(), 'dsh-v245-bad-'))
   const bindingsPath = join(root, 'as-a-directory')
@@ -129,5 +135,11 @@ test('v245 ④: 退化路径（配对写失败）如实回 ok:false —— 不�
   const bound = await tools.get('observer_bind').execute({ mainSessionId: 'main-d', observerSessionId: 'obs-d' })
   assert.equal(bound.ok, false, '配对表写不成时必须说 false')
   assert.equal(bound.pairRecorded, false)
-  assert.match(String(bound.text), /旧式视图已写入/u)
+  assert.match(String(bound.text), /也没写成/u, `回执必须说清两次写都没落地；实测：${bound.text}`)
+  assert.deepEqual(
+    debugObserverState().bindings,
+    {},
+    '写失败不得留下内存绑定：面板看得见、磁盘没有，是同一事实的两半在互相矛盾',
+  )
+  assert.deepEqual(debugObserverState().reverse, {}, '反向映射也必须回滚')
 })
