@@ -106,7 +106,52 @@ test('v235 ⑧: 5 轮用过 ≥3 种工具且从未调 memory_graph_update ⇒ �
 test('v235 ⑨: 同样多步，但日志里调过 memory_graph_update ⇒ 不产出（条件 ② 独立生效）', () => {
   const { actions, state } = run({ turns: STALL_TURNS_LIMIT, toolsPerTurn: THREE, includeGraphCall: true })
   assert.equal(graphNudges(actions).length, 0, '建过图就不该被要求建图')
-  assert.equal(state.sawGraphTool, true)
+  /**
+   * ── G-10 (OBS-01): THE FIELD SPLIT, AND THIS ASSERTION IS WHY IT MATTERS ───────────────────────
+   *
+   * `sawGraphTool` became `sawGraphAttempt` + `sawGraphWrite`. Here BOTH are true — the call was made and
+   * the call succeeded — which is precisely the case that must suppress. ⑨b below covers the case where
+   * they differ, which is the defect.
+   */
+  assert.equal(state.sawGraphAttempt, true, '调过 ⇒ attempt 为真')
+  assert.equal(state.sawGraphWrite, true, '且成功 ⇒ write 为真')
+})
+
+test('v235 ⑨b (G-10, OBS-01): a REFUSED graph call is not 「建过图」 — the reminder must still fire', () => {
+  /**
+   * THE DEFECT, measured by the lead: `sawGraphTool` was set on `tool/call`, so ONE refused
+   * `memory_graph_update` silenced the graph reminder for the life of the main. 「试过」 was read as
+   * 「写成了」.
+   *
+   * This drives the same five-turn multi-step shape as ⑨, but the graph call FAILS.
+   */
+  const state = createMonitorState()
+  const opts = { ...DEFAULT_MONITOR_OPTIONS, now: () => 1_000_000 }
+  const actions = []
+  let callIndex = 0
+
+  /* A refused graph call: the tool/result carries `isError`. */
+  const refusedId = `pre-${(callIndex += 1)}`
+  actions.push(...stepMonitor(state, toolCall('memory_graph_update', refusedId), opts))
+  actions.push(...stepMonitor(
+    state,
+    { type: 'tool/result', seq: nextSeq(), data: { message: { isError: true, source: { callId: refusedId } } } },
+    opts,
+  ))
+
+  for (let turn = 0; turn < STALL_TURNS_LIMIT; turn += 1) {
+    for (const tool of THREE) {
+      const id = `c${(callIndex += 1)}`
+      actions.push(...stepMonitor(state, toolCall(tool, id), opts))
+      actions.push(...stepMonitor(state, toolResult(id), opts))
+    }
+    actions.push(...stepMonitor(state, turnEnd(), opts))
+  }
+
+  assert.equal(state.sawGraphAttempt, true, '前提确认：它确实调过（intent 有证据）')
+  assert.equal(state.sawGraphWrite, false, '但没写成 —— 不得被记成有图')
+  assert.equal(graphNudges(actions).length, 1,
+    `失败的一次调用不许把提醒永久关掉；实测 ${graphNudges(actions).length} 条`)
 })
 
 // ── ⑩ 多步证据不足 ⇒ 不产出 ────────────────────────────────────────────────────────────────
@@ -221,14 +266,20 @@ test('v235 ⑬: 文案含 NUDGE_MARKER，且点出 memory_graph_update 与 boots
 test('v235 ⑭: describeMonitorState 报告 graph 触发器的四个事实（哑了还是没到条件，要能区分）', () => {
   const before = describeMonitorState(createMonitorState())
   assert.ok(before.graph !== undefined, '必须有一段 graph 读数 —— 否则运维无法区分「哑了」与「没到条件」')
-  assert.equal(before.graph.sawTool, false)
+  /**
+   * G-10: one `sawTool` became `sawAttempt` + `sawWrite`. BOTH must be printed — a readout that shows one
+   * of the two invites the next reader to repeat the exact confusion (「试过」 read as 「写成了」).
+   */
+  assert.equal(before.graph.sawAttempt, false)
+  assert.equal(before.graph.sawWrite, false)
   assert.equal(before.graph.nudged, false)
   assert.equal(before.graph.distinctToolsRecent, 0)
   assert.equal(before.graph.windowTurns, 0)
 
   const { state } = run({ turns: STALL_TURNS_LIMIT, toolsPerTurn: THREE })
   const after = describeMonitorState(state)
-  assert.equal(after.graph.sawTool, false)
+  assert.equal(after.graph.sawAttempt, false, '没调过图工具')
+  assert.equal(after.graph.sawWrite, false, '更没写成')
   assert.equal(after.graph.nudged, true, '发过之后必须能读出来')
   assert.equal(after.graph.distinctToolsRecent, 3)
   assert.equal(after.graph.windowTurns, STALL_TURNS_LIMIT, '窗口轮数被 stallTurns 限制住，不是无限累积')
@@ -236,6 +287,26 @@ test('v235 ⑭: describeMonitorState 报告 graph 触发器的四个事实（哑
   /** 另一种「哑」的原因：图已建。两者要靠不同字段区分。 */
   const built = run({ turns: STALL_TURNS_LIMIT, toolsPerTurn: THREE, includeGraphCall: true })
   const builtView = describeMonitorState(built.state)
-  assert.equal(builtView.graph.sawTool, true)
+  assert.equal(builtView.graph.sawAttempt, true, '调过')
+  assert.equal(builtView.graph.sawWrite, true, '而且成功了 —— 这才是「有图」')
   assert.equal(builtView.graph.nudged, false, '建过图 ⇒ 没发过，而且不该发 —— 与「哑了」完全不同')
+
+  /**
+   * ── THE CASE THAT ONE FIELD COULD NOT EXPRESS (G-10) ───────────────────────────────────────────
+   *
+   * Attempted but refused: `sawAttempt: true` + `sawWrite: false`. With a single `sawTool` this row was
+   * indistinguishable from 「建过图」, and it suppressed the reminder.
+   */
+  const refusedState = createMonitorState()
+  const opts = { ...DEFAULT_MONITOR_OPTIONS, now: () => 1_000_000 }
+  const refusedId = 'pre-refused'
+  stepMonitor(refusedState, toolCall('memory_graph_update', refusedId), opts)
+  stepMonitor(
+    refusedState,
+    { type: 'tool/result', seq: nextSeq(), data: { message: { isError: true, source: { callId: refusedId } } } },
+    opts,
+  )
+  const refusedView = describeMonitorState(refusedState)
+  assert.equal(refusedView.graph.sawAttempt, true, '试过')
+  assert.equal(refusedView.graph.sawWrite, false, '但没写成')
 })

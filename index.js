@@ -2691,10 +2691,17 @@ const DEFAULT_MONITOR_OPTIONS                 = {
                                                                                                    
                          
     
-                                                                                                      
-                                                                             
+                                                                                        
+    
+                                                                                                   
+                                                                                                  
+                                                                                                          
+    
+                                                                                    
      
-                       
+                          
+                                                                                                 
+                        
      
                                                                                               
                                                                      
@@ -2757,7 +2764,8 @@ function createMonitorState()               {
     stalledTurns: 0,
     lastTodoSeq: 0,
     everUsedTodo: false,
-    sawGraphTool: false,
+    sawGraphAttempt: false,
+    sawGraphWrite: false,
     toolsThisTurn: [],
     recentTurnTools: [],
     graphNudged: false,
@@ -2974,8 +2982,19 @@ function graphNudgeText(turns        , distinctTools        )         {
  * fired — the stall branch uses that to yield for one step rather than talk over it.
  */
 function maybeGraphNudge(state              , options                , seq        , actions                 )          {
-  /** ② already has a graph, or this trigger has already spoken: nothing to do, forever. */
-  if (state.sawGraphTool === true || state.graphNudged === true) return false
+  /**
+   * ② the graph EXISTS, or this trigger has already spoken: nothing to do, forever.
+   *
+   * ── G-10 (OBS-01): `sawGraphWrite`, NOT 「it once called the tool」 ────────────────────────────
+   *
+   * The guard used to read `sawGraphTool`, which was set on `tool/call` — so a REFUSED
+   * `memory_graph_update` silenced this reminder for the life of the main. 「试过」 is evidence of
+   * intent; only 「写成了」 is evidence the graph exists, and only that may suppress.
+   *
+   * Measured (lead, OBS-01): a failed call still flipped the flag, and the main never heard about the
+   * graph again. Deliberately NOT keyed on `sawGraphAttempt` — see the fields in `MonitorState`.
+   */
+  if (state.sawGraphWrite === true || state.graphNudged === true) return false
   /** Not enough log to call it "多步" yet — the window needs `stallTurns` turns in it. */
   if (state.turnsClosed < options.stallTurns) return false
   /** ① multi-step evidence: DISTINCT kinds, because one tool called forty times is one kind. */
@@ -3085,14 +3104,23 @@ function stepMonitor(
     if (callId.length === 0 || name.length === 0) return actions
     state.pending[callId] = name
     /**
-     * v0.39: the two facts the graph trigger needs, recorded when the CALL is seen.
+     * ── G-10 (P1, OBS-01): 「试过」与「写成了」是两个事实，而这里只有一个 ─────────────────────────
      *
-     * `sawGraphTool` is "did it ever try" — a failed call still answers yes, and waiting for a settle
-     * would leave the trigger blind to exactly the main whose graph calls never came back.
-     * `toolsThisTurn` is the multi-step evidence, deduplicated per turn: calling one tool forty times
-     * is one kind of tool, not forty.
+     * The comment above said the right thing and the code did not follow it:
+     *
+     *     `sawGraphTool` is "did it ever try" — a failed call still answers yes…
+     *
+     * `sawGraphTool` then SUPPRESSED the graph reminder forever (`maybeGraphNudge`: `if
+     * state.sawGraphTool === true … return false`). So a main that called `memory_graph_update` ONCE and
+     * got a refusal never heard about the graph again — 「tried」 was read as 「wrote」.
+     *
+     * The two facts are now separate, and only the second suppresses:
+     *   sawGraphAttempt  the tool was CALLED (this line)      — evidence of intent, not of a graph
+     *   sawGraphWrite    a tool/result came back ok:true      — evidence the graph actually changed
+     *
+     * MEASURED (lead, OBS-01): feeding a FAILED `memory_graph_update` still flipped `sawGraphTool` to true.
      */
-    if (GRAPH_TOOL.test(name)) state.sawGraphTool = true
+    if (GRAPH_TOOL.test(name)) state.sawGraphAttempt = true
     if (!state.toolsThisTurn.includes(name)) state.toolsThisTurn.push(name)
     if (TODO_TOOL.test(name)) {
       /**
@@ -3170,6 +3198,17 @@ function stepMonitor(
 
     // Any success ends the failure streak: the agent moved on.
     state.failure = null
+    /**
+     * ── G-10 (OBS-01): A SUCCESSFUL GRAPH CALL IS THE EVIDENCE THAT SUPPRESSES ────────────────────
+     *
+     * This is the OTHER half of the split. `tool/call` records 「it tried」; only a settled result that
+     * is not a failure records 「the graph changed」 — and `maybeGraphNudge` reads THIS one.
+     *
+     * The tool name comes from the pending call map, which is keyed by `callId`; a result without one
+     * cannot be attributed and is therefore not evidence of anything (see the `callId` note in the
+     * failure branch, which refuses to file unattributed results under a shared name for the same reason).
+     */
+    if (tool.length > 0 && GRAPH_TOOL.test(tool)) state.sawGraphWrite = true
     const settled = callId.length > 0 ? state.pendingTodo[callId] : undefined
     if (settled !== undefined) {
       delete state.pendingTodo[callId]
@@ -3375,8 +3414,16 @@ function describeMonitorState(
      * its condition can never be met. Naming all four facts makes the answer readable.
      */
     graph: {
-      /** True once the main has called `memory_graph_update` at least once. */
-      sawTool: state.sawGraphTool,
+      /**
+       * ── G-10 (OBS-01): BOTH FACTS, BECAUSE ONE FIELD IS HOW THEY GOT CONFUSED ──────────────────
+       *
+       * There used to be a single `sawTool`. It answered 「did it ever call the tool」 and it was read as
+       * 「has a graph」, so one refused call silenced the reminder forever. A readout that shows only one
+       * of the two invites the same mistake in the next reader; both are printed, and only `wrote`
+       * suppresses.
+       */
+      sawAttempt: state.sawGraphAttempt,
+      sawWrite: state.sawGraphWrite,
       /** True once this trigger has spoken for this main — it speaks once. */
       nudged: state.graphNudged,
       /** Distinct tool kinds across the recent window: the multi-step evidence, as measured. */
