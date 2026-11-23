@@ -63,6 +63,11 @@ jobs:
           rm -rf .siblings
           node -e "console.log('layer at', require('node:fs').realpathSync('../dsh-paradise/index.js'))"
 
+      - name: Runtime dependencies are empty and dev tooling is allowlisted
+        # B4-A 的「依赖为空门禁」。dependencies 会被装进用户的运行时，必须永远为空；
+        # typescript 只能是精确锁版本的 devDependency（干净克隆里缺它的代价已实测）。
+        run: node scripts/check-runtime-deps.mjs
+
       - name: Install (no dependencies expected)
         run: npm install --no-audit --no-fund
 
