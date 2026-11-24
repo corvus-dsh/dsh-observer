@@ -41,7 +41,7 @@
     "burn-in": "node scripts/burn-in.mjs",
     "preflight": "node scripts/preflight.mjs",
     "gates": "node scripts/check-cycles.mjs && node scripts/run-gate.mjs scripts/type-budget.mjs && node scripts/check-readme-counts.mjs && node scripts/check-test-numbers.mjs && node scripts/check-check-parity.mjs && node scripts/bundle-purity-guard.mjs && node scripts/verify-pure-move.mjs --self-test",
-    "check": "node scripts/build.mjs && node scripts/check-runtime-deps.mjs && node scripts/check-ci-layout.mjs && node scripts/check-doc-claims.mjs && node scripts/preflight.mjs && node scripts/check-cycles.mjs && node scripts/run-gate.mjs scripts/type-budget.mjs && node scripts/check-readme-counts.mjs && node scripts/check-test-numbers.mjs && node scripts/check-check-parity.mjs && node scripts/check-artifact-fresh.mjs && node scripts/bundle-purity-guard.mjs && node scripts/verify-pure-move.mjs --self-test && node --test test/*.test.mjs"
+    "check": "node scripts/build.mjs && node scripts/check-runtime-deps.mjs && node scripts/check-shared-sources.mjs && node scripts/check-ci-layout.mjs && node scripts/check-doc-claims.mjs && node scripts/preflight.mjs && node scripts/check-cycles.mjs && node scripts/run-gate.mjs scripts/type-budget.mjs && node scripts/check-readme-counts.mjs && node scripts/check-test-numbers.mjs && node scripts/check-check-parity.mjs && node scripts/check-artifact-fresh.mjs && node scripts/bundle-purity-guard.mjs && node scripts/verify-pure-move.mjs --self-test && node --test test/*.test.mjs"
   },
   "files": [
     "index.js",
