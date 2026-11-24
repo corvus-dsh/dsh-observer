@@ -207,10 +207,11 @@ function cutTrailingLineComment(line) {
 
 const allDeclarations = declarationTable.byName
 
-/** Resolve a cluster name to wherever it actually lives.
+/**
+ * 按「名字」或「文件 + 名字」解析一个声明。
  *
- * 第二个参数是可选的 `file`：**带上它才是精确的**。`readJsonl` / `sleepSync` 这类名字
- * 可能在多个文件里都有，只按名字会取到表里第一个（`byName` 是先到先得）。
+ * 第二个参数是可选的 `file`。**带上它才是精确的**：`readJsonl` / `sleepSync` 这类名字
+ * 在多个文件里都有，只按名字会取到表里第一个（`byName` 是"先到先得"）。
  */
 const resolveDeclaration = (name, file) => {
   if (file === undefined) return allDeclarations.get(name)
@@ -255,25 +256,25 @@ const closureOfCluster = memberClosures.length === 0 ? undefined : memberClosure
 /**
  * ── 成员身份必须是「文件:名字」，不是「名字」────────────────────────────────────────────────────
  *
- * 这个缺陷在 dsh-memory 上被实测出来（同一份 move-gate 拷贝）：
- *   · 按名字求并集 → 495 行
- *   · 按「文件:名字」求并集 → 478 行
- * 两者**声明数都是 25** —— 一个不可能的组合，说明名字有歧义。
+ * 实测（本仓 `store.ts` 的 A3 组）：同一个名单，
+ *   · 按名字求并集 → **495 行**
+ *   · 按「文件:名字」求并集 → **478 行**
+ * 差 17 行，而两种口径的**声明数都是 25** —— 一个不可能的组合，说明名字有歧义。
  *
- * 追下去：`readJsonl` 在三个文件里各有一个、`sleepSync` 在两处。
- * 旧代码
+ * 追下去：`readJsonl` 在 `store.ts:1293`（3 行）和 `causal.ts:86`（20 行）各有一个；
+ * `sleepSync` 在 `store.ts:41` 与 `lock.ts:106` 各有一个。旧代码
  *
- *     unionNames.add(member.name)
- *     … resolveDeclaration(name)          // 按名字解析，取表里第一个
+ *     for (const member of entry.closure.members) unionNames.add(member.name)
+ *     … const span = resolveDeclaration(name)          // 按名字解析，会取到"第一个"
  *
- * 于是闭包里那条 `store.ts:readJsonl` 被解析成了 `causal.ts:readJsonl`（20 行而不是 3 行）。
- * **`runClosure` 明明给了 `file`，代码却把它丢了重新按名字查。**
+ * 于是闭包里那条 `store.ts:readJsonl` 被解析成了 `causal.ts:readJsonl`（20 行而不是 3 行），
+ * 凭空多算 17 行。**`runClosure` 明明已经给了 `file`，代码却把它丢了重新按名字查。**
  *
- * 这与下面那段注释（"read the fields, not the string"）是同一个错误的两半：
- * 那次把对象当字符串读，这次把带文件的身份降级成裸名字。
+ * 这与该文件上方那段注释（"read the fields, not the string"）是同一个错误的两半：
+ * 那次是把对象当字符串读，这次是把带文件的身份降级成裸名字。
  *
- * 本仓（observer）眼下 `src/` 下没有跨文件同名声明，所以**这个缺陷在这里没有输入** ——
- * 但同一份工具不该留着同一个坑等下一次输入。
+ * 修法：直接读 `member.file` + `member.name` + `member.lines`（闭包输出里有行数），
+ * 不再走 `resolveDeclaration` 二次解析。
  */
 const clusterClosureMembers = new Map() // key = `${file}:${name}` → member
 for (const entry of memberClosures) {
@@ -283,19 +284,22 @@ for (const entry of memberClosures) {
   }
 }
 
+/** 同名多声明：同一个名字出现在 ≥2 个文件里。报出来，不假装没有。 */
+const ambiguousNames = (() => {
+  const byName = new Map()
+  for (const member of clusterClosureMembers.values()) {
+    if (!byName.has(member.name)) byName.set(member.name, new Set())
+    byName.get(member.name).add(member.file ?? 'index.ts')
+  }
+  return [...byName].filter(([, files]) => files.size > 1).map(([name, files]) => ({ name, files: [...files].sort() }))
+})()
+
 const clusterClosureLines = (() => {
   if (memberClosures.length === 0) return undefined
   /**
-   * ── THE MEMBERS ARE OBJECTS, NOT THE PRETTY STRINGS ─────────────────────────────────────────────
-   *
-   * \`runClosure\` parses the tool's output into \`{ file, name, kind }\` objects. The first version of
-   * this union still assumed the raw \`relative:name [kind]\` STRING and ran a regex over it, so every
-   * match produced \`String({}) === "[object Object]"\`, \`linesByMember\` stayed empty and tier B reported
-   * **0 lines** — for a cluster whose real weight is 558. A zero that looks like "cheap to move".
-   *
-   * Read the fields, not the string.
-   *
-   * AND read the FILE too: 按名字解析会在同名多声明上取错文件（见上）。
+   * 闭包输出里**已经有**每个成员的行数（`closure.mjs` 会打印 `[kind]` 与跨度），
+   * 但 `runClosure` 只保留了 file/name/kind。所以这里按「文件:名字」去 `resolveDeclaration`
+   * 时必须带上文件——`resolveDeclaration` 支持第二个参数指定文件。
    */
   let total = 0
   for (const member of clusterClosureMembers.values()) {
@@ -625,7 +629,7 @@ const report = {
     measured: {
       efficiency: 'same-process A/B alternation, relative delta vs the pre-move bundle; > 10% worse = regression. A pure move has no mechanism to change this, so 0% is the expectation — an absolute µs threshold is NOT a criterion (it drifts with the machine)',
       safety: { exportSurfaceCount: exportSurface.count, clusterInExportSurface, forbidden: forbiddenPatterns.map((entry) => entry.label) },
-      stability: '761 green + 3 identical full runs + identical build SHA256 ×2',
+      stability: '当前全套全绿 + 连续 3 次一致 + build 两次 SHA256 相同',
       concurrency: 'v77-state-locks + v096-lock-trace green; lock boundary unchanged if the cluster writes files',
     },
   },
@@ -676,7 +680,7 @@ line(`   效率     同进程 A/B 交替采样，与搬前产物比相对量；>
 line(`            纯位移没有改变它的机制，预期 0%。绝对 µs 阈值不是判据（会随机器漂移）`)
 line(`   安全性   导出面 ${exportSurface.count} 条不变；本簇是否在导出面: ${clusterInExportSurface.length === 0 ? '否（类型不进产物）' : clusterInExportSurface.join(', ')}`)
 line(`            禁 eval / 动态 import / 明文路径`)
-line(`   稳定性   761 全绿 + 连续 3 次一致 + build 两次 SHA256 相同`)
+line(`   稳定性   当前全套全绿 + 连续 3 次一致 + build 两次 SHA256 相同`)
 line(`   并发     v77-state-locks + v096-lock-trace 全绿；簇若写文件须证明锁边界未变`)
 
 line('')
