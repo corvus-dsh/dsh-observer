@@ -177,6 +177,10 @@ const envMessage = `${process.env.GRAFT_COMMIT_MESSAGE ?? ''}\n${process.env.GIT
 if (process.env.GRAFT_COMMIT_MESSAGE !== undefined && process.env.GRAFT_COMMIT_MESSAGE !== '') {
   console.error(`bundle-purity-guard: commit message supplied from the environment, ${process.env.GRAFT_COMMIT_MESSAGE.length} char(s) (injected via GRAFT_COMMIT_MESSAGE)`)
 }
+/** 同一条证据的第二条通道（CI 用这个传提交消息）。只公告自己那条，就是 §五十三.2 的缺口。 */
+if (process.env.GITHUB_HEAD_COMMIT_MESSAGE !== undefined && process.env.GITHUB_HEAD_COMMIT_MESSAGE !== '') {
+  console.error(`bundle-purity-guard: commit message supplied from CI, ${process.env.GITHUB_HEAD_COMMIT_MESSAGE.length} char(s) (injected via GITHUB_HEAD_COMMIT_MESSAGE)`)
+}
 const fromEnvironment = /\[bundle-change\]/u.test(envMessage)
 /** The commit-message declaration is honoured ONLY when the measured artifact IS that commit's. */
 const fromCommit = treeCleanOverMeasuredPaths && /\[bundle-change\]/u.test(headCommitMessage)
