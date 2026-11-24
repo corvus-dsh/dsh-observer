@@ -164,6 +164,19 @@ const treeCleanOverMeasuredPaths = (() => {
 })()
 
 const envMessage = `${process.env.GRAFT_COMMIT_MESSAGE ?? ''}\n${process.env.GITHUB_HEAD_COMMIT_MESSAGE ?? ''}`
+/**
+ * ── 注入点必须自述（lead §五十.4）───────────────────────────────────────────────────────────────
+ *
+ * `GRAFT_COMMIT_MESSAGE` 让这道门禁**以为**提交消息里有 `[bundle-change]` 声明。它改的是**入口证据**，
+ * 不是被测产物——所以只打印「消息由环境提供」与长度，不打印内容。
+ *
+ * 为什么必须有这一行：一次「环境声明成立因此通过」与一次「真的在提交消息里声明了」打印出来的
+ * 报告完全相同（`Declaration source: ENVIRONMENT VARIABLE`）。**没有这一行，读者无法区分
+ * 「CI 按约定注入了」和「有人在本地为了让门禁过而注入了」**——而后者是一条不需要改代码的通过路径。
+ */
+if (process.env.GRAFT_COMMIT_MESSAGE !== undefined && process.env.GRAFT_COMMIT_MESSAGE !== '') {
+  console.error(`bundle-purity-guard: commit message supplied from the environment, ${process.env.GRAFT_COMMIT_MESSAGE.length} char(s) (injected via GRAFT_COMMIT_MESSAGE)`)
+}
 const fromEnvironment = /\[bundle-change\]/u.test(envMessage)
 /** The commit-message declaration is honoured ONLY when the measured artifact IS that commit's. */
 const fromCommit = treeCleanOverMeasuredPaths && /\[bundle-change\]/u.test(headCommitMessage)
