@@ -57,6 +57,25 @@ export interface MainRecord {
   stalledTurns: number
   /** Whether the "this main was replaced, mine it" harvest already ran (it must never run twice). */
   harvestedReplacement: boolean
+  /**
+   * ── OBS-02：**事件游标**也必须活过重启 ──────────────────────────────────────────────────────
+   *
+   * `lastTodoSeq` 是「看板最后一次**动**在第几条事件」，`everUsedTodo` 是「这块看板被建过没有」。
+   * 两者都是关于**日志**的事实，而 `hydrateMonitorState` 的旧注释明确写着「不恢复它们」：
+   *
+   *     NOT restored on purpose: `failure`, `pending`, `toolsThisTurn`, `blocked`.
+   *     Those describe events in a LOG, and a log that restarted at seq 0 cannot be resumed…
+   *
+   * 那条理由对 `failure` / `pending` 成立（它们是**进行中**的连击，重启后确实无从续接），
+   * 但对 `lastTodoSeq` / `everUsedTodo` **不成立**：日志不会因为进程重启而回到 seq 0。
+   * 丢失它们的具体后果是：重启后 `everUsedTodo === false`，于是「这个主脑从没建过看板」这条
+   * stale 触发**看起来仍然成立**，而它其实早就被满足过了 —— 观察者会对一个刚建完板的主脑继续说
+   * 「你还没有板」。**告警的内容与事实相反，而且没有任何错误码。**
+   *
+   * 所以这两个是**游标**，与 `lastNudgeSeq` 同类（后者早就恢复了），必须一起存。
+   */
+  lastTodoSeq: number
+  everUsedTodo: boolean
 }
 
 export interface LongTermLedger {
@@ -107,6 +126,9 @@ export function parseLedger(raw: unknown): LongTermLedger {
       lastNudgeSeq: Number.isFinite(Number(entry.lastNudgeSeq)) && Number(entry.lastNudgeSeq) > 0 ? Number(entry.lastNudgeSeq) : 0,
       stalledTurns: Number.isFinite(Number(entry.stalledTurns)) && Number(entry.stalledTurns) > 0 ? Number(entry.stalledTurns) : 0,
       harvestedReplacement: entry.harvestedReplacement === true,
+      /** OBS-02: 事件游标。旧台账没有这两个字段 ⇒ 0 / false（「这条记录早于该字段」不是一条坏行）。 */
+      lastTodoSeq: Number.isFinite(Number(entry.lastTodoSeq)) && Number(entry.lastTodoSeq) > 0 ? Number(entry.lastTodoSeq) : 0,
+      everUsedTodo: entry.everUsedTodo === true,
     })
   }
   return { version: 1, records: out }
@@ -157,6 +179,9 @@ export function upsertRecord(
       lastNudgeSeq: number
       stalledTurns: number
       harvestedReplacement: boolean
+      /** OBS-02: 事件游标，随预算一起存（它们描述的是日志，不是进程生命周期）。 */
+      lastTodoSeq?: number
+      everUsedTodo?: boolean
     }
   },
 ): LongTermLedger {
@@ -186,6 +211,15 @@ export function upsertRecord(
     stalledTurns: quota !== undefined ? Math.max(0, Number(quota.stalledTurns) || 0) : existing?.stalledTurns ?? 0,
     harvestedReplacement:
       quota !== undefined ? quota.harvestedReplacement === true : existing?.harvestedReplacement === true,
+    /** OBS-02: 游标只在 quota 给出时被 SET；否则沿用既有值（与上面几个字段同一套语义）。 */
+    lastTodoSeq:
+      quota !== undefined && quota.lastTodoSeq !== undefined
+        ? Math.max(0, Number(quota.lastTodoSeq) || 0)
+        : existing?.lastTodoSeq ?? 0,
+    everUsedTodo:
+      quota !== undefined && quota.everUsedTodo !== undefined
+        ? quota.everUsedTodo === true
+        : existing?.everUsedTodo === true,
   }
   const others = ledger.records.filter((record) => record.sessionId !== patch.sessionId)
   const next = [...others, merged].sort((left, right) => {

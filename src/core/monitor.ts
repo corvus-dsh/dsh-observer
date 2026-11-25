@@ -300,6 +300,9 @@ export function hydrateMonitorState(
     lastNudgeSeq?: number
     stalledTurns?: number
     harvestedReplacement?: boolean
+    /** OBS-02: 事件游标，见下方注释。 */
+    lastTodoSeq?: number
+    everUsedTodo?: boolean
   },
 ): void {
   const number = (value: unknown): number =>
@@ -309,6 +312,21 @@ export function hydrateMonitorState(
   state.lastNudgeSeq = number(seed.lastNudgeSeq)
   state.stalledTurns = number(seed.stalledTurns)
   state.harvestedReplacement = seed.harvestedReplacement === true
+  /**
+   * ── OBS-02：这两个**必须**恢复，它们与上面那条「不恢复」的理由不冲突 ──────────────────────────
+   *
+   * 老注释列的四个字段（`failure` / `pending` / `toolsThisTurn` / `blocked`）都是**进程内连击**：
+   * 一条在新进程里重启的日志无法续接「连着失败了几次」，那条理由成立。
+   *
+   * 但 `lastTodoSeq` / `everUsedTodo` 是**游标**，不是连击：
+   *   · 日志不会因为进程重启而回到 seq 0，所以「游标指向第几条」仍然有效；
+   *   · 丢失它们会让 `everUsedTodo` 回到 false，于是「这个主脑从没建过看板」这条 stale 触发
+   *     在一个**已经建过板**的主脑上重新成立 —— 观察者会继续说「你还没有板」。
+   *
+   * 换句话说：告警的**内容与事实相反**，而且没有任何错误码。这正是 OBS-02 记的那条缺陷。
+   */
+  state.lastTodoSeq = number(seed.lastTodoSeq)
+  state.everUsedTodo = seed.everUsedTodo === true
 }
 
 /**

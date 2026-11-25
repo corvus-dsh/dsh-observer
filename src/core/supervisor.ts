@@ -232,6 +232,12 @@ export function createSupervisor(
             lastNudgeSeq: state.lastNudgeSeq,
             stalledTurns: state.stalledTurns,
             harvestedReplacement: state.harvestedReplacement,
+            /**
+             * OBS-02：这两个游标必须**跟着写**。只恢复不写等于永远是 0 —— 而 0 的含义是
+             * 「这块板从没动过」，于是 stale 触发在重启后重新成立。
+             */
+            lastTodoSeq: state.lastTodoSeq,
+            everUsedTodo: state.everUsedTodo,
           },
         }),
       )
