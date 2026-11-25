@@ -87,15 +87,99 @@ test('gate: asserted but never asked is REFUSED — this is the incident', async
   assert.match(verdict.detail, new RegExp(ASK_TOOL_NAME, 'u'))
 })
 
-test('gate: asserted AND asked is allowed, and the evidence is cited', async () => {
+test('gate: asserted AND ANSWERED is allowed, and the evidence is cited', async () => {
+  /**
+   * ── S10 / D4：这条用例的判据从 `asked` 改成了 `answered` ────────────────────────────────────────
+   *
+   * 旧版本只放一条 `tool/call` 就断言 `ok: true, evidence: 'asked'`，等于把「问过」当成「同意过」。
+   * 现在必须同时有**答复**（按 callId 关联），并且证据里要能看到「答了什么」。
+   *
+   * 这不是放宽也不是收紧判据的写法，是**语义本身**改变了：门禁要的是答复，不是提问。
+   * 追问 / 没答 / 报错 / 取消 / 换了选项，全部仍然拒绝（见下面新加的两条负向用例）。
+   */
   const verdict = await checkConfirmation({
     claimed: true,
     sessionId: 's',
-    readLog: async () => ({ events: [{ type: 'tool/call', seq: 5, data: { name: ASK_TOOL_NAME } }] }),
+    readLog: async () => ({
+      events: [
+        { type: 'tool/call', seq: 5, data: { callId: 'c1', name: ASK_TOOL_NAME } },
+        { type: 'tool/result', seq: 6, data: { callId: 'c1', message: { toolCallId: 'c1', content: [{ type: 'text', text: '确认，开始执行' }] } } },
+      ],
+    }),
   })
   assert.equal(verdict.ok, true)
-  assert.equal(verdict.evidence, 'asked')
+  assert.equal(verdict.evidence, 'answered')
   assert.equal(verdict.askedAtSeq, 5)
+  assert.equal(verdict.answeredAtSeq, 6)
+  assert.match(verdict.answerText, /确认/u, '答复原文必须被引用，而不只是「有人答过」')
+})
+
+/**
+ * ── D4 的负向半：问过但**没有答复**必须拒绝 ──────────────────────────────────────────────────────
+ *
+ * 这两条是新加的，而且它们的形状就是旧实现放过的那个洞：
+ *
+ *   ① 只有 `tool/call`（用户没答 / 界面没回）⇒ `ok: false, evidence: 'asked'`
+ *   ② 结果带 `isError` 或 `cancelled`（工具失败 / 用户取消）⇒ 同样拒绝
+ *
+ * 第二条尤其值得单列：一个**报错的** ask 看起来仍然有 `tool/call` 记录，旧实现数到它就算通过。
+ */
+test('gate: asked WITHOUT an answer is REFUSED — asking is not agreeing', async () => {
+  const askedOnly = await checkConfirmation({
+    claimed: true,
+    sessionId: 's',
+    readLog: async () => ({ events: [{ type: 'tool/call', seq: 5, data: { callId: 'c1', name: ASK_TOOL_NAME } }] }),
+  })
+  assert.equal(askedOnly.ok, false, '问过但没答 ⇒ 必须拒绝')
+  assert.equal(askedOnly.evidence, 'asked', '证据词必须是 asked（不是 not-asked）：问题确实问过')
+  assert.equal(askedOnly.askedAtSeq, 5, '仍然要点名问在哪一条')
+  assert.match(askedOnly.detail, /没有找到可用的答复/u)
+})
+
+test('gate: a FAILED or CANCELLED ask result is not an answer', async () => {
+  const failed = await checkConfirmation({
+    claimed: true,
+    sessionId: 's',
+    readLog: async () => ({
+      events: [
+        { type: 'tool/call', seq: 5, data: { callId: 'c1', name: ASK_TOOL_NAME } },
+        { type: 'tool/result', seq: 6, data: { callId: 'c1', isError: true, message: { content: [{ type: 'text', text: 'tool failed' }] } } },
+      ],
+    }),
+  })
+  assert.equal(failed.ok, false, '工具报错的 ask 不是答复')
+
+  const cancelled = await checkConfirmation({
+    claimed: true,
+    sessionId: 's',
+    readLog: async () => ({
+      events: [
+        { type: 'tool/call', seq: 5, data: { callId: 'c1', name: ASK_TOOL_NAME } },
+        { type: 'tool/result', seq: 6, data: { callId: 'c1', cancelled: true, message: { content: [{ type: 'text', text: '' }] } } },
+      ],
+    }),
+  })
+  assert.equal(cancelled.ok, false, '用户取消的 ask 不是答复')
+})
+
+test('gate: an answer to a DIFFERENT call is not this question\'s answer', async () => {
+  /**
+   * 按 callId 关联的意义：两次 ask 并存时，位置匹配会把 A 的答复算给 B。
+   * 这里 B 没有答复，只有 A 的 —— 必须拒绝。
+   */
+  const verdict = await checkConfirmation({
+    claimed: true,
+    sessionId: 's',
+    readLog: async () => ({
+      events: [
+        { type: 'tool/call', seq: 3, data: { callId: 'a', name: ASK_TOOL_NAME } },
+        { type: 'tool/result', seq: 4, data: { callId: 'a', message: { toolCallId: 'a', content: [{ type: 'text', text: '旧的确认' }] } } },
+        { type: 'tool/call', seq: 7, data: { callId: 'b', name: ASK_TOOL_NAME } },
+      ],
+    }),
+  })
+  assert.equal(verdict.ok, false, '最后一次 ask 没有答复 ⇒ 拒绝，即使更早那次答过')
+  assert.equal(verdict.askedAtSeq, 7, '点名的必须是**最后一次**提问')
 })
 
 /**
@@ -179,13 +263,23 @@ test('tool: asserted but never asked is refused, and says which fact was missing
   assert.equal(harness.persistence.createCalls.length, 0)
 })
 
-test('tool: asserted AND asked goes through, and the receipt cites the evidence', async () => {
+test('tool: asserted AND ANSWERED goes through, and the receipt cites the answer', async () => {
   const harness = boot({ askedUser: true })
   const reply = await spawn(harness, { userConfirmed: true })
 
   assert.equal(reply.ok, true, reply.text)
-  assert.equal(reply.confirmation.evidence, 'asked')
+  assert.equal(reply.confirmation.evidence, 'answered',
+    'S10/D4：成功态是 answered（问过**且**得到答复），不再是 asked')
+  /**
+   * ⚠️ 这一条跑在**没有 `exec.agent.id`** 的主机上，所以回执只能说「证据存在 … 但归属未核实」。
+   *
+   * 我第一版写的是 `/需求对齐：已核实/`，实测拿到的是「证据存在 … 归属未核实」——
+   * 那正是 B4-B B6 想要的行为（证据与归属是两个独立事实），错的是我的期望。
+   * 「已核实」只属于 `attributed` 那条用例（下面自有它自己的断言）。
+   */
   assert.match(reply.text, /需求对齐：证据存在/u)
+  assert.match(reply.text, /得到答复/u, '回执必须引用答复，而不只是「存在证据」')
+  assert.match(reply.text, /seq=1 得到答复/u, '而且必须点名答复在哪一条')
   assert.equal(tapeOf(harness.persistence, reply.sessionId).length, 8)
 })
 
@@ -279,13 +373,19 @@ test('refusal: it instructs the model to go and ASK, and forbids forging the fla
 })
 
 test('refusal: an allowed verdict produces no text', async () => {
-  /** v2.1.0: `skip`/`skipped` are gone from the signature; an allowed verdict is the evidence path. */
+  /** v2.1.0: `skip`/`skipped` are gone; S10/D4: the allowed verdict is `answered`, not `asked`. */
   const verdict = await checkConfirmation({
     claimed: true,
     sessionId: 's',
-    readLog: async () => ({ events: [{ type: 'tool/call', seq: 1, data: { name: ASK_TOOL_NAME } }] }),
+    readLog: async () => ({
+      events: [
+        { type: 'tool/call', seq: 1, data: { callId: 'c1', name: ASK_TOOL_NAME } },
+        { type: 'tool/result', seq: 2, data: { callId: 'c1', message: { toolCallId: 'c1', content: [{ type: 'text', text: '确认' }] } } },
+      ],
+    }),
   })
   assert.equal(verdict.ok, true)
+  assert.equal(verdict.evidence, 'answered')
   assert.equal(confirmationRefusal(verdict), '')
 })
 

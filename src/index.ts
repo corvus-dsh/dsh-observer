@@ -1511,7 +1511,23 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
      * result — but a session that never asked cannot produce the evidence, and that is the case
      * this gate has to catch.
      */
-    let confirmationReport: { ok: boolean; evidence: string; askedAtSeq: number | null; detail: string } = {
+    /**
+     * ── S10 / D4：这里必须带上答复的两个字段 ──────────────────────────────────────────────────────
+     *
+     * 逐字段重建是固定缺陷产地：`checkConfirmation` 已经在 `answered` 时返回 `answeredAtSeq` /
+     * `answerText`，但**本文件的中间形状没有声明它们**，于是 TypeScript 的类型（在 strip 构建下
+     * 不被检查）允许代码编译通过，而回执里打印出 `seq=undefined`。
+     *
+     * 判据抓到的正是这个：`需求对齐：证据存在（seq=0 提问、seq=undefined 得到答复）`。
+     */
+    let confirmationReport: {
+      ok: boolean
+      evidence: string
+      askedAtSeq: number | null
+      answeredAtSeq?: number
+      answerText?: string
+      detail: string
+    } = {
       ok: false,
       evidence: 'not-asked',
       askedAtSeq: null,
@@ -1590,6 +1606,9 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
         ok: verdict.ok,
         evidence: verdict.evidence,
         askedAtSeq: verdict.askedAtSeq,
+        ...(verdict.evidence === 'answered'
+          ? { answeredAtSeq: verdict.answeredAtSeq, answerText: verdict.answerText }
+          : {}),
         detail: verdict.detail,
       }
     }
@@ -1938,10 +1957,17 @@ export function apply(ctx: PluginContextLike, config: Record<string, unknown> = 
        * that prints 「已核实」 for a borrowed log is the very claim this fix exists to stop, so an
        * unattributed id is printed as unverified even when the evidence was found.
        */
-      `需求对齐：${confirmationReport.evidence === 'asked'
+      /**
+       * ── S10 / D4：这一行必须说出「答复」，不只是「证据存在」──────────────────────────────────────
+       *
+       * 旧文案在 `evidence === 'asked'` 时就能印「已核实（seq=… 调用过 ask_user_question）」——
+       * 它把**提问**写成了核实结论。现在成功态是 `answered`，文案也把答复原文带上；
+       * `asked` 只出现在拒绝路径上（问了没答），而拒绝由别的字段表达，走不到这里。
+       */
+      `需求对齐：${confirmationReport.evidence === 'answered'
         ? ownershipReport === 'attributed'
-          ? `已核实（本会话 seq=${String(confirmationReport.askedAtSeq)} 调用过 ask_user_question）`
-          : `证据存在（seq=${String(confirmationReport.askedAtSeq)} 调用过 ask_user_question），但**归属未核实**：本宿主未告知调用方身份，无法证明这条 id 是自己的`
+          ? `已核实（seq=${String(confirmationReport.askedAtSeq)} 提问，seq=${String(confirmationReport.answeredAtSeq)} 得到答复「${confirmationReport.answerText}」）`
+          : `证据存在（seq=${String(confirmationReport.askedAtSeq)} 提问、seq=${String(confirmationReport.answeredAtSeq)} 得到答复），但**归属未核实**：本宿主未告知调用方身份，无法证明这条 id 是自己的`
         : confirmationReport.evidence === 'unavailable'
           ? '未核实（本宿主没有会话日志读取能力，按宿主配置 allowUnverifiedConfirmation 放行）'
           : confirmationReport.evidence === 'unreadable'
@@ -2525,6 +2551,15 @@ export const confirmationInternals = {
   checkOwnership,
   confirmationRefusal,
   findAskEvidence,
+  /**
+   * ── S10 / D4：答复的读取器，并入**已有**的 internals 对象 ────────────────────────────────────
+   *
+   * 按本文件上面那条规则第 1 条处理（「优先并入已列出的对象，一个新顶层名字要永远付代价」）：
+   * `findAskAnswer` 是「问过 ≠ 答过」这条判据的**唯一入口**，判据必须能直接触达它，
+   * 否则只能通过 `checkConfirmation` 间接测 —— 而那样一红就分不清是「没读到答复」还是
+   * 「读到了但判错了」。
+   */
+  findAskAnswer,
 }
 
 /**

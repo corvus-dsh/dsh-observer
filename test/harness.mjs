@@ -338,6 +338,30 @@ export function makeHost({
                         arguments: '{"questions":[{"id":"plan","question":"确认这份计划？"}]}',
                       },
                     },
+                    /**
+                     * ── S10 / D4：`askedUser: true` 必须同时给出**答复** ────────────────────────────
+                     *
+                     * 这道门现在的判据是「问过**且**得到答复」（`evidence: 'answered'`）。只放一条
+                     * `tool/call` 的夹具描述的是「问了但用户没答」，而那正是门禁必须拒绝的形状 ——
+                     * 所以夹具不补这一条，测的就是「一台允许沉默通过的机器」。
+                     *
+                     * callId 与上面的调用严格对应：`findAskAnswer` 按 callId 关联，位置只作为
+                     * 宿主不发布 callId 时的兜底。
+                     */
+                    {
+                      type: 'tool/result',
+                      seq: 1,
+                      time: 2,
+                      data: {
+                        turn: 1,
+                        step: 2,
+                        callId: `call-ask-${id}`,
+                        message: {
+                          toolCallId: `call-ask-${id}`,
+                          content: [{ type: 'text', text: '确认，开始执行' }],
+                        },
+                      },
+                    },
                   ]
                 : []
               return {
@@ -368,6 +392,21 @@ export function makeHost({
                         callId: 'call-ask-1',
                         name: 'ask_user_question',
                         arguments: '{"questions":[{"id":"plan","question":"确认这份计划？"}]}',
+                      },
+                    },
+                    /** S10 / D4: the answer, correlated by callId — see the block above for the reason. */
+                    {
+                      type: 'tool/result',
+                      seq: 1,
+                      time: 2,
+                      data: {
+                        turn: 1,
+                        step: 2,
+                        callId: 'call-ask-1',
+                        message: {
+                          toolCallId: 'call-ask-1',
+                          content: [{ type: 'text', text: '确认，开始执行' }],
+                        },
                       },
                     },
                   ]

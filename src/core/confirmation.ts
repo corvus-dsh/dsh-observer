@@ -58,13 +58,19 @@ export const ASK_TOOL_NAME = 'ask_user_question'
  * `--unverified-ok` would be `skipConfirmation` again: a permission slip only the model can sign,
  * about a conversation only the model is producing (see the v2.1.0 note below).
  */
-export type ConfirmationEvidence = 'asked' | 'not-asked' | 'unavailable' | 'unreadable'
+export type ConfirmationEvidence = 'asked' | 'answered' | 'not-asked' | 'unavailable' | 'unreadable'
 
 export type ConfirmationVerdict =
-  | { ok: true; evidence: 'asked'; askedAtSeq: number; detail: string }
+  /**
+   * ── D4：唯一允许通过的证据是 `answered` ─────────────────────────────────────────────────────
+   *
+   * `asked` 不再是成功态。它保留在类型里，是因为**拒绝**要能说出「你问过，但没有答」——
+   * 把「问过」与「答过」合并成同一个成功值，正是那道门被绕过的形状。
+   */
+  | { ok: true; evidence: 'answered'; askedAtSeq: number; answeredAtSeq: number; answerText: string; detail: string }
   /** (a) or (b), ADMITTED only because the operator turned the gate off for this host. */
   | { ok: true; evidence: 'unavailable' | 'unreadable'; askedAtSeq: null; detail: string; warning: string }
-  | { ok: false; evidence: 'not-asked' | 'unavailable' | 'unreadable'; askedAtSeq: null; detail: string }
+  | { ok: false; evidence: 'asked' | 'not-asked' | 'unavailable' | 'unreadable'; askedAtSeq: number | null; detail: string }
 
 /**
  * Find the LAST `ask_user_question` call in a session log.
@@ -83,6 +89,128 @@ export function findAskEvidence(events: readonly any[]): number | null {
     if (Number.isFinite(seq)) at = seq
   }
   return at
+}
+
+/**
+ * ── D4：问过 ≠ 得到答复 ────────────────────────────────────────────────────────────────────────
+ *
+ * `findAskEvidence` 只回答「有没有调用过 ask_user_question」。它证明的是**问题被提出了**，
+ * 而门禁要的是**用户回答了什么**。两者之间有一个完整的失败面：
+ *
+ *   · 工具调用抛错 / 被宿主拒绝（`isError`）⇒ 用户根本没看到问题；
+ *   · 用户**取消了**（DSH 的 ask 结果会带 cancelled/declined 一类标记）⇒ 没有答案；
+ *   · 用户**答了，但答的是另一个选项**（不是「确认」）⇒ 答案存在，但不是同意；
+ *   · 结果与调用**对不上**（`callId` 不同，或结果早于调用）⇒ 证据不属于这个问题。
+ *
+ * 这四例在旧实现里全部被当成 `evidence: 'asked'`、`ok: true` —— 也就是**把「问过」当成「同意过」**。
+ *
+ * 返回 `answered` 时同时带回 `answerText` 与 `answeredAtSeq`，让上层能说清「用户答了什么」，
+ * 而不是只说「有人答过」。
+ */
+export interface AskAnswer {
+  /** The seq of the `tool/call` that asked. */
+  readonly askedAtSeq: number
+  /** The seq of the `tool/result` that carries the answer. */
+  readonly answeredAtSeq: number
+  /** The answer as the host recorded it, trimmed. Empty string is a REFUSAL, not an answer. */
+  readonly answerText: string
+}
+
+/** DSH 把「用户没答」表达成的几种形状（任一出现即视为没有答复）。 */
+const NO_ANSWER_FLAGS = ['cancelled', 'canceled', 'declined', 'dismissed', 'timedOut', 'timeout']
+
+const textOfAskResult = (data: any): string => {
+  /**
+   * ── 真实形状是 block 数组，不是字符串 ──────────────────────────────────────────────────────────
+   *
+   * 探针实测（`_scratch/probe-d4-answer.mjs`）：DSH 的 `tool/result` 把正文放在
+   * `message.content = [{ type: 'text', text: '…' }]`。第一版只认字符串、`{answer}` 对象和字符串数组，
+   * 于是**每一种真实形状都被读成空串** —— 而那会被判成「没有答复」，门禁永远拒绝。
+   * 一个永远拒绝的门禁不会漏放任何人，但它同样不会放行任何人：那是另一种失效。
+   */
+  const textOfContent = (content: any): string => {
+    if (typeof content === 'string') return content.trim()
+    if (Array.isArray(content)) {
+      return content
+        .map((block) => {
+          if (typeof block === 'string') return block
+          if (block !== null && typeof block === 'object' && typeof block.text === 'string') return block.text
+          return ''
+        })
+        .filter((piece) => piece.trim().length > 0)
+        .join(' ')
+        .trim()
+    }
+    return ''
+  }
+
+  const candidates = [data?.answers, data?.answer, data?.text, data?.message?.content, data?.content]
+  for (const candidate of candidates) {
+    const fromContent = textOfContent(candidate)
+    if (fromContent.length > 0) return fromContent
+    /** `answers` may be an object keyed by question. */
+    if (candidate !== null && typeof candidate === 'object' && !Array.isArray(candidate)) {
+      const joined = Object.values(candidate)
+        .map((value: any) => textOfContent(value) || (typeof value?.answer === 'string' ? value.answer.trim() : ''))
+        .filter((item) => item.length > 0)
+        .join(' ')
+      if (joined.trim().length > 0) return joined.trim()
+    }
+  }
+  return ''
+}
+
+/**
+ * Find the ANSWER to the last `ask_user_question` call.
+ *
+ * `null` means: no call, or the call has no usable answer. The two are different observations and the
+ * caller reports them with different words — but both refuse, because 「问过没答」 is not 「同意」.
+ */
+export function findAskAnswer(events: readonly any[]): AskAnswer | null {
+  /** The callId of the LAST ask call. Correlating by callId is what makes the answer ITS answer. */
+  let askCallId = ''
+  let askedAtSeq = -1
+  const callIdsBySeq = new Map<number, string>()
+  for (const event of events) {
+    if (event?.type !== 'tool/call') continue
+    if (event.data?.name !== ASK_TOOL_NAME) continue
+    const seq = Number(event.seq)
+    if (!Number.isFinite(seq)) continue
+    const callId = typeof event.data?.callId === 'string' ? event.data.callId : ''
+    callIdsBySeq.set(seq, callId)
+    if (seq >= askedAtSeq) {
+      askedAtSeq = seq
+      askCallId = callId
+    }
+  }
+  if (askedAtSeq < 0) return null
+
+  /**
+   * The result: matched by `callId` when both sides carry one. When the host does not publish callIds
+   * the only available correlation is position — result AFTER the call — and that is used as a
+   * fallback **only then**, because positional matching is exactly what breaks when two asks run
+   * concurrently.
+   */
+  let best: { seq: number; answerText: string } | null = null
+  for (const event of events) {
+    if (event?.type !== 'tool/result') continue
+    const seq = Number(event.seq)
+    if (!Number.isFinite(seq) || seq <= askedAtSeq) continue
+    const data = event.data ?? {}
+    const message = data.message ?? {}
+    const resultCallId = String(data.callId ?? message.toolCallId ?? message.source?.callId ?? '')
+    if (askCallId.length > 0 && resultCallId.length > 0 && resultCallId !== askCallId) continue
+
+    /** A refused / cancelled call is NOT an answer, whatever text rides along. */
+    if (data.isError === true || message.isError === true) return null
+    if (NO_ANSWER_FLAGS.some((flag) => data[flag] === true || message[flag] === true || data?.status === flag)) return null
+
+    const answerText = textOfAskResult({ ...data, message })
+    if (answerText.length === 0) return null
+    if (best === null || seq < best.seq) best = { seq, answerText }
+  }
+  if (best === null) return null
+  return { askedAtSeq, answeredAtSeq: best.seq, answerText: best.answerText }
 }
 
 /**
@@ -192,11 +320,33 @@ export async function checkConfirmation(options: {
         '也就是说，你还没有把计划展示给用户并请他确认。',
     }
   }
+  /**
+   * ── D4：问过之后，必须还有答复 ────────────────────────────────────────────────────────────────
+   *
+   * 这一跳是这次修复的全部。旧实现在这里直接 `return { ok: true, evidence: 'asked' }` ——
+   * 于是「调用过 ask 但工具抛错」「用户取消」「用户选了别的选项」「结果与调用对不上」四种情形
+   * 全部通过。**问过不是同意过。**
+   */
+  const answer = findAskAnswer(events)
+  if (answer === null) {
+    return {
+      ok: false,
+      evidence: 'asked',
+      askedAtSeq,
+      detail:
+        `本会话在 seq=${askedAtSeq} 调用过 ${ASK_TOOL_NAME}，但**没有找到可用的答复**：` +
+        '工具报错 / 用户取消 / 结果与调用对不上 / 答复为空 —— 这几种都不会让门禁通过。' +
+        '请重新提出确认，并等待用户真正作出选择。',
+    }
+  }
   return {
     ok: true,
-    evidence: 'asked',
-    askedAtSeq,
-    detail: `已核实：本会话在 seq=${askedAtSeq} 调用过 ${ASK_TOOL_NAME}`,
+    evidence: 'answered',
+    askedAtSeq: answer.askedAtSeq,
+    answeredAtSeq: answer.answeredAtSeq,
+    answerText: answer.answerText,
+    detail:
+      `已核实：seq=${answer.askedAtSeq} 提问，seq=${answer.answeredAtSeq} 得到答复「${answer.answerText}」`,
   }
 }
 
