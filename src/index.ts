@@ -118,7 +118,7 @@ import {
  * a crash deep inside a half-built artifact.
  */
 import { ensureWriteAdapter, hasWriteAdapterProvider, setWriteAdapterProvider, writePathStatus } from './core/paradise-write.js'
-import { ASK_TOOL_NAME, checkConfirmation, checkOwnership, confirmationRefusal, findAskEvidence } from './core/confirmation.js'
+import { ASK_TOOL_NAME, checkConfirmation, checkOwnership, confirmationRefusal, findAskAnswer, findAskEvidence } from './core/confirmation.js'
 /**
  * v1.9.0 — ONLY THE PROMPT TEXT AND THE MARKER COME FROM THE ARCHIVED IGNITION MODULE.
  *
